@@ -1,0 +1,418 @@
+/* Atlassian-Inspired Styling for Bitbucket PR Tracker */
+
+:root {
+  --color-primary: #0052CC;      /* Atlassian Blue */
+  --color-primary-hover: #0065FF;
+  --color-success: #36B37E;      /* Atlassian Green */
+  --color-error: #DE350B;        /* Atlassian Red */
+  --color-error-bg: #FFEBE6;
+  --color-warning: #FFAB00;      /* Atlassian Yellow */
+  --color-text: #172B4D;         /* Dark Neutral */
+  --color-text-subtle: #5E6C84;  /* Medium Neutral */
+  --color-border: #DFE1E6;       /* Light Gray Border */
+  --color-bg: #FFFFFF;
+  --color-bg-subtle: #F4F5F7;    /* Light Gray Fill */
+  --font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, "Fira Sans", "Droid Sans", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-family);
+  font-size: 13px;
+  color: var(--color-text);
+  background-color: var(--color-bg);
+  width: 340px;
+  overflow-x: hidden;
+}
+
+.extension-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 400px;
+  max-height: 580px;
+}
+
+/* Header */
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--color-border);
+  background-color: var(--color-bg);
+}
+
+.logo-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bitbucket-logo path {
+  fill: var(--color-primary);
+}
+
+.header h1 {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+/* Icons and Buttons */
+.icon-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.15s ease;
+}
+
+.icon-btn:hover {
+  background-color: var(--color-bg-subtle);
+}
+
+.icon-btn svg path {
+  transition: fill 0.15s ease;
+}
+
+.icon-btn:hover svg path {
+  fill: var(--color-primary);
+}
+
+/* Main Content Wrapper */
+.main-content {
+  flex: 1;
+  overflow-y: auto;
+  position: relative;
+  background-color: var(--color-bg-subtle);
+}
+
+/* Scrollbar styling */
+.pr-items-container::-webkit-scrollbar {
+  width: 6px;
+}
+.pr-items-container::-webkit-scrollbar-track {
+  background: transparent;
+}
+.pr-items-container::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+.pr-items-container::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-subtle);
+}
+
+/* Settings Panel */
+.settings-panel {
+  background-color: var(--color-bg);
+  border-bottom: 1px solid var(--color-border);
+  padding: 16px;
+  animation: slideDown 0.2s ease-out;
+}
+
+@keyframes slideDown {
+  from {
+    transform: translateY(-10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.settings-panel h2 {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--color-text);
+}
+
+.form-group {
+  margin-bottom: 12px;
+}
+
+.form-group label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--color-text-subtle);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.form-control {
+  width: 100%;
+  padding: 8px 10px;
+  font-family: inherit;
+  font-size: 13px;
+  border: 2px solid var(--color-border);
+  border-radius: 3px;
+  outline: none;
+  background-color: var(--color-bg-subtle);
+  color: var(--color-text);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.form-control:focus {
+  border-color: var(--color-primary);
+  background-color: var(--color-bg);
+}
+
+.input-password-wrapper {
+  position: relative;
+  display: flex;
+}
+
+.input-password-wrapper input {
+  padding-right: 32px;
+}
+
+.visibility-btn {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px;
+  line-height: 1;
+}
+
+.field-help {
+  font-size: 11px;
+  color: var(--color-text-subtle);
+  margin-top: 4px;
+  line-height: 1.3;
+}
+
+.settings-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* Button UI */
+.btn {
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 3px;
+  border: none;
+  cursor: pointer;
+  transition: background-color 0.1s ease, color 0.1s ease;
+}
+
+.btn-primary {
+  background-color: var(--color-primary);
+  color: white;
+}
+
+.btn-primary:hover {
+  background-color: var(--color-primary-hover);
+}
+
+.btn-secondary {
+  background-color: var(--color-bg-subtle);
+  color: var(--color-text);
+}
+
+.btn-secondary:hover {
+  background-color: var(--color-border);
+}
+
+.btn-small {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.btn-error-action {
+  background-color: var(--color-error);
+  color: white;
+  margin-top: 8px;
+}
+
+.btn-error-action:hover {
+  opacity: 0.9;
+}
+
+/* PR List Section */
+.pr-list-panel {
+  display: flex;
+  flex-direction: column;
+  padding: 12px 0 0 0;
+}
+
+.list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 16px 8px 16px;
+}
+
+#pr-count-title {
+  font-weight: 600;
+  color: var(--color-text-subtle);
+  font-size: 12px;
+}
+
+/* PR Container and list item cards */
+.pr-items-container {
+  display: flex;
+  flex-direction: column;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.pr-card {
+  display: block;
+  text-decoration: none;
+  background-color: var(--color-bg);
+  border-bottom: 1px solid var(--color-border);
+  padding: 12px 16px;
+  transition: background-color 0.1s ease;
+  cursor: pointer;
+}
+
+.pr-card:hover {
+  background-color: #F4F5F7;
+}
+
+.pr-repo {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-primary);
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.pr-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+  line-height: 1.4;
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+
+.pr-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--color-text-subtle);
+}
+
+.pr-author {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pr-author::before {
+  content: "👤";
+  font-size: 9px;
+}
+
+/* Status Alerts */
+.status-alert {
+  display: flex;
+  gap: 12px;
+  padding: 12px 16px;
+  margin: 0 16px 12px 16px;
+  border-radius: 4px;
+  line-height: 1.4;
+}
+
+.status-alert.info {
+  background-color: #DEEBFF;
+  border: 1px solid #B3D4FF;
+  color: #0747A6;
+  align-items: center;
+}
+
+.status-alert.error {
+  background-color: var(--color-error-bg);
+  border: 1px solid #FFBDAD;
+  color: #BF2600;
+}
+
+.alert-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.alert-content p {
+  font-size: 12px;
+  margin-top: 2px;
+  word-break: break-word;
+}
+
+/* Loading Spinner */
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(7, 71, 166, 0.2);
+  border-top-color: #0747A6;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Empty State Styles */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 40px 24px;
+}
+
+.empty-icon {
+  margin-bottom: 12px;
+}
+
+.empty-state h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+  margin-bottom: 6px;
+}
+
+.empty-state p {
+  font-size: 12px;
+  color: var(--color-text-subtle);
+  line-height: 1.4;
+  margin-bottom: 16px;
+}
+
+/* Footer Section */
+.footer {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-top: 1px solid var(--color-border);
+  background-color: var(--color-bg);
+  font-size: 11px;
+  color: var(--color-text-subtle);
+}
+
+.hidden {
+  display: none !important;
+}
