@@ -1,7 +1,60 @@
-// Bitbucket PR Tracker Popup JS
+// Atlassian Extension Hub Popup JS
 
 document.addEventListener('DOMContentLoaded', async () => {
-  // DOM Elements
+  // --- Tab Navigation Setup ---
+  const tabButtons = document.querySelectorAll('.tab-btn');
+  const tabPanels = document.querySelectorAll('.tab-panel');
+  const appTitle = document.getElementById('app-title');
+
+  tabButtons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      // Deactivate all tabs
+      tabButtons.forEach((t) => t.classList.remove('active'));
+      // Hide all panels
+      tabPanels.forEach((p) => p.classList.add('hidden'));
+
+      // Activate clicked tab
+      btn.classList.add('active');
+      const targetPanelId = `${btn.getAttribute('data-tab')}-panel`;
+      document.getElementById(targetPanelId).classList.remove('hidden');
+
+      // Update app title text based on active tab
+      if (btn.getAttribute('data-tab') === 'bitbucket-tab') {
+        appTitle.textContent = 'Atlassian Hub';
+      } else if (btn.getAttribute('data-tab') === 'jira-tab') {
+        appTitle.textContent = 'Jira Hub';
+      } else if (btn.getAttribute('data-tab') === 'confluence-tab') {
+        appTitle.textContent = 'Confluence Hub';
+      } else {
+        appTitle.textContent = 'Customizer';
+      }
+    });
+  });
+
+  // --- Dynamic Form Add Product Request ---
+  const addProductForm = document.getElementById('add-product-form');
+  const productRequestSuccessAlert = document.getElementById('product-request-success');
+
+  addProductForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const checkedProducts = Array.from(addProductForm.querySelectorAll('input[name="products"]:checked')).map(cb => cb.value);
+    const feedback = document.getElementById('custom-product-feedback').value.trim();
+
+    // Store custom requests securely in chrome.storage.local
+    await chrome.storage.local.set({
+      requestedProducts: checkedProducts,
+      productFeedback: feedback,
+      productFeedbackTimestamp: Date.now()
+    });
+
+    // Show success confirmation message
+    productRequestSuccessAlert.classList.remove('hidden');
+    setTimeout(() => {
+      productRequestSuccessAlert.classList.add('hidden');
+    }, 4000);
+  });
+
+  // --- Connection Settings DOM Elements ---
   const toggleSettingsBtn = document.getElementById('toggle-settings-btn');
   const settingsPanel = document.getElementById('settings-panel');
   const authTypeSelect = document.getElementById('auth-type');
@@ -32,7 +85,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Load existing credentials and list on popup open
   await initializePopup();
 
-  // Event Listeners
+  // Event Listeners for settings and syncing
   toggleSettingsBtn.addEventListener('click', toggleSettingsPanel);
   cancelSettingsBtn.addEventListener('click', hideSettingsPanel);
   authTypeSelect.addEventListener('change', handleAuthTypeChange);
@@ -50,7 +103,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       'authType',
       'prList',
       'lastUpdated',
-      'error'
+      'error',
+      'requestedProducts',
+      'productFeedback'
     ]);
 
     // Populate Settings fields
@@ -66,6 +121,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     if (data.bitbucketToken) {
       bitbucketTokenInput.value = data.bitbucketToken;
+    }
+
+    // Populate requested products checkboxes if they were saved before
+    if (data.requestedProducts) {
+      data.requestedProducts.forEach((val) => {
+        const checkbox = addProductForm.querySelector(`input[name="products"][value="${val}"]`);
+        if (checkbox) checkbox.checked = true;
+      });
+    }
+    if (data.productFeedback) {
+      document.getElementById('custom-product-feedback').value = data.productFeedback;
     }
 
     // Load list or show configured states
@@ -172,7 +238,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // Main UI Render Function
+  // Main UI Render Function for Bitbucket PR list
   function updateUI(data) {
     const hasToken = !!data.bitbucketToken;
     const prs = data.prList || [];

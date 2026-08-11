@@ -1,105 +1,97 @@
-# Bitbucket PR Tracker Extension Installation Guide
+# Atlassian Extension Hub Installation & Setup Guide
 
-A production-ready Chrome Extension (Manifest V3) that tracks open Bitbucket Pull Requests and shows the active PR count directly on the extension's badge icon.
+A production-ready Chrome Extension (Manifest V3) that centralizes your Atlassian workflow. Currently, it fully tracks open Bitbucket Pull Requests (showing live badges and interactive lists) and features modular tabs for **Jira**, **Confluence**, and a customized **Add Product** portal.
 
 ---
 
 ## 📋 Table of Contents
 1. [Prerequisites](#1-prerequisites)
-2. [How to Create Bitbucket Credentials (Securely)](#2-how-to-create-bitbucket-credentials-securely)
+2. [Atlassian Connection Setup](#2-atlassian-connection-setup)
     - [Option A: Personal Access Token (PAT) - Recommended](#option-a-personal-access-token-pat---recommended)
     - [Option B: App Password](#option-b-app-password)
-3. [Chrome Extension Installation Guide](#3-chrome-extension-installation-guide)
-4. [First-Time Configuration & Verification](#4-first-time-configuration--verification)
+3. [Chrome Extension Installation](#3-chrome-extension-installation)
+4. [Using the Tab Navigation Bar](#4-using-the-tab-navigation-bar)
+    - [Bitbucket PRs Tab](#bitbucket-prs-tab)
+    - [Jira (Coming Soon!)](#jira-coming-soon)
+    - [Confluence (Coming Soon!)](#confluence-coming-soon)
+    - [+ Add Product (Customizer)](#-add-product-customizer)
 5. [Troubleshooting & Debugging](#5-troubleshooting--debugging)
 
 ---
 
 ## 1. Prerequisites
-- **Bitbucket Cloud Account** (e.g., hosted on `bitbucket.org`).
-- **Google Chrome Browser** (or any Chromium-based browser supporting Manifest V3, such as Brave, Edge, or Opera).
+- An active **Bitbucket Cloud / Atlassian account** (e.g. hosted on `bitbucket.org`).
+- **Google Chrome** (or any other Chromium browser with Manifest V3 support, such as Brave, Edge, or Opera).
 
 ---
 
-## 2. How to Create Bitbucket Credentials (Securely)
+## 2. Atlassian Connection Setup
 
-Connecting the extension securely is standard practice. You should **never** use your main Atlassian password. Instead, configure either a **Personal Access Token (PAT)** or an **App Password**. Both methods ensure that permissions are scoped strictly to `Read` operations and can be revoked at any time.
+To connect the extension securely, you should **never** use your main Atlassian password. Instead, generate a **Personal Access Token (PAT)** or an **App Password**. Both methods grant safe, limited, read-only permissions that you can revoke at any time.
 
 ### Option A: Personal Access Token (PAT) - *Recommended*
-*Personal Access Tokens are ideal for secure personal or workspace integration.*
-
-1. Log in to your [Bitbucket Cloud](https://bitbucket.org) account.
-2. Click your **avatar / profile icon** in the bottom-left corner and choose **Personal settings**.
-3. Under the **Access management** header in the left sidebar, click **Personal access tokens**.
+1. Log in to [Bitbucket Cloud](https://bitbucket.org).
+2. Click your **avatar** in the bottom-left corner and choose **Personal settings**.
+3. Under the **Access management** header, click **Personal access tokens**.
 4. Click **Create token**.
-5. Give your token a recognizable name (e.g., `Chrome PR Tracker`).
-6. Set the following permissions:
+5. Give your token a name (e.g., `Atlassian Hub Extension`).
+6. Toggle the following permissions to **Read**:
    - **Repositories:** `Read`
    - **Pull requests:** `Read`
-7. Click **Create**.
-8. **Copy the generated token immediately!** (You will not be able to view it again).
+7. Click **Create** and **copy the generated token** immediately.
 
 ### Option B: App Password
-*If your organization has disabled Personal Access Tokens, use an App Password instead.*
-
-1. Log in to your [Bitbucket Cloud](https://bitbucket.org) account.
-2. Click your **avatar / profile icon** in the bottom-left corner and choose **Personal settings**.
-3. In the sidebar under **Access management**, select **App passwords**.
+1. Log in to [Bitbucket Cloud](https://bitbucket.org).
+2. Click your **avatar** in the bottom-left corner and choose **Personal settings**.
+3. Under **Access management**, select **App passwords**.
 4. Click **Create app password**.
-5. Give your app password a label (e.g., `Chrome PR Tracker`).
-6. Set the following scopes:
+5. Give your app password a label (e.g., `Atlassian Hub Extension`).
+6. Set the following scopes to **Read**:
    - **Repositories:** `Read`
    - **Pull Requests:** `Read`
 7. Click **Create**.
-8. **Copy the generated password** immediately, and take note of your **Bitbucket username** (visible under *Personal settings* > *Account settings*).
+8. **Copy the password** immediately, and note down your **Bitbucket username** (found under *Personal settings* > *Account settings*).
 
 ---
 
-## 3. Chrome Extension Installation Guide
+## 3. Chrome Extension Installation
 
-Since this is a custom extension, you will load it into Chrome as an **unpacked developer extension**:
+Load the extension into your browser using Google Chrome's developer mode:
 
 1. Open **Google Chrome**.
-2. Navigate to the Extensions page by typing `chrome://extensions/` in the URL bar, or by clicking the puzzle piece icon on the toolbar and selecting **Manage Extensions**.
-3. In the top-right corner, toggle the **Developer mode** switch to **ON**.
+2. Navigate to `chrome://extensions/`.
+3. In the top-right corner, turn on **Developer mode**.
 4. In the top-left corner, click **Load unpacked**.
-5. Browse to and select the `bitbucket-pr-extension/` directory (the folder containing `manifest.json`).
-6. The extension is now loaded! You should see the **Bitbucket PR Tracker** tile appear.
-7. Click the **puzzle piece icon** on your Chrome toolbar and click the **pin icon** next to **Bitbucket PR Tracker** to keep it visible on your browser bar.
+5. Select the `bitbucket-pr-extension/` directory (the folder containing `manifest.json`).
+6. The **Atlassian Hub** will be loaded. Click the puzzle-piece icon in your Chrome toolbar and **pin** the extension for quick access.
 
 ---
 
-## 4. First-Time Configuration & Verification
+## 4. Using the Tab Navigation Bar
 
-1. Click on the newly pinned **Bitbucket PR Tracker** icon in your browser toolbar.
-2. If this is your first time, the popup will display a welcoming configuration hint. Click **Configure Extension** or the **Gear icon** in the top-right corner to open the Settings panel.
-3. Choose your preferred **Authentication Type**:
-   - For **PAT (Recommended)**: Choose `Personal Access Token (PAT)` and paste the copied token.
-   - For **App Password**: Choose `App Password`, enter your `Bitbucket Username`, and paste the generated App Password.
-4. Click the **Save & Sync** button.
-5. The extension will perform an initial connection to the Bitbucket Cloud API:
-   - If successful, the popup will list your open pull requests and display a last-updated timestamp.
-   - The extension badge icon on your Chrome toolbar will turn **Atlassian Blue (`#0052CC`)** and show the current number of open PRs.
-   - The extension will automatically refresh your PR list every **5 minutes** in the background.
+Our extension features a modern, clean, Atlassian-inspired tab structure that lets you seamlessly switch views:
+
+### 🟢 Bitbucket PRs Tab
+- **The Core Tracker:** Once credentials are configured, this tab displays a scrollable card-list of your open pull requests.
+- **Badge Indicator:** The extension icon badge glows **Atlassian Blue (`#0052CC`)** and displays the active count of your open pull requests.
+- **Instant Actions:** Click any pull request card to open it directly in a new browser tab.
+- **Sync Now:** Use the refresh icon in the tab header to force a manual synchronization on-demand.
+
+### 🔵 Jira (Coming Soon!)
+- A dedicated view that will aggregate all of your assigned Jira issues, active sprints, and status boards directly inside the popup.
+- Stay tuned! This tab is scheduled for release in the upcoming version.
+
+### 🟡 Confluence (Coming Soon!)
+- A dedicated view that will list your saved documents, collaboratively edited spaces, and blog announcements.
+- This feature is coming soon to keep you up-to-date with your team's knowledgebase.
+
+### 🟣 + Add Product (Customizer)
+- **Want more products?** Open this tab to select which integrations you would like next (e.g., Jira Service Management, Trello Boards, Bitbucket Pipelines & Builds, Compass Component Catalog).
+- **Submit Feedback:** Write down your custom requirements in the text box and click **Save Product Request**. This saves your feedback locally and helps guide future development!
 
 ---
 
 ## 5. Troubleshooting & Debugging
 
-### The Badge Shows "ERR" (Red Background)
-The `"ERR"` state indicates that a network request failed or your credentials were rejected.
-- **Check Credentials:** Click the settings icon in the popup and verify your token. Ensure there are no accidental trailing or leading spaces in the input fields.
-- **Check Scopes:** Confirm that your PAT or App Password has both `Repositories: Read` and `Pull requests: Read` permissions.
-- **Check Network:** Verify that you have an active internet connection and that `https://api.bitbucket.org` is not blocked by your firewall/VPN.
-
-### Inspecting Background Logs
-Because background scripts run in isolated environment workers, you can view logs and errors directly:
-1. Navigate to `chrome://extensions/`.
-2. Find the **Bitbucket PR Tracker** card.
-3. Click the link next to **Inspect views** labeled **service worker**.
-4. This opens a dedicated Developer Tools window showing console output, errors, and network traffic generated by `background.js`.
-
-### Forcing a Refresh
-If you want to pull updates immediately without waiting for the 5-minute schedule:
-- Open the extension popup.
-- Click the circular **Sync now** icon in the header.
+- **Badge Shows "ERR" in Red:** This indicates authentication or network failure. Open Settings (gear icon) and verify your token. Ensure no accidental trailing spaces are copied.
+- **Inspecting Background Log Console:** Navigate to `chrome://extensions/`, find the **Atlassian Hub** card, and click the link next to *Inspect views* labeled `service worker` to view active fetch request logs or debug exceptions.
