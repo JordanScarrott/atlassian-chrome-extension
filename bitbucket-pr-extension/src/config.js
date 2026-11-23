@@ -34,7 +34,7 @@ export const CENTRAL_URLS = Object.freeze({
    * Hardcode your Mezzanine Jira base URL here once (no trailing slash), e.g.:
    * 'https://mezzanine.jira.example.com'
    */
-  MEZZANINE_JIRA_URL: '',
+  MEZZANINE_JIRA_URL: 'https://mezzanineware.atlassian.net/',
 
   /** Optional Confluence base URL placeholder (no trailing slash). */
   CONFLUENCE_URL: '',
@@ -75,7 +75,7 @@ export const THROTTLE_CONFIG = Object.freeze({
 
 /** @type {Readonly<Preferences>} */
 export const DEFAULT_PREFERENCES = Object.freeze({
-  pollIntervalMinutes: 5,
+  pollIntervalMinutes: 15,
   badgeMode: 'action_required',
   notificationsEnabled: false,
   staleThresholdHours: 48,

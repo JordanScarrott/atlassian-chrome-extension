@@ -14,7 +14,8 @@
     "generate-icons": "bun scripts/generate-icons.mjs",
     "verify:extension": "bun scripts/verify-extension.mjs",
     "verify": "bun run verify:extension && bun run lint && bun run typecheck && bun test tests",
-    "package": "bun scripts/package-extension.mjs"
+    "package": "bun scripts/package-extension.mjs",
+    "share": "bun run verify:extension && bun scripts/package-extension.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.1.38",

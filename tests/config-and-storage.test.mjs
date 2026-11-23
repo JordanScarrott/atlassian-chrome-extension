@@ -94,7 +94,7 @@ test('config constants match Phase 2 specification', () => {
   assert.equal(THROTTLE_CONFIG.maxBackoffMs, 15 * 60 * 1000);
   assert.equal(THROTTLE_CONFIG.nearLimitDelayMs, 1_500);
 
-  assert.equal(DEFAULT_PREFERENCES.pollIntervalMinutes, 5);
+  assert.equal(DEFAULT_PREFERENCES.pollIntervalMinutes, 15);
   assert.equal(DEFAULT_PREFERENCES.badgeMode, 'action_required');
   assert.equal(DEFAULT_PREFERENCES.notificationsEnabled, false);
   assert.equal(DEFAULT_PREFERENCES.staleThresholdHours, 48);
