@@ -1,151 +1,294 @@
-// Bitbucket PR Tracker Service Worker (Manifest V3 background.js)
+import { fetchOpenPullRequests } from './lib/bitbucket.js';
+import { verifyJiraCredentials } from './lib/jira.js';
+import { normalizeJiraBaseUrl } from './lib/pr-model.js';
 
 const ALARM_NAME = 'pollPRs';
-const ALARM_INTERVAL_MINS = 5;
+const ALARM_INTERVAL_MINS = 60;
+const MIN_AUTO_SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15-minute cooldown for automatic on-open refreshes
 
-// Set up alarm and initial sync on installation
-chrome.runtime.onInstalled.addListener(() => {
-  console.log('Bitbucket PR Tracker Extension Installed.');
-  setupAlarm();
-  fetchAndSyncPRs();
-});
+let activeSyncPromise = null;
 
-// Listen for alarms
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ALARM_NAME) {
-    console.log('Alarm triggered: Polling Bitbucket PRs...');
-    fetchAndSyncPRs();
+const CREDENTIAL_KEYS = ['authType', 'email', 'apiToken', 'jiraBaseUrl', 'jiraToken', 'jiraUser'];
+const STATE_KEYS = [
+  'currentUser',
+  'prList',
+  'myPrs',
+  'toReviewPrs',
+  'pendingReviewCount',
+  'workspaceCount',
+  'lastUpdated',
+  'lastSyncAttemptAt',
+  'error',
+];
+
+async function ensurePollAlarm() {
+  const existing = await chrome.alarms.get(ALARM_NAME);
+  if (!existing || existing.periodInMinutes !== ALARM_INTERVAL_MINS) {
+    if (existing) {
+      await chrome.alarms.clear(ALARM_NAME);
+    }
+    await chrome.alarms.create(ALARM_NAME, { periodInMinutes: ALARM_INTERVAL_MINS });
   }
-});
-
-// Listen for messages from the popup
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'REFRESH_PRS') {
-    console.log('Manual refresh requested via message.');
-    fetchAndSyncPRs()
-      .then(() => sendResponse({ success: true }))
-      .catch((err) => sendResponse({ success: false, error: err.message }));
-    return true; // Keep message channel open for asynchronous response
-  }
-});
-
-// Setup the alarms timer
-function setupAlarm() {
-  chrome.alarms.clear(ALARM_NAME, () => {
-    chrome.alarms.create(ALARM_NAME, { periodInMinutes: ALARM_INTERVAL_MINS });
-    console.log(`Alarm scheduled for every ${ALARM_INTERVAL_MINS} minutes.`);
-  });
 }
 
-// Main logic to fetch and sync Pull Requests
-async function fetchAndSyncPRs() {
+async function updateBadge({ pendingReviewCount = 0, myPrs = [] }) {
+  if (pendingReviewCount > 0) {
+    await chrome.action.setBadgeText({ text: String(pendingReviewCount) });
+    await chrome.action.setBadgeBackgroundColor({ color: '#FF9800' });
+  } else if (myPrs.length > 0) {
+    await chrome.action.setBadgeText({ text: String(myPrs.length) });
+    await chrome.action.setBadgeBackgroundColor({ color: '#0052CC' });
+  } else {
+    await chrome.action.setBadgeText({ text: '' });
+  }
+}
+
+async function clearBadge() {
+  await chrome.action.setBadgeText({ text: '' });
+}
+
+async function setErrorBadge() {
+  await chrome.action.setBadgeText({ text: 'ERR' });
+  await chrome.action.setBadgeBackgroundColor({ color: '#DE350B' });
+}
+
+async function syncPullRequests(overrideCredentials) {
+  if (!overrideCredentials && activeSyncPromise) {
+    return activeSyncPromise;
+  }
+
+  const runSync = async () => {
+    const credentials = overrideCredentials
+      ? {
+          authType: overrideCredentials.authType || 'atlassian_token',
+          email: (overrideCredentials.email || '').trim(),
+          token: (overrideCredentials.apiToken ?? overrideCredentials.token ?? '').trim(),
+        }
+      : await (async () => {
+          const stored = await chrome.storage.local.get(CREDENTIAL_KEYS);
+          return {
+            authType: stored.authType || 'atlassian_token',
+            email: (stored.email || '').trim(),
+            token: (stored.apiToken || '').trim(),
+          };
+        })();
+
+    if (!credentials.token) {
+      await clearBadge();
+      return { ok: false, unauthenticated: true };
+    }
+
+    await chrome.storage.local.set({ lastSyncAttemptAt: Date.now() });
+
+    try {
+      const data = await fetchOpenPullRequests(credentials);
+
+      await chrome.storage.local.set({
+        currentUser: data.user,
+        prList: data.prs,
+        myPrs: data.myPrs,
+        toReviewPrs: data.toReviewPrs,
+        pendingReviewCount: data.pendingReviewCount,
+        workspaceCount: data.workspaceCount,
+        lastUpdated: data.lastUpdated,
+        error: null,
+      });
+
+      await updateBadge(data);
+      return { ok: true, data };
+    } catch (err) {
+      const error = {
+        code: err?.code || 'API_ERROR',
+        message: err?.message || 'An unknown error occurred during sync.',
+      };
+      await chrome.storage.local.set({ error });
+      await setErrorBadge();
+      return { ok: false, error };
+    }
+  };
+
+  if (overrideCredentials) {
+    return runSync();
+  }
+
+  activeSyncPromise = runSync();
   try {
-    const settings = await chrome.storage.local.get([
-      'bitbucketToken',
-      'bitbucketUsername',
-      'authType'
-    ]);
+    return await activeSyncPromise;
+  } finally {
+    activeSyncPromise = null;
+  }
+}
 
-    const { bitbucketToken, bitbucketUsername, authType } = settings;
+chrome.runtime.onInstalled.addListener(async () => {
+  try {
+    await ensurePollAlarm();
+    await syncPullRequests();
+  } catch (err) {
+    console.error('onInstalled sync failed:', err);
+  }
+});
 
-    if (!bitbucketToken) {
-      console.log('No Bitbucket token/password configured. Clearing badge.');
-      chrome.action.setBadgeText({ text: '' });
-      await chrome.storage.local.set({ prList: [], error: 'Token not configured' });
-      return;
+chrome.runtime.onStartup.addListener(async () => {
+  try {
+    await ensurePollAlarm();
+    await syncPullRequests();
+  } catch (err) {
+    console.error('onStartup sync failed:', err);
+  }
+});
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === ALARM_NAME) {
+    try {
+      await syncPullRequests();
+    } catch (err) {
+      console.error('Alarm sync failed:', err);
     }
+  }
+});
 
-    // Determine auth header type
-    let authHeader = '';
-    if (authType === 'app_password') {
-      if (!bitbucketUsername) {
-        throw new Error('Username is required for App Password authentication.');
+async function handleMessage(message, sendResponse) {
+  try {
+    switch (message?.type) {
+      case 'SIGN_IN_AND_SYNC': {
+        const stored = await chrome.storage.local.get(CREDENTIAL_KEYS);
+        const payload = message.credentials || message;
+        const authType = payload?.authType || stored.authType || 'atlassian_token';
+        const email = (payload?.email ?? stored.email ?? '').trim();
+        const submittedApiToken = (payload?.apiToken ?? payload?.token ?? '').trim();
+        const apiToken = submittedApiToken || stored.apiToken || '';
+        const rawJiraUrl = (payload?.jiraBaseUrl ?? stored.jiraBaseUrl ?? '').trim();
+        const jiraBaseUrl = rawJiraUrl ? normalizeJiraBaseUrl(rawJiraUrl) : '';
+        const submittedJiraToken = (payload?.jiraToken ?? '').trim();
+        const jiraToken = submittedJiraToken || (jiraBaseUrl ? stored.jiraToken || '' : '');
+
+        if (rawJiraUrl && !jiraBaseUrl) {
+          sendResponse({
+            ok: false,
+            error: {
+              code: 'INVALID_INPUT',
+              message: 'Jira Site URL must be a valid URL (e.g. https://your-company.atlassian.net).',
+            },
+          });
+          break;
+        }
+
+        let jiraUser = null;
+        if (jiraToken) {
+          if (!jiraBaseUrl) {
+            sendResponse({
+              ok: false,
+              error: {
+                code: 'INVALID_INPUT',
+                message: 'Enter your Jira Site URL to verify your Jira API token.',
+              },
+            });
+            break;
+          }
+          jiraUser = await verifyJiraCredentials({ jiraBaseUrl, email, jiraToken });
+        }
+
+        const result = await syncPullRequests({ authType, email, token: apiToken });
+        if (result.ok) {
+          await chrome.storage.local.set({
+            authType,
+            email,
+            apiToken,
+            jiraBaseUrl,
+            jiraToken,
+            jiraUser,
+          });
+          await ensurePollAlarm();
+          sendResponse({ ok: true, data: result.data, jiraBaseUrl, jiraUser });
+        } else {
+          sendResponse({
+            ok: false,
+            error: result.error || {
+              code: 'INVALID_INPUT',
+              message: 'API token is required.',
+            },
+          });
+        }
+        break;
       }
-      const credentials = `${bitbucketUsername.trim()}:${bitbucketToken.trim()}`;
-      // In Manifest V3 service workers, btoa is natively supported
-      const base64Credentials = btoa(unescape(encodeURIComponent(credentials)));
-      authHeader = `Basic ${base64Credentials}`;
-    } else {
-      // Default to Personal Access Token / Bearer token
-      authHeader = `Bearer ${bitbucketToken.trim()}`;
+
+      case 'CLEAR_JIRA': {
+        await chrome.storage.local.remove(['jiraBaseUrl', 'jiraToken', 'jiraUser']);
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'REFRESH_PRS': {
+        if (message?.auto) {
+          const { lastUpdated, lastSyncAttemptAt } = await chrome.storage.local.get([
+            'lastUpdated',
+            'lastSyncAttemptAt',
+          ]);
+          const updatedTs = lastUpdated ? Date.parse(lastUpdated) : 0;
+          const attemptTs = Number(lastSyncAttemptAt) || 0;
+          const latestTs = Math.max(Number.isFinite(updatedTs) ? updatedTs : 0, attemptTs);
+
+          if (latestTs > 0 && Date.now() - latestTs < MIN_AUTO_SYNC_INTERVAL_MS) {
+            sendResponse({ ok: true, skipped: true, reason: 'cooldown' });
+            break;
+          }
+        }
+        const result = await syncPullRequests();
+        sendResponse(result);
+        break;
+      }
+
+      case 'SIGN_OUT': {
+        await chrome.storage.local.remove([...CREDENTIAL_KEYS, ...STATE_KEYS]);
+        await clearBadge();
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'GET_STATE': {
+        const stored = await chrome.storage.local.get([...CREDENTIAL_KEYS, ...STATE_KEYS]);
+        sendResponse({
+          ok: true,
+          authenticated: Boolean(stored.apiToken),
+          authType: stored.authType || 'atlassian_token',
+          email: stored.email || '',
+          hasApiToken: Boolean(stored.apiToken),
+          jiraBaseUrl: stored.jiraBaseUrl || '',
+          hasJiraToken: Boolean(stored.jiraToken),
+          jiraUser: stored.jiraUser || null,
+          currentUser: stored.currentUser || null,
+          prList: stored.prList || [],
+          myPrs: stored.myPrs || [],
+          toReviewPrs: stored.toReviewPrs || [],
+          pendingReviewCount: stored.pendingReviewCount || 0,
+          workspaceCount: stored.workspaceCount || 0,
+          lastUpdated: stored.lastUpdated || null,
+          error: stored.error || null,
+        });
+        break;
+      }
+
+      default:
+        sendResponse({
+          ok: false,
+          error: {
+            code: 'UNKNOWN_MESSAGE',
+            message: `Unsupported message type: ${message?.type}`,
+          },
+        });
     }
-
-    const headers = {
-      'Authorization': authHeader,
-      'Accept': 'application/json'
-    };
-
-    // 1. Fetch current user info to obtain uuid
-    console.log('Fetching user info from Bitbucket...');
-    const userResponse = await fetch('https://api.bitbucket.org/2.0/user', { headers });
-
-    if (!userResponse.ok) {
-      const errorText = await userResponse.text();
-      throw new Error(`User API Failed (${userResponse.status}): ${errorText || userResponse.statusText}`);
-    }
-
-    const userData = await userResponse.json();
-    const userUuid = userData.uuid;
-    if (!userUuid) {
-      throw new Error('Could not retrieve user UUID from Bitbucket API response.');
-    }
-
-    console.log(`Successfully obtained user UUID: ${userUuid}`);
-
-    // 2. Fetch open pull requests associated with the user
-    // Format is GET https://api.bitbucket.org/2.0/pullrequests/{uuid}?q=state="OPEN"
-    const prUrl = `https://api.bitbucket.org/2.0/pullrequests/${encodeURIComponent(userUuid)}?q=state=%22OPEN%22`;
-    console.log(`Fetching open pull requests...`);
-    const prResponse = await fetch(prUrl, { headers });
-
-    if (!prResponse.ok) {
-      const errorText = await prResponse.text();
-      throw new Error(`PR API Failed (${prResponse.status}): ${errorText || prResponse.statusText}`);
-    }
-
-    const prData = await prResponse.json();
-    const rawPrList = prData.values || [];
-
-    // Map response to clean structure for caching and popup display
-    const mappedPrList = rawPrList.map((pr) => ({
-      id: pr.id,
-      title: pr.title,
-      description: pr.description || '',
-      state: pr.state,
-      createdOn: pr.created_on,
-      url: pr.links?.html?.href || '#',
-      repoName: pr.source?.repository?.full_name || pr.destination?.repository?.full_name || 'Unknown Repository',
-      author: pr.author?.display_name || 'Unknown Author'
-    }));
-
-    // Update the extension badge icon
-    const prCount = mappedPrList.length;
-    if (prCount > 0) {
-      chrome.action.setBadgeText({ text: prCount.toString() });
-      chrome.action.setBadgeBackgroundColor({ color: '#0052CC' }); // Atlassian Blue
-    } else {
-      chrome.action.setBadgeText({ text: '' });
-    }
-
-    // Save successful fetch results in local storage
-    await chrome.storage.local.set({
-      prList: mappedPrList,
-      lastUpdated: Date.now(),
-      error: null
-    });
-
-    console.log(`PR Sync completed successfully. Found ${prCount} open PR(s).`);
-
-  } catch (error) {
-    console.error('Error syncing Bitbucket PRs:', error);
-
-    // Update badge to display error
-    chrome.action.setBadgeText({ text: 'ERR' });
-    chrome.action.setBadgeBackgroundColor({ color: '#DE350B' }); // Atlassian Red
-
-    // Save error details in local storage
-    await chrome.storage.local.set({
-      error: error.message || 'An unknown error occurred during sync.'
+  } catch (err) {
+    sendResponse({
+      ok: false,
+      error: {
+        code: err?.code || 'API_ERROR',
+        message: err?.message || 'Unexpected service worker error.',
+      },
     });
   }
 }
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  handleMessage(message, sendResponse);
+  return true;
+});

@@ -2,198 +2,374 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Atlassian Extension Hub</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>Bitbucket PR Tracker</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="extension-container">
-    <!-- Header -->
-    <header class="header">
-      <div class="logo-title">
-        <svg class="bitbucket-logo" viewBox="0 0 24 24" width="20" height="20">
-          <path fill="#0052CC" d="M22.1 2H1.9c-.5 0-.9.4-.9.9v18.2c0 .5.4.9.9.9h20.2c.5 0 .9-.4.9-.9V2.9c0-.5-.4-.9-.9-.9zm-5.7 14.5H7.6l-1.3-7.7h11.4l-1.3 7.7z"/>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="header-brand">
+        <svg class="brand-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="6" cy="6" r="2.75" stroke="currentColor" stroke-width="2" />
+          <circle cx="6" cy="18" r="2.75" stroke="currentColor" stroke-width="2" />
+          <circle cx="18" cy="15" r="2.75" stroke="currentColor" stroke-width="2" />
+          <path d="M6 8.75V15.25M9 6H14.5C16.433 6 18 7.567 18 9.5V12.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
         </svg>
-        <h1 id="app-title">Atlassian Hub</h1>
+        <div class="header-titles">
+          <h1 class="app-title">Bitbucket PR Tracker</h1>
+          <p id="header-user" class="header-user" hidden></p>
+        </div>
       </div>
-      <button id="toggle-settings-btn" class="icon-btn" title="Settings">
-        <svg viewBox="0 0 24 24" width="16" height="16">
-          <path fill="#42526E" d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
-        </svg>
-      </button>
+
+      <div class="header-actions">
+        <button
+          type="button"
+          id="refresh-btn"
+          class="icon-btn"
+          aria-label="Refresh pull requests"
+          title="Refresh pull requests"
+          hidden
+        >
+          <svg class="icon-svg refresh-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+            <path d="M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+
+        <button
+          type="button"
+          id="settings-btn"
+          class="icon-btn"
+          aria-label="Account settings"
+          title="Account settings"
+          aria-expanded="false"
+          hidden
+        >
+          <svg class="icon-svg" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
     </header>
 
-    <!-- Top Tab Navigation Bar -->
-    <nav class="tabs-nav">
-      <button class="tab-btn active" data-tab="bitbucket-tab">Bitbucket PRs</button>
-      <button class="tab-btn" data-tab="jira-tab">Jira</button>
-      <button class="tab-btn" data-tab="confluence-tab">Confluence</button>
-      <button class="tab-btn tab-btn-add" data-tab="add-product-tab">+ Add Product</button>
-    </nav>
+    <div id="error-banner" class="error-banner" role="alert" hidden>
+      <div class="error-banner-body">
+        <span class="error-banner-icon" aria-hidden="true">⚠</span>
+        <span id="error-banner-message" class="error-banner-message"></span>
+      </div>
+      <div class="error-banner-actions">
+        <button type="button" id="check-credentials-btn" class="btn btn-sm btn-secondary" hidden>
+          Check Credentials
+        </button>
+      </div>
+    </div>
 
-    <!-- Main Content Panel -->
-    <main class="main-content">
-      <!-- Settings Panel (Collapsible/Toggleable, global settings) -->
-      <section id="settings-panel" class="settings-panel hidden">
-        <h2>Connection Settings (Bitbucket)</h2>
+    <main class="app-main">
+      <div id="loading-view" class="loading-view">
+        <span class="loading-spinner" aria-hidden="true"></span>
+        <span>Loading pull requests…</span>
+      </div>
 
-        <div class="form-group">
-          <label for="auth-type">Authentication Type</label>
-          <select id="auth-type" class="form-control">
-            <option value="pat">Personal Access Token (PAT)</option>
-            <option value="app_password">App Password (with Username)</option>
-          </select>
-        </div>
+      <section id="auth-section" class="auth-section" aria-labelledby="auth-heading" hidden>
+        <h2 id="auth-heading" class="section-heading">API Keys &amp; Integrations</h2>
 
-        <div id="username-group" class="form-group hidden">
-          <label for="bitbucket-username">Bitbucket Username</label>
-          <input type="text" id="bitbucket-username" class="form-control" placeholder="e.g. atlassian_user" />
-          <p class="field-help">Required for App Password login.</p>
-        </div>
+        <form id="auth-form" class="auth-form" novalidate>
+          <div class="integration-card">
+            <div class="integration-card-header">
+              <span class="integration-title">Bitbucket Cloud</span>
+              <span id="bitbucket-key-status" class="integration-badge">Not connected</span>
+            </div>
 
-        <div class="form-group">
-          <label id="token-label" for="bitbucket-token">Personal Access Token (PAT)</label>
-          <div class="input-password-wrapper">
-            <input type="password" id="bitbucket-token" class="form-control" placeholder="Paste secure token here" />
-            <button id="toggle-token-visibility" type="button" class="visibility-btn" title="Toggle visibility">👁️</button>
+            <fieldset class="auth-method-fieldset">
+            <legend>Authentication method</legend>
+            <div class="radio-group">
+              <label class="radio-option" for="auth-method-atlassian">
+                <input
+                  type="radio"
+                  name="authType"
+                  id="auth-method-atlassian"
+                  value="atlassian_token"
+                  checked
+                >
+                <span>Atlassian API Token (Recommended)</span>
+              </label>
+              <label class="radio-option" for="auth-method-bearer">
+                <input
+                  type="radio"
+                  name="authType"
+                  id="auth-method-bearer"
+                  value="bearer_token"
+                >
+                <span>Bitbucket Access Token</span>
+              </label>
+            </div>
+          </fieldset>
+
+          <div id="setup-box" class="setup-box">
+            <div class="setup-box-header">
+              <p class="setup-box-title">Create a scoped Atlassian API token:</p>
+              <a
+                id="api-tokens-link"
+                class="setup-link"
+                href="https://id.atlassian.com/manage-profile/security/api-tokens"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open API Token Settings ↗
+              </a>
+            </div>
+            <p class="setup-scopes-label">Required read-only scopes:</p>
+            <ul class="scope-list">
+              <li><code>read:user:bitbucket</code></li>
+              <li><code>read:workspace:bitbucket</code></li>
+              <li><code>read:repository:bitbucket</code></li>
+              <li><code>read:pullrequest:bitbucket</code></li>
+            </ul>
           </div>
-          <p id="token-help" class="field-help">Requires 'Pull Requests: Read' and 'Repositories: Read' scopes.</p>
-        </div>
 
-        <div class="settings-actions">
-          <button id="save-settings-btn" class="btn btn-primary">Save & Sync</button>
-          <button id="cancel-settings-btn" class="btn btn-secondary">Cancel</button>
-        </div>
+          <div id="email-field" class="field">
+            <label for="email-input" class="field-label">
+              Atlassian Account Email <span class="required-mark" aria-hidden="true">*</span>
+            </label>
+            <span id="email-hint" class="field-hint">
+              Format: you@company.com (Atlassian account email)
+            </span>
+            <input
+              id="email-input"
+              class="form-input"
+              name="email"
+              type="email"
+              required
+              autocomplete="email"
+              autocorrect="off"
+              autocapitalize="none"
+              spellcheck="false"
+              enterkeyhint="next"
+              aria-invalid="false"
+              aria-describedby="email-hint"
+              data-error="email-error"
+              placeholder="you@company.com"
+            >
+            <div id="email-error" class="field-error">
+              <span role="img" aria-label="Error">⚠</span>
+              <span id="email-error-text">Enter an email address in the format you@example.com.</span>
+            </div>
+          </div>
+
+          <div id="token-field" class="field">
+            <label for="token-input" id="token-label" class="field-label">
+              Atlassian API Token <span class="required-mark" aria-hidden="true">*</span>
+            </label>
+            <span id="token-hint" class="field-hint">
+              Paste your scoped token (stored locally in Chrome storage)
+            </span>
+            <div class="input-with-action">
+              <input
+                id="token-input"
+                class="form-input"
+                name="apiToken"
+                type="password"
+                required
+                autocomplete="off"
+                autocorrect="off"
+                autocapitalize="none"
+                spellcheck="false"
+                enterkeyhint="done"
+                aria-invalid="false"
+                aria-describedby="token-hint"
+                data-error="token-error"
+                placeholder="Paste API token"
+              >
+              <button
+                type="button"
+                id="toggle-token-visibility"
+                class="icon-btn token-toggle-btn"
+                aria-pressed="false"
+                aria-label="Show token"
+                title="Show token"
+              >
+                <svg class="icon-svg icon-eye" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z" stroke="currentColor" stroke-width="2" stroke-linejoin="round" />
+                  <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" />
+                </svg>
+                <svg class="icon-svg icon-eye-off" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M17.94 17.94A10.94 10.94 0 0 1 12 19c-7 0-11-7-11-7a21.8 21.8 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a21.8 21.8 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                  <path d="M1 1l22 22" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
+            <div id="token-error" class="field-error">
+              <span role="img" aria-label="Error">⚠</span>
+              <span id="token-error-text">Enter a valid API token.</span>
+            </div>
+          </div>
+          </div>
+
+          <div class="integration-card">
+            <div class="integration-card-header">
+              <span class="integration-title">Jira Ticket Linking (Optional)</span>
+              <span id="jira-key-status" class="integration-badge">Not configured</span>
+            </div>
+
+            <div class="field">
+              <label for="jira-url-input" class="field-label">Jira Site URL</label>
+              <span id="jira-url-hint" class="field-hint">
+                Links PR keys like <code>PROJ-123</code> directly to Jira (no token required)
+              </span>
+              <input
+                id="jira-url-input"
+                class="form-input"
+                name="jiraBaseUrl"
+                type="url"
+                autocomplete="url"
+                autocorrect="off"
+                autocapitalize="none"
+                spellcheck="false"
+                enterkeyhint="next"
+                aria-invalid="false"
+                aria-describedby="jira-url-hint"
+                data-error="jira-url-error"
+                placeholder="https://your-company.atlassian.net"
+              >
+              <div id="jira-url-error" class="field-error">
+                <span role="img" aria-label="Error">⚠</span>
+                <span id="jira-url-error-text">Enter a valid URL (e.g. https://your-company.atlassian.net).</span>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="jira-token-input" class="field-label">Jira API Token (Optional)</label>
+              <span id="jira-token-hint" class="field-hint">
+                Optional scoped token if you want to verify Jira API access
+              </span>
+              <div class="input-with-action">
+                <input
+                  id="jira-token-input"
+                  class="form-input"
+                  name="jiraToken"
+                  type="password"
+                  autocomplete="off"
+                  autocorrect="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  enterkeyhint="done"
+                  aria-invalid="false"
+                  aria-describedby="jira-token-hint"
+                  placeholder="Optional Jira API token"
+                >
+                <button
+                  type="button"
+                  id="toggle-jira-token-visibility"
+                  class="icon-btn token-toggle-btn"
+                  aria-pressed="false"
+                  aria-label="Show Jira token"
+                  title="Show Jira token"
+                >
+                  <svg class="icon-svg icon-eye" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z" stroke="currentColor" stroke-width="2" stroke-linejoin="round" />
+                    <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" />
+                  </svg>
+                  <svg class="icon-svg icon-eye-off" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path d="M17.94 17.94A10.94 10.94 0 0 1 12 19c-7 0-11-7-11-7a21.8 21.8 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a21.8 21.8 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                    <path d="M1 1l22 22" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <div id="jira-clear-row" class="integration-actions-row" hidden>
+              <button type="button" id="clear-jira-btn" class="btn btn-sm btn-secondary">
+                Remove Jira Config
+              </button>
+            </div>
+          </div>
+
+          <div id="auth-form-error" class="form-error-box" role="alert" hidden>
+            <span aria-hidden="true">⚠</span>
+            <span id="auth-form-error-text"></span>
+          </div>
+
+          <div class="form-actions">
+            <button type="submit" id="submit-auth-btn" class="btn btn-primary">
+              Save &amp; Sync
+            </button>
+            <button type="button" id="cancel-auth-btn" class="btn btn-secondary" hidden>
+              Back to PRs
+            </button>
+          </div>
+
+          <div id="signed-in-account-actions" class="account-footer-actions" hidden>
+            <button type="button" id="sign-out-btn" class="btn btn-danger-outline">
+              Sign Out
+            </button>
+          </div>
+        </form>
       </section>
 
-      <!-- Panel 1: Bitbucket PR List -->
-      <section id="bitbucket-tab-panel" class="tab-panel">
-        <div class="list-header">
-          <span id="pr-count-title">Pull Requests</span>
-          <button id="manual-refresh-btn" class="icon-btn" title="Sync now">
-            <svg viewBox="0 0 24 24" width="14" height="14">
-              <path fill="#42526E" d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
-            </svg>
+      <section id="dashboard-section" class="dashboard-section" aria-label="Pull requests" hidden>
+        <div class="tablist" role="tablist" focusgroup="tablist nomemory" aria-label="Pull request categories">
+          <button
+            type="button"
+            role="tab"
+            id="tab-my-prs"
+            aria-selected="true"
+            tabindex="0"
+            focusgroupstart
+          >
+            <span class="tab-label">My PRs</span>
+            <span class="tab-badge" id="my-prs-count">0</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            id="tab-to-review"
+            aria-selected="false"
+            tabindex="-1"
+          >
+            <span class="tab-label">To Review</span>
+            <span class="tab-badge" id="to-review-count">0</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            id="tab-more"
+            aria-selected="false"
+            tabindex="-1"
+          >
+            <span class="tab-label">More</span>
           </button>
         </div>
 
-        <!-- Dynamic Status Alerts -->
-        <div id="loading-indicator" class="status-alert info hidden">
-          <div class="spinner"></div>
-          <span>Checking Bitbucket pull requests...</span>
-        </div>
-
-        <div id="error-alert" class="status-alert error hidden">
-          <div class="alert-icon">⚠️</div>
-          <div class="alert-content">
-            <strong id="error-title">Sync Error</strong>
-            <p id="error-message">Unable to fetch open PRs.</p>
-            <button id="error-setup-btn" class="btn btn-small btn-error-action">Configure Settings</button>
+        <div class="tabpanels-container">
+          <div id="panel-my-prs" role="tabpanel" aria-labelledby="tab-my-prs" tabindex="0">
+            <div class="panel-body" id="my-prs-list"></div>
           </div>
-        </div>
-
-        <!-- Scrollable list wrapper -->
-        <div id="pr-items-container" class="pr-items-container">
-          <!-- Dynamic PR list items inserted here -->
-        </div>
-
-        <!-- Empty state placeholder -->
-        <div id="empty-state" class="empty-state hidden">
-          <svg viewBox="0 0 24 24" width="48" height="48" class="empty-icon">
-            <path fill="#C1C7D0" d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-5 12H9c-.55 0-1-.45-1-1s.45-1 1-1h6c.55 0 1 .45 1 1s-.45 1-1 1zm3-4H6c-.55 0-1-.45-1-1s.45-1 1-1h12c.55 0 1 .45 1 1s-.45 1-1 1z"/>
-          </svg>
-          <h3>All caught up!</h3>
-          <p>No open pull requests are assigned to you.</p>
-        </div>
-
-        <!-- Setup hint placeholder -->
-        <div id="setup-hint" class="empty-state hidden">
-          <svg viewBox="0 0 24 24" width="48" height="48" class="empty-icon">
-            <path fill="#C1C7D0" d="M12.65 11.1C12.95 10.59 13 10 13 9.5c0-1.93-1.57-3.5-3.5-3.5S6 7.57 6 9.5c0 1.93 1.57 3.5 3.5 3.5.5 0 1.09-.05 1.6-.35L17.5 19.1c.39.39 1.03.39 1.42 0l1.42-1.42c.39-.39.39-1.03 0-1.42l-7.69-5.18zM9.5 11c-.83 0-1.5-.67-1.5-1.5S8.67 8 9.5 8s1.5.67 1.5 1.5S10.33 11 9.5 11z"/>
-          </svg>
-          <h3>Welcome!</h3>
-          <p>Connect your Bitbucket account to start tracking open pull requests.</p>
-          <button id="setup-hint-btn" class="btn btn-primary">Configure Extension</button>
-        </div>
-      </section>
-
-      <!-- Panel 2: Jira (Future Product placeholder) -->
-      <section id="jira-tab-panel" class="tab-panel hidden">
-        <div class="empty-state">
-          <svg viewBox="0 0 24 24" width="48" height="48" class="empty-icon">
-            <path fill="#0052CC" d="M11.53 2c-.39 0-.75.21-.95.55L1.13 18.99c-.19.33-.19.74 0 1.07.19.33.55.54.94.54h19.86c.39 0 .75-.21.95-.55.19-.33.19-.74 0-1.07L13.43 2.55c-.2-.34-.56-.55-.95-.55h-.95zM12 18c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1zm1-4c0 .55-.45 1-1 1s-1-.45-1-1V9c0-.55.45-1 1-1s1 .45 1 1v5z"/>
-          </svg>
-          <h3>Jira Integration</h3>
-          <p class="feature-coming-soon">🔥 Coming Soon!</p>
-          <p>Track your assigned Jira Issues, sprints, and ticket status updates directly in this tab. Keep an eye out for our upcoming version release.</p>
-          <button class="btn btn-secondary disabled-btn" disabled>Connect Jira</button>
-        </div>
-      </section>
-
-      <!-- Panel 3: Confluence (Future Product placeholder) -->
-      <section id="confluence-tab-panel" class="tab-panel hidden">
-        <div class="empty-state">
-          <svg viewBox="0 0 24 24" width="48" height="48" class="empty-icon">
-            <path fill="#0052CC" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
-          </svg>
-          <h3>Confluence Integration</h3>
-          <p class="feature-coming-soon">🔥 Coming Soon!</p>
-          <p>Read your saved pages, track updates on collaboratively edited spaces, and monitor comments on your blogs/documents from Confluence.</p>
-          <button class="btn btn-secondary disabled-btn" disabled>Connect Confluence</button>
-        </div>
-      </section>
-
-      <!-- Panel 4: + Add Product Configurator -->
-      <section id="add-product-tab-panel" class="tab-panel hidden">
-        <div class="add-product-container">
-          <h3>Request/Customize Atlassian Products</h3>
-          <p class="intro-text">Select which Atlassian products you would like integrated into your navigation bar in future updates.</p>
-
-          <form id="add-product-form" class="add-product-form">
-            <div class="checkbox-group">
-              <label class="checkbox-label">
-                <input type="checkbox" name="products" value="jira_service_desk" />
-                <span>Jira Service Management</span>
-              </label>
-              <label class="checkbox-label">
-                <input type="checkbox" name="products" value="trello" />
-                <span>Trello Boards</span>
-              </label>
-              <label class="checkbox-label">
-                <input type="checkbox" name="products" value="bitbucket_pipelines" />
-                <span>Bitbucket Pipelines & Builds</span>
-              </label>
-              <label class="checkbox-label">
-                <input type="checkbox" name="products" value="opsgenie" />
-                <span>Opsgenie Incident Alerts</span>
-              </label>
-              <label class="checkbox-label">
-                <input type="checkbox" name="products" value="compass" />
-                <span>Compass Component Catalog</span>
-              </label>
+          <div id="panel-to-review" role="tabpanel" aria-labelledby="tab-to-review" hidden>
+            <div class="panel-body" id="to-review-list"></div>
+          </div>
+          <div id="panel-more" role="tabpanel" aria-labelledby="tab-more" hidden>
+            <div class="panel-body">
+              <div class="more-placeholder">
+                <h2 class="more-title">More</h2>
+                <p class="more-text">This tab is intentionally empty and ready for future additions.</p>
+              </div>
             </div>
-
-            <div class="form-group">
-              <label for="custom-product-feedback">Other Ideas / Custom API Integrations:</label>
-              <textarea id="custom-product-feedback" class="form-control" rows="3" placeholder="Tell us what you'd like to track next..."></textarea>
-            </div>
-
-            <button type="submit" class="btn btn-primary w-100">Save Product Request</button>
-          </form>
-
-          <div id="product-request-success" class="status-alert info hidden" style="margin: 12px 0 0 0;">
-            <span>✨ Thanks! Your feature request has been saved locally.</span>
           </div>
         </div>
       </section>
     </main>
 
-    <!-- Footer -->
-    <footer class="footer">
-      <div id="last-updated-text">Never updated</div>
-      <div class="version">v1.1.0</div>
+    <footer class="app-footer">
+      <span id="last-synced" class="footer-sync">Last synced: Never</span>
+      <span id="app-version" class="footer-version">v1.1.0</span>
     </footer>
+
+    <div id="live-announcer" class="visually-hidden" aria-live="polite"></div>
   </div>
 
-  <script src="popup.js"></script>
+  <script type="module" src="popup.js"></script>
 </body>
 </html>

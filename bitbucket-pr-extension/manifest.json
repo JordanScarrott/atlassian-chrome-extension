@@ -1,21 +1,22 @@
 {
   "manifest_version": 3,
   "name": "Bitbucket PR Tracker",
-  "version": "1.0.0",
-  "description": "Tracks open Bitbucket Pull Requests and shows the active count on the extension badge icon.",
+  "version": "1.1.0",
+  "description": "Sign in with your Atlassian API token to track Bitbucket pull requests you created and need to review.",
   "permissions": [
     "storage",
     "alarms"
   ],
   "host_permissions": [
-    "https://api.bitbucket.org/*"
+    "https://api.bitbucket.org/*",
+    "https://*.atlassian.net/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Bitbucket Pull Requests",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
