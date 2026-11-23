@@ -7,6 +7,14 @@ import {
   sanitizeHttpsUrl
 } from './src/config.js';
 import {
+  buildReviewerBreakdown,
+  formatFooterUpdated,
+  formatRelativeAge,
+  formatRemainingSnooze,
+  getCiBadgeDescriptor,
+  getCrossFilterEmptyHint
+} from './src/popup-helpers.js';
+import {
   collectActiveJiraTickets,
   computeCounts,
   filterAndSortPrs,
@@ -50,15 +58,6 @@ import { normalizeAuthType } from './src/storage.js';
 
 const SNOOZE_FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 const TOP_TABS = ['bitbucket-tab', 'jira-tab', 'confluence-tab', 'add-product-tab'];
-
-/** @type {Readonly<Record<PrFilter, string>>} */
-const FILTER_LABELS = Object.freeze({
-  action_required: 'Needs Action',
-  reviewing: 'Reviewing',
-  authored: 'My PRs',
-  all: 'All PRs',
-  snoozed: 'Snoozed'
-});
 
 /** @type {Readonly<Record<string, ActionBadgeMeta>>} */
 const ACTION_BADGE_LABELS = Object.freeze({
@@ -147,63 +146,6 @@ function sendWorkerMessage(payload) {
       resolve(/** @type {T} */ (response ?? {}));
     });
   });
-}
-
-/**
- * Format a compact relative age label (`just now`, `5m`, `3h`, `6d`, or short date like `Nov 8` for >= 14d).
- *
- * @param {string} isoTimestamp
- * @param {number} [now]
- * @returns {string}
- */
-function formatRelativeAge(isoTimestamp, now = Date.now()) {
-  const parsed = Date.parse(isoTimestamp);
-  if (Number.isNaN(parsed)) {
-    return '';
-  }
-  const diffMinutes = Math.max(0, Math.floor((now - parsed) / 60_000));
-  if (diffMinutes < 1) {
-    return 'just now';
-  }
-  if (diffMinutes < 60) {
-    return `${diffMinutes}m`;
-  }
-  const diffHours = Math.floor(diffMinutes / 60);
-  if (diffHours < 24) {
-    return `${diffHours}h`;
-  }
-  const diffDays = Math.floor(diffHours / 24);
-  if (diffDays < 14) {
-    return `${diffDays}d`;
-  }
-  return new Date(parsed).toLocaleDateString(undefined, {
-    month: 'short',
-    day: 'numeric'
-  });
-}
-
-/**
- * Format remaining snooze duration (e.g. `3h 40m left`, `25m left`, `<1m left`).
- *
- * @param {number} untilMs
- * @param {number} [now]
- * @returns {string}
- */
-function formatSnoozeRemaining(untilMs, now = Date.now()) {
-  const remainingMs = Math.max(0, untilMs - now);
-  const totalMinutes = Math.ceil(remainingMs / 60_000);
-  if (totalMinutes <= 1) {
-    return '<1m left';
-  }
-  const hours = Math.floor(totalMinutes / 60);
-  const mins = totalMinutes % 60;
-  if (hours > 0 && mins > 0) {
-    return `${hours}h ${mins}m left`;
-  }
-  if (hours > 0) {
-    return `${hours}h left`;
-  }
-  return `${mins}m left`;
 }
 
 /**
@@ -826,75 +768,37 @@ document.addEventListener('DOMContentLoaded', async () => {
    */
   function renderFooterTimestamp() {
     const ts = state.snapshot.lastUpdated;
-    if (!ts) {
-      lastUpdatedText.textContent = 'Never updated';
+    lastUpdatedText.textContent = formatFooterUpdated(ts);
+    if (typeof ts === 'number' && Number.isFinite(ts) && ts > 0) {
+      lastUpdatedText.title = `Last synced: ${new Date(ts).toLocaleString()}`;
+    } else {
       lastUpdatedText.removeAttribute('title');
-      return;
     }
-
-    const now = Date.now();
-    const diffMinutes = Math.max(0, Math.floor((now - ts) / 60_000));
-    let relativeLabel = 'just now';
-    if (diffMinutes >= 1 && diffMinutes < 60) {
-      relativeLabel = `${diffMinutes}m ago`;
-    } else if (diffMinutes >= 60) {
-      const diffHours = Math.floor(diffMinutes / 60);
-      if (diffHours < 24) {
-        relativeLabel = `${diffHours}h ago`;
-      } else {
-        const diffDays = Math.floor(diffHours / 24);
-        relativeLabel = `${diffDays}d ago`;
-      }
-    }
-
-    lastUpdatedText.textContent = `Updated ${relativeLabel}`;
-    lastUpdatedText.title = `Last synced: ${new Date(ts).toLocaleString()}`;
   }
 
   /**
    * Build a crisp CI status pill (`.ci-badge`) from `pr.buildStatus`.
    *
    * @param {NonNullable<EnrichedPullRequest['buildStatus']>} buildStatus
-   * @returns {HTMLAnchorElement | HTMLSpanElement}
+   * @returns {HTMLAnchorElement | HTMLSpanElement | null}
    */
   function buildCiBadgeElement(buildStatus) {
-    const safeUrl = sanitizeHttpsUrl(buildStatus.url);
-    const el = safeUrl ? document.createElement('a') : document.createElement('span');
-
-    let stateClass = 'ci-stopped';
-    let label = '■ CI';
-    if (buildStatus.state === 'SUCCESSFUL') {
-      stateClass = 'ci-successful';
-      label = buildStatus.totalCount > 1
-        ? `✓ ${buildStatus.passedCount}/${buildStatus.totalCount}`
-        : '✓ CI';
-    } else if (buildStatus.state === 'FAILED') {
-      stateClass = 'ci-failed';
-      label = buildStatus.totalCount > 1
-        ? `✕ ${buildStatus.passedCount}/${buildStatus.totalCount}`
-        : '✕ CI';
-    } else if (buildStatus.state === 'INPROGRESS') {
-      stateClass = 'ci-inprogress';
-      label = '⟳ CI';
-    } else if (buildStatus.state === 'STOPPED') {
-      stateClass = 'ci-stopped';
-      label = '■ CI';
+    const descriptor = getCiBadgeDescriptor(buildStatus);
+    if (!descriptor) {
+      return null;
     }
 
+    const { stateClass, label, tooltip, safeUrl } = descriptor;
+    const el = safeUrl ? document.createElement('a') : document.createElement('span');
     el.className = `ci-badge ${stateClass}`;
     el.textContent = label;
-
-    const buildName = buildStatus.name || 'Checks';
-    const countsPart = buildStatus.totalCount > 0
-      ? ` (${buildStatus.passedCount}/${buildStatus.totalCount} passed)`
-      : '';
-    el.title = `Build: ${buildName}${countsPart}`;
+    el.title = tooltip;
 
     if (safeUrl && el instanceof HTMLAnchorElement) {
       el.href = safeUrl;
       el.target = '_blank';
       el.rel = 'noopener noreferrer';
-      el.setAttribute('aria-label', `${el.title} — open build status`);
+      el.setAttribute('aria-label', `${tooltip} — open build status`);
       el.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -903,87 +807,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     return el;
-  }
-
-  /**
-   * Build reviewer breakdown arrays and rich tooltip text for approval / changes-requested pills.
-   *
-   * @param {EnrichedPullRequest} pr
-   * @returns {{ approvedNames: string[], changesRequestedNames: string[], pendingNames: string[], approvalTooltip: string }}
-   */
-  function buildReviewerBreakdown(pr) {
-    /** @type {Map<string, { displayName: string, state: 'approved' | 'changes_requested' | 'pending' }>} */
-    const byUuid = new Map();
-    const reviewers = Array.isArray(pr.reviewers) ? pr.reviewers : [];
-    const participants = Array.isArray(pr.participants) ? pr.participants : [];
-
-    for (const r of reviewers) {
-      if (r.uuid && r.uuid !== pr.authorUuid) {
-        byUuid.set(r.uuid, {
-          displayName: r.displayName || 'Reviewer',
-          state: 'pending'
-        });
-      }
-    }
-
-    for (const p of participants) {
-      if (!p.uuid || p.uuid === pr.authorUuid) {
-        continue;
-      }
-      const existing = byUuid.get(p.uuid);
-      if (p.role === 'REVIEWER' || existing) {
-        /** @type {'approved' | 'changes_requested' | 'pending'} */
-        let reviewState = 'pending';
-        if (p.state === 'approved' || p.approved) {
-          reviewState = 'approved';
-        } else if (p.state === 'changes_requested') {
-          reviewState = 'changes_requested';
-        }
-        byUuid.set(p.uuid, {
-          displayName: p.displayName || existing?.displayName || 'Reviewer',
-          state: reviewState
-        });
-      }
-    }
-
-    /** @type {string[]} */
-    const approvedNames = [];
-    /** @type {string[]} */
-    const changesRequestedNames = [];
-    /** @type {string[]} */
-    const pendingNames = [];
-
-    for (const entry of byUuid.values()) {
-      if (entry.state === 'approved') {
-        approvedNames.push(entry.displayName);
-      } else if (entry.state === 'changes_requested') {
-        changesRequestedNames.push(entry.displayName);
-      } else {
-        pendingNames.push(entry.displayName);
-      }
-    }
-
-    /** @type {string[]} */
-    const lines = [];
-    if (approvedNames.length > 0) {
-      lines.push(`Approved: ${approvedNames.join(', ')}`);
-    }
-    if (changesRequestedNames.length > 0) {
-      lines.push(`Changes requested: ${changesRequestedNames.join(', ')}`);
-    }
-    if (pendingNames.length > 0) {
-      lines.push(`Pending: ${pendingNames.join(', ')}`);
-    }
-    const approvalTooltip = lines.length > 0
-      ? lines.join('\n')
-      : `${pr.approvalsCount} approval(s)`;
-
-    return {
-      approvedNames,
-      changesRequestedNames,
-      pendingNames,
-      approvalTooltip
-    };
   }
 
   /**
@@ -1030,7 +853,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     badgesRow.className = 'pr-badges-row';
 
     if (pr.buildStatus) {
-      badgesRow.appendChild(buildCiBadgeElement(pr.buildStatus));
+      const ciBadgeEl = buildCiBadgeElement(pr.buildStatus);
+      if (ciBadgeEl) {
+        badgesRow.appendChild(ciBadgeEl);
+      }
     }
 
     const badgeMeta = ACTION_BADGE_LABELS[pr.actionState] ?? {
@@ -1164,14 +990,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const snoozeEntry = isSnoozed ? state.snoozedMap[pr.key] : undefined;
     if (isSnoozed && snoozeEntry && activeFilter === 'snoozed') {
-      const snoozeBadge = document.createElement('span');
-      snoozeBadge.className = 'pr-stat-pill snooze-remaining-badge';
-      snoozeBadge.textContent = formatSnoozeRemaining(snoozeEntry.until, now);
-      snoozeBadge.title = `Snoozed until ${new Date(snoozeEntry.until).toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit'
-      })} (resurfaces early if PR updates)`;
-      metaLeft.appendChild(snoozeBadge);
+      const remainingText = formatRemainingSnooze(snoozeEntry.until, now);
+      if (remainingText) {
+        const snoozeBadge = document.createElement('span');
+        snoozeBadge.className = 'pr-stat-pill snooze-remaining-badge';
+        snoozeBadge.textContent = remainingText;
+        snoozeBadge.title = `Snoozed until ${new Date(snoozeEntry.until).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit'
+        })} (resurfaces early if PR updates)`;
+        metaLeft.appendChild(snoozeBadge);
+      }
     }
 
     const metaRight = document.createElement('div');
@@ -1366,14 +1195,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const trimmedQuery = searchQuery.trim();
       if (trimmedQuery) {
-        const allMatches = activeFilter !== 'all'
-          ? filterAndSortPrs(prs, { filter: 'all', query: trimmedQuery, snoozedMap, now })
-          : [];
+        const crossHint = getCrossFilterEmptyHint({
+          activeFilter,
+          searchQuery: trimmedQuery,
+          allPrs: prs,
+          snoozedMap,
+          now
+        });
 
-        if (activeFilter !== 'all' && allMatches.length > 0) {
-          const filterLabel = FILTER_LABELS[activeFilter] ?? activeFilter;
+        if (crossHint) {
           emptyStateTitle.textContent = 'No matches in this filter';
-          emptyStateMessage.textContent = `No matches in ${filterLabel} — ${allMatches.length} match${allMatches.length === 1 ? '' : 'es'} in All PRs.`;
+          emptyStateMessage.textContent = crossHint.label;
           emptyStateActionBtn.textContent = 'Show in All PRs';
           emptyStateActionBtn.dataset.emptyAction = 'show_in_all';
           emptyStateActionBtn.classList.remove('hidden');
