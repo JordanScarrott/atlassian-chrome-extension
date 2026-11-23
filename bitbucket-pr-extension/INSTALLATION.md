@@ -69,7 +69,7 @@ Load the extension directly from source—no build step is required:
 4. Select the `bitbucket-pr-extension/` directory (the folder containing `manifest.json`).
 5. Click the puzzle-piece icon in the Chrome toolbar and **pin** **Atlassian Extension Hub**.
 
-*(If you generated a packaged archive with `npm run package`, unzip `dist/atlassian-hub-v2.0.0.zip` and select the extracted folder when loading unpacked.)*
+*(If you generated a packaged archive with `bun run package`, unzip `dist/atlassian-hub-v2.0.0.zip` and select the extracted folder when loading unpacked.)*
 
 ---
 

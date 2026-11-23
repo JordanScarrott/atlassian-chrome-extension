@@ -1,6 +1,23 @@
+# Dependencies & build output
 node_modules/
 dist/
 *.zip
 coverage/
-.DS_Store
+
+# Bun is the package manager; ignore accidental npm lockfiles
+package-lock.json
+
+# Secrets & local env (never commit tokens or API keys)
+.env
+.env.*
+!.env.example
 token.txt
+*.pem
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Tool caches
+.eslintcache
+*.tsbuildinfo

@@ -5,16 +5,16 @@
   "description": "Atlassian Chrome Extension (Bitbucket PR Tracker & Mezzanine Jira Hub) — Manifest V3",
   "type": "module",
   "engines": {
-    "node": ">=20.0.0"
+    "bun": ">=1.1.0"
   },
   "scripts": {
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/**/*.test.mjs",
-    "generate-icons": "node scripts/generate-icons.mjs",
-    "verify:extension": "node scripts/verify-extension.mjs",
-    "verify": "npm run verify:extension && npm run lint && npm run typecheck && npm test",
-    "package": "node scripts/package-extension.mjs"
+    "test": "bun test tests",
+    "generate-icons": "bun scripts/generate-icons.mjs",
+    "verify:extension": "bun scripts/verify-extension.mjs",
+    "verify": "bun run verify:extension && bun run lint && bun run typecheck && bun test tests",
+    "package": "bun scripts/package-extension.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.1.38",

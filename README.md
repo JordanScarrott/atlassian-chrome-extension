@@ -65,20 +65,20 @@ Press `?` anywhere in the popup (outside text inputs) to toggle the in-app short
 
 ## Development & Verification
 
-Requires **Node.js >= 20**.
+Requires **[Bun](https://bun.sh/) >= 1.1**.
 
 ```bash
 # Install dev dependencies (ESLint, TypeScript, @types/chrome)
-npm install
+bun install
 
-# Run all quality gates: extension manifest/icon/security check, ESLint, JSDoc checkJs typecheck, and Node unit tests
-npm run verify
+# Run all quality gates: extension manifest/icon/security check, ESLint, JSDoc checkJs typecheck, and unit tests
+bun run verify
 
 # Build a Chrome Web Store / sideload zip archive in dist/ (gitignored)
-npm run package
+bun run package
 
 # Regenerate extension PNG icons in bitbucket-pr-extension/icons/
-npm run generate-icons
+bun run generate-icons
 ```
 
-Individual checks can also be run via `npm run verify:extension`, `npm run lint`, `npm run typecheck`, and `npm test`. See [CODING_STANDARDS.md](./CODING_STANDARDS.md) for architecture and security conventions.
+Individual checks can also be run via `bun run verify:extension`, `bun run lint`, `bun run typecheck`, and `bun test tests`. See [CODING_STANDARDS.md](./CODING_STANDARDS.md) for architecture and security conventions.

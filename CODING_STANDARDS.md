@@ -9,7 +9,7 @@ This repository builds a zero-build, Manifest V3 Chrome extension using native E
 
 ## 2. Pure, Testable Domain Modules
 - Keep business logic, API clients, rate limiting, storage wrappers, and triage scoring inside `bitbucket-pr-extension/src/*.js` as pure or dependency-injected modules.
-- External side effects (`fetch`, `chrome.*` APIs, `Date.now()`) should be injectable so unit and integration tests run deterministically under `node --test` without browser harnesses.
+- External side effects (`fetch`, `chrome.*` APIs, `Date.now()`) should be injectable so unit and integration tests run deterministically under `bun test` without browser harnesses.
 - Keep `background.js` and `popup.js` as thin orchestration/UI layers over `src/`.
 
 ## 3. Type Safety via JSDoc + TypeScript (`checkJs`)
@@ -32,8 +32,8 @@ This repository builds a zero-build, Manifest V3 Chrome extension using native E
 - Implement stale-while-revalidate UI behavior so cached PRs remain usable if a background refresh fails transiently.
 
 ## 7. Automated Verification Gate
-Before completing any change, all checks in `npm run verify` must pass:
-1. `npm run verify:extension` — validates `manifest.json` (MV3), icon PNG headers/dimensions, and forbidden pattern checks.
-2. `npm run lint` — ESLint 9 flat config rules (`no-alert`, `no-eval`, `eqeqeq`, `prefer-const`, `no-var`, `no-unused-vars`).
-3. `npm run typecheck` — `tsc --noEmit` across `bitbucket-pr-extension/**/*.js`.
-4. `npm test` — `node --test tests/**/*.test.mjs`.
+Before completing any change, all checks in `bun run verify` must pass:
+1. `bun run verify:extension` — validates `manifest.json` (MV3), icon PNG headers/dimensions, and forbidden pattern checks.
+2. `bun run lint` — ESLint 9 flat config rules (`no-alert`, `no-eval`, `eqeqeq`, `prefer-const`, `no-var`, `no-unused-vars`).
+3. `bun run typecheck` — `tsc --noEmit` across `bitbucket-pr-extension/**/*.js`.
+4. `bun test tests` — runs unit and integration tests in `tests/*.test.mjs`.
