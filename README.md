@@ -6,10 +6,12 @@ A zero-build, Manifest V3 Chrome Extension (**v2.0.0**) that turns your browser 
 
 ## Features
 
-- **"Your Turn" Attention Set (Authored & Reviewing):** Tracks both pull requests awaiting your review and PRs you authored. Automatically surfaces what requires your action (`Needs Action` vs `Reviewing`, `My PRs`, `All`, and `Snoozed`), ranks items by priority, and flags stale PRs (`24h` / `48h` / `72h`).
-- **Auto-Detected Jira Ticket Chips & Active Jira Tab:** Extracts Jira issue keys (e.g. `MEZ-123`) from PR titles and branch names, displays clickable chips directly on PR cards, and aggregates all active tickets in the **Jira** tab.
-- **Keyboard-First Triage & Smart Snooze:** Navigate, open, copy links, refresh, and snooze PRs for 4 hours without touching the mouse. Snoozed PRs automatically unsnooze early if new commits or comments update the PR.
-- **Resilient Caching & Rate-Limit Stewardship:** Caches user profile, workspaces, and repositories with TTLs; deduplicates concurrent syncs; enforces a 10s manual refresh cooldown, 4-request concurrency cap, and 12s request timeouts; paces requests on `X-RateLimit-NearLimit`; and backs off automatically on HTTP `429 Retry-After` while keeping cached PRs usable (stale-while-revalidate).
+- **"Your Turn" Attention Set (Authored & Reviewing):** Tracks both pull requests awaiting your review and PRs you authored. Automatically surfaces what requires your action (`Needs Action` vs `Reviewing`, `My PRs`, `All`, and `Snoozed`), surfaces unresolved tasks and change-request counts, ranks items by priority, and flags stale PRs (`24h` / `48h` / `72h`).
+- **Live CI / Build Status & Presubmit Escalation:** Displays commit build status pills (`✓ CI`, `✕ CI`, `⟳ CI`, `■ CI`) directly on PR cards with deep links to CI runs, escalates authored PRs with failing builds to **CI Failed** (`Needs Action`), and supports search tokens (`ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`).
+- **Auto-Detected Jira Ticket Chips & Active Jira Tab:** Extracts Jira issue keys (e.g. `MEZ-123`) from PR titles and branch names, displays clickable chips directly on PR cards, and aggregates active tickets in the **Jira** tab with one-click **Filter PRs** drill-down.
+- **Keyboard-First Triage & Smart Snooze:** Navigate (`j`/`k`, `ArrowLeft`/`ArrowRight` tablist navigation), open, copy links, refresh, and snooze PRs for 4 hours with an inline **Undo** toast and remaining duration indicator. Snoozed PRs automatically unsnooze early if new commits or comments update the PR.
+- **Automatic Dark Mode & WCAG AA Contrast:** Automatically adapts to your OS theme via `@media (prefers-color-scheme: dark)` with high-contrast Atlassian tokens in both light and dark modes.
+- **Resilient Caching & Rate-Limit Stewardship:** Caches user profile, workspaces, repositories, and commit build statuses with TTLs; deduplicates concurrent syncs; enforces a 10s manual refresh cooldown, 4-request concurrency cap, and 12s request timeouts; paces requests on `X-RateLimit-NearLimit`; and backs off automatically on HTTP `429 Retry-After` while keeping cached PRs usable (stale-while-revalidate).
 - **Configurable Preferences:** Customize polling interval (`Manual` to `30m`), toolbar badge mode (`Needs Action`, `All Open PRs`, or `Off`), desktop notifications, stale threshold, default PR filter, compact card density, workspace/repository allowlists, and Jira URL override.
 - **Modular Atlassian Hub Tabs:** Switch between **Bitbucket PRs**, **Jira** (Active Jira Tickets + quick open), **Confluence** (quick launch when configured / integration roadmap), and **+ Add Product** (local feature request customizer).
 
@@ -51,7 +53,7 @@ Press `?` anywhere in the popup (outside text inputs) to toggle the in-app short
 
 | Key | Action |
 | :--- | :--- |
-| `/` | Focus PR search bar |
+| `/` | Focus PR search bar (supports `ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`, build names, Jira keys) |
 | `j` / `k` (or `↓` / `↑`) | Select next / previous PR card |
 | `Enter` | Open selected PR in a new tab |
 | `c` | Copy selected PR URL to clipboard |

@@ -1,7 +1,30 @@
-import { DEFAULT_PREFERENCES, STORAGE_KEYS, sanitizeHttpsUrl } from './config.js';
+import { DEFAULT_PREFERENCES, STORAGE_KEYS, THROTTLE_CONFIG, sanitizeHttpsUrl } from './config.js';
 
 /**
  * @typedef {'api_token' | 'bearer'} AuthType
+ */
+
+/**
+ * @typedef {'SUCCESSFUL' | 'FAILED' | 'INPROGRESS' | 'STOPPED'} BuildState
+ */
+
+/**
+ * @typedef {Object} BuildStatusSummary
+ * @property {BuildState} state
+ * @property {number} totalCount
+ * @property {number} passedCount
+ * @property {number} failedCount
+ * @property {number} inProgressCount
+ * @property {number} stoppedCount
+ * @property {string | null} url
+ * @property {string} name
+ * @property {string} updatedOn
+ * @property {string} commitHash
+ * @property {number} cachedAt
+ */
+
+/**
+ * @typedef {Record<string, BuildStatusSummary>} BuildStatusCacheMap
  */
 
 /**
@@ -81,6 +104,8 @@ import { DEFAULT_PREFERENCES, STORAGE_KEYS, sanitizeHttpsUrl } from './config.js
  * @property {boolean} draft
  * @property {PrReviewer[]} reviewers
  * @property {PrParticipant[]} participants
+ * @property {string} [sourceCommitHash]
+ * @property {BuildStatusSummary | null} [buildStatus]
  */
 
 /**
@@ -338,6 +363,7 @@ export function createStorage(area = typeof chrome !== 'undefined' ? chrome?.sto
         STORAGE_KEYS.CACHED_USER,
         STORAGE_KEYS.CACHED_WORKSPACES,
         STORAGE_KEYS.CACHED_REPOS,
+        STORAGE_KEYS.CACHED_BUILD_STATUSES,
         STORAGE_KEYS.PR_LIST,
         STORAGE_KEYS.LAST_UPDATED,
         STORAGE_KEYS.ERROR,
@@ -476,6 +502,105 @@ export function createStorage(area = typeof chrome !== 'undefined' ? chrome?.sto
       const map = current && typeof current === 'object' ? { .../** @type {Record<string, unknown>} */ (current) } : {};
       map[workspace] = repos;
       await area.set({ [STORAGE_KEYS.CACHED_REPOS]: map });
+    },
+
+    /**
+     * Read cached commit build statuses keyed by `${repoFullName}:${commitHash}` (or `${commitHash}`).
+     *
+     * @returns {Promise<BuildStatusCacheMap>}
+     */
+    async getCachedBuildStatuses() {
+      const data = await area.get([STORAGE_KEYS.CACHED_BUILD_STATUSES]);
+      const raw = data[STORAGE_KEYS.CACHED_BUILD_STATUSES];
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return {};
+      }
+      /** @type {BuildStatusCacheMap} */
+      const cleaned = {};
+      for (const [key, entry] of Object.entries(raw)) {
+        if (!entry || typeof entry !== 'object') {
+          continue;
+        }
+        const e = /** @type {Record<string, unknown>} */ (entry);
+        if (
+          (e.state !== 'SUCCESSFUL' && e.state !== 'FAILED' && e.state !== 'INPROGRESS' && e.state !== 'STOPPED') ||
+          typeof e.cachedAt !== 'number'
+        ) {
+          continue;
+        }
+        cleaned[key] = {
+          state: e.state,
+          totalCount: typeof e.totalCount === 'number' ? e.totalCount : 0,
+          passedCount: typeof e.passedCount === 'number' ? e.passedCount : 0,
+          failedCount: typeof e.failedCount === 'number' ? e.failedCount : 0,
+          inProgressCount: typeof e.inProgressCount === 'number' ? e.inProgressCount : 0,
+          stoppedCount: typeof e.stoppedCount === 'number' ? e.stoppedCount : 0,
+          url: sanitizeHttpsUrl(e.url),
+          name: typeof e.name === 'string' ? e.name : '',
+          updatedOn: typeof e.updatedOn === 'string' ? e.updatedOn : '',
+          commitHash: typeof e.commitHash === 'string' ? e.commitHash : '',
+          cachedAt: e.cachedAt
+        };
+      }
+      return cleaned;
+    },
+
+    /**
+     * Persist build status cache map, sanitizing URLs and pruning oldest entries past `maxBuildStatusCacheEntries`.
+     *
+     * @param {BuildStatusCacheMap} map
+     * @returns {Promise<void>}
+     */
+    async setCachedBuildStatuses(map) {
+      if (!map || typeof map !== 'object' || Array.isArray(map)) {
+        await area.set({ [STORAGE_KEYS.CACHED_BUILD_STATUSES]: {} });
+        return;
+      }
+      /** @type {Array<[string, BuildStatusSummary]>} */
+      const validEntries = [];
+      for (const [key, entry] of Object.entries(map)) {
+        if (!key || !entry || typeof entry !== 'object') {
+          continue;
+        }
+        if (
+          (entry.state !== 'SUCCESSFUL' &&
+            entry.state !== 'FAILED' &&
+            entry.state !== 'INPROGRESS' &&
+            entry.state !== 'STOPPED') ||
+          typeof entry.cachedAt !== 'number'
+        ) {
+          continue;
+        }
+        validEntries.push([
+          key,
+          {
+            state: entry.state,
+            totalCount: typeof entry.totalCount === 'number' ? entry.totalCount : 0,
+            passedCount: typeof entry.passedCount === 'number' ? entry.passedCount : 0,
+            failedCount: typeof entry.failedCount === 'number' ? entry.failedCount : 0,
+            inProgressCount: typeof entry.inProgressCount === 'number' ? entry.inProgressCount : 0,
+            stoppedCount: typeof entry.stoppedCount === 'number' ? entry.stoppedCount : 0,
+            url: sanitizeHttpsUrl(entry.url),
+            name: typeof entry.name === 'string' ? entry.name : '',
+            updatedOn: typeof entry.updatedOn === 'string' ? entry.updatedOn : '',
+            commitHash: typeof entry.commitHash === 'string' ? entry.commitHash : '',
+            cachedAt: entry.cachedAt
+          }
+        ]);
+      }
+
+      const maxEntries = THROTTLE_CONFIG.maxBuildStatusCacheEntries;
+      if (validEntries.length > maxEntries) {
+        validEntries.sort((a, b) => b[1].cachedAt - a[1].cachedAt);
+        validEntries.length = maxEntries;
+      }
+
+      /** @type {BuildStatusCacheMap} */
+      const bounded = {};
+      for (const [key, value] of validEntries) {
+        bounded[key] = value;
+      }
+      await area.set({ [STORAGE_KEYS.CACHED_BUILD_STATUSES]: bounded });
     },
 
     /**

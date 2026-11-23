@@ -83,6 +83,8 @@ test('config constants match Phase 2 specification', () => {
   assert.equal(CACHE_TTL_MS.workspaces, 60 * 60 * 1000);
   assert.equal(CACHE_TTL_MS.repositories, 30 * 60 * 1000);
   assert.equal(CACHE_TTL_MS.prStaleAfter, 5 * 60 * 1000);
+  assert.equal(CACHE_TTL_MS.buildStatusTerminal, 6 * 60 * 60 * 1000);
+  assert.equal(CACHE_TTL_MS.buildStatusActive, 60 * 1000);
 
   assert.equal(THROTTLE_CONFIG.manualRefreshCooldownMs, 10_000);
   assert.equal(THROTTLE_CONFIG.syncLockTimeoutMs, 45_000);
@@ -90,9 +92,11 @@ test('config constants match Phase 2 specification', () => {
   assert.equal(THROTTLE_CONFIG.maxConcurrentRequests, 4);
   assert.equal(THROTTLE_CONFIG.maxPagesPerEndpoint, 5);
   assert.equal(THROTTLE_CONFIG.maxReposPerWorkspace, 25);
+  assert.equal(THROTTLE_CONFIG.maxBuildStatusCacheEntries, 200);
   assert.equal(THROTTLE_CONFIG.baseBackoffMs, 15_000);
   assert.equal(THROTTLE_CONFIG.maxBackoffMs, 15 * 60 * 1000);
   assert.equal(THROTTLE_CONFIG.nearLimitDelayMs, 1_500);
+  assert.equal(STORAGE_KEYS.CACHED_BUILD_STATUSES, 'cachedBuildStatuses');
 
   assert.equal(DEFAULT_PREFERENCES.pollIntervalMinutes, 5);
   assert.equal(DEFAULT_PREFERENCES.badgeMode, 'action_required');
@@ -201,6 +205,21 @@ test('storage clearCredentialsAndCache clears auth and caches while preserving p
     items: [{ slug: 'repo1', fullName: 'ws1/repo1', updatedOn: '2026-11-22T00:00:00Z' }],
     cachedAt: 1000
   });
+  await storage.setCachedBuildStatuses({
+    'ws1/repo1:abc123': {
+      state: 'SUCCESSFUL',
+      totalCount: 1,
+      passedCount: 1,
+      failedCount: 0,
+      inProgressCount: 0,
+      stoppedCount: 0,
+      url: 'https://ci.example.com/1',
+      name: 'CI',
+      updatedOn: '2026-11-22T00:00:00Z',
+      commitHash: 'abc123',
+      cachedAt: 1000
+    }
+  });
   await storage.savePrSnapshot({
     prList: [],
     lastUpdated: 2000,
@@ -216,6 +235,7 @@ test('storage clearCredentialsAndCache clears auth and caches while preserving p
   assert.equal(await storage.getCachedUser(), null);
   assert.equal(await storage.getCachedWorkspaces(), null);
   assert.equal(await storage.getCachedRepos('ws1'), null);
+  assert.deepEqual(await storage.getCachedBuildStatuses(), {});
   const snapshot = await storage.getPrSnapshot();
   assert.deepEqual(snapshot, {
     prList: [],
@@ -273,4 +293,39 @@ test('storage handles snooze map and throws on missing storage area', async () =
   assert.deepEqual(map, {
     'ws/repo#1': { until: 50000, prUpdatedOn: '2026-11-22T10:00:00Z', reason: 'later' }
   });
+});
+
+test('storage getCachedBuildStatuses and setCachedBuildStatuses sanitize URLs and prune oldest entries past maxBuildStatusCacheEntries', async () => {
+  const area = createMemoryStorageArea();
+  const storage = createStorage(area);
+
+  /** @type {Record<string, any>} */
+  const oversized = {};
+  const total = THROTTLE_CONFIG.maxBuildStatusCacheEntries + 25;
+  for (let i = 0; i < total; i += 1) {
+    oversized[`acme/repo:commit-${i}`] = {
+      state: 'SUCCESSFUL',
+      totalCount: 1,
+      passedCount: 1,
+      failedCount: 0,
+      inProgressCount: 0,
+      stoppedCount: 0,
+      url: i === total - 1 ? 'javascript:alert(1)' : `https://ci.example.com/builds/${i}`,
+      name: `Build ${i}`,
+      updatedOn: '2026-11-23T00:00:00Z',
+      commitHash: `commit-${i}`,
+      cachedAt: 1_000 + i
+    };
+  }
+
+  await storage.setCachedBuildStatuses(oversized);
+  const loaded = await storage.getCachedBuildStatuses();
+  const keys = Object.keys(loaded);
+
+  assert.equal(keys.length, THROTTLE_CONFIG.maxBuildStatusCacheEntries);
+  assert.equal(loaded['acme/repo:commit-0'], undefined);
+  assert.equal(loaded['acme/repo:commit-24'], undefined);
+  assert.ok(loaded['acme/repo:commit-25']);
+  assert.equal(loaded[`acme/repo:commit-${total - 1}`]?.url, null);
+  assert.equal(loaded['acme/repo:commit-50']?.url, 'https://ci.example.com/builds/50');
 });

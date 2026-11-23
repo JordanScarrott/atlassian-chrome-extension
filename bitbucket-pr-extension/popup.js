@@ -33,7 +33,8 @@ import { normalizeAuthType } from './src/storage.js';
  * @property {string} username
  * @property {CachedUser | null} user
  * @property {WorkspaceSummary[]} workspaces
- * @property {Omit<PrSnapshot, 'prList'> & { prList: EnrichedPullRequest[] }} snapshot
+ * @property {boolean} [isAuthError]
+ * @property {Omit<PrSnapshot, 'prList'> & { prList: EnrichedPullRequest[], isAuthError?: boolean }} snapshot
  * @property {Preferences} preferences
  * @property {SyncState} syncState
  * @property {SnoozedMap} snoozedMap
@@ -44,20 +45,55 @@ import { normalizeAuthType } from './src/storage.js';
 /**
  * @typedef {Object} ActionBadgeMeta
  * @property {string} label
+ * @property {string} title
  */
 
 const SNOOZE_FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 const TOP_TABS = ['bitbucket-tab', 'jira-tab', 'confluence-tab', 'add-product-tab'];
 
+/** @type {Readonly<Record<PrFilter, string>>} */
+const FILTER_LABELS = Object.freeze({
+  action_required: 'Needs Action',
+  reviewing: 'Reviewing',
+  authored: 'My PRs',
+  all: 'All PRs',
+  snoozed: 'Snoozed'
+});
+
 /** @type {Readonly<Record<string, ActionBadgeMeta>>} */
 const ACTION_BADGE_LABELS = Object.freeze({
-  needs_review: { label: 'Needs Review' },
-  changes_requested: { label: 'Changes Requested' },
-  ready_to_merge: { label: 'Ready to Merge' },
-  waiting_reviewers: { label: 'Waiting' },
-  approved_by_you: { label: 'Approved' },
-  changes_requested_by_you: { label: 'Changes Sent' },
-  draft: { label: 'Draft' }
+  needs_review: {
+    label: 'Needs Review',
+    title: 'Your review is pending on this pull request'
+  },
+  changes_requested: {
+    label: 'Changes Requested',
+    title: 'A reviewer requested changes on your pull request'
+  },
+  ci_failed: {
+    label: 'CI Failed',
+    title: 'Latest CI build on your pull request failed or stopped'
+  },
+  ready_to_merge: {
+    label: 'Ready to Merge',
+    title: 'Approved by reviewers with no outstanding change requests or failing builds'
+  },
+  waiting_reviewers: {
+    label: 'Waiting',
+    title: 'Waiting on reviewers or updates from others'
+  },
+  approved_by_you: {
+    label: 'Approved',
+    title: 'You have approved this pull request'
+  },
+  changes_requested_by_you: {
+    label: 'Changes Sent',
+    title: 'You requested changes; waiting on author updates'
+  },
+  draft: {
+    label: 'Draft',
+    title: 'Draft pull request (excluded from Needs Action)'
+  }
 });
 
 /** @type {ReadonlySet<string>} */
@@ -114,7 +150,7 @@ function sendWorkerMessage(payload) {
 }
 
 /**
- * Format a compact relative age label (e.g. `5m`, `3h`, `2d`) from an ISO date string.
+ * Format a compact relative age label (`just now`, `5m`, `3h`, `6d`, or short date like `Nov 8` for >= 14d).
  *
  * @param {string} isoTimestamp
  * @param {number} [now]
@@ -137,7 +173,37 @@ function formatRelativeAge(isoTimestamp, now = Date.now()) {
     return `${diffHours}h`;
   }
   const diffDays = Math.floor(diffHours / 24);
-  return `${diffDays}d`;
+  if (diffDays < 14) {
+    return `${diffDays}d`;
+  }
+  return new Date(parsed).toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric'
+  });
+}
+
+/**
+ * Format remaining snooze duration (e.g. `3h 40m left`, `25m left`, `<1m left`).
+ *
+ * @param {number} untilMs
+ * @param {number} [now]
+ * @returns {string}
+ */
+function formatSnoozeRemaining(untilMs, now = Date.now()) {
+  const remainingMs = Math.max(0, untilMs - now);
+  const totalMinutes = Math.ceil(remainingMs / 60_000);
+  if (totalMinutes <= 1) {
+    return '<1m left';
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  const mins = totalMinutes % 60;
+  if (hours > 0 && mins > 0) {
+    return `${hours}h ${mins}m left`;
+  }
+  if (hours > 0) {
+    return `${hours}h left`;
+  }
+  return `${mins}m left`;
 }
 
 /**
@@ -223,8 +289,9 @@ function createEmptyState() {
 document.addEventListener('DOMContentLoaded', async () => {
   // --- DOM References ---
   const extensionContainer = getEl('extension-container', HTMLDivElement);
+  const mainContent = getEl('main-content', HTMLElement);
   const appTitle = getEl('app-title', HTMLHeadingElement);
-  const connectionStatusChip = getEl('connection-status-chip', HTMLSpanElement);
+  const connectionStatusChip = getEl('connection-status-chip', HTMLButtonElement);
   const connectionStatusText = getEl('connection-status-text', HTMLSpanElement);
   const manualRefreshBtn = getEl('manual-refresh-btn', HTMLButtonElement);
   const toggleSettingsBtn = getEl('toggle-settings-btn', HTMLButtonElement);
@@ -282,6 +349,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const prefNotifications = getEl('pref-notifications', HTMLInputElement);
   const prefCompactMode = getEl('pref-compact-mode', HTMLInputElement);
   const prefWorkspacesFilter = getEl('pref-workspaces-filter', HTMLInputElement);
+  const availableWorkspacesHint = getEl('available-workspaces-hint', HTMLParagraphElement);
   const prefReposFilter = getEl('pref-repos-filter', HTMLInputElement);
   const prefJiraUrl = getEl('pref-jira-url', HTMLInputElement);
   const prefsStatusBanner = getEl('prefs-status-banner', HTMLDivElement);
@@ -326,6 +394,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   const jiraTicketsCount = getEl('jira-tickets-count', HTMLSpanElement);
   const jiraTicketsContainer = getEl('jira-tickets-container', HTMLDivElement);
   const jiraEmptyState = getEl('jira-empty-state', HTMLDivElement);
+  const jiraEmptyTitle = getEl('jira-empty-title', HTMLHeadingElement);
+  const jiraEmptyMessage = getEl('jira-empty-message', HTMLParagraphElement);
+  const jiraConnectBtn = getEl('jira-connect-btn', HTMLButtonElement);
 
   // Confluence Tab
   const confluenceConfiguredCard = getEl('confluence-configured-card', HTMLDivElement);
@@ -366,28 +437,64 @@ document.addEventListener('DOMContentLoaded', async () => {
   let storageRefreshTimer = null;
   /** @type {number | null} */
   let productFeedbackTimer = null;
+  /** @type {number | null} */
+  let toastDismissTimer = null;
+  /** @type {number} */
+  let suppressStorageRefreshUntil = 0;
   /** @type {number} */
   let stateRequestSeq = 0;
 
   // --- Helper Utilities ---
 
   /**
-   * Show a non-blocking toast message that auto-dismisses.
+   * Show a non-blocking toast message that auto-dismisses, with an optional inline action button.
    *
    * @param {string} message
    * @param {'neutral' | 'success' | 'error'} [variant]
+   * @param {{ actionLabel?: string, onAction?: () => void | Promise<void>, durationMs?: number }} [options]
    */
-  function showToast(message, variant = 'neutral') {
+  function showToast(message, variant = 'neutral', options = {}) {
+    if (toastDismissTimer !== null) {
+      window.clearTimeout(toastDismissTimer);
+      toastDismissTimer = null;
+    }
+
     const toast = document.createElement('div');
     toast.className = variant === 'neutral' ? 'toast' : `toast toast-${variant}`;
-    toast.textContent = message;
+
+    const textSpan = document.createElement('span');
+    textSpan.textContent = message;
+    toast.appendChild(textSpan);
+
+    if (options.actionLabel && typeof options.onAction === 'function') {
+      const actionBtn = document.createElement('button');
+      actionBtn.type = 'button';
+      actionBtn.className = 'toast-action-btn';
+      actionBtn.textContent = options.actionLabel;
+      const onAction = options.onAction;
+      actionBtn.addEventListener('click', () => {
+        if (toastDismissTimer !== null) {
+          window.clearTimeout(toastDismissTimer);
+          toastDismissTimer = null;
+        }
+        toast.remove();
+        void onAction();
+      });
+      toast.appendChild(actionBtn);
+    }
+
     toastContainer.replaceChildren(toast);
 
-    window.setTimeout(() => {
+    const durationMs = typeof options.durationMs === 'number'
+      ? options.durationMs
+      : (options.actionLabel ? 4500 : 2600);
+
+    toastDismissTimer = window.setTimeout(() => {
+      toastDismissTimer = null;
       if (toast.parentNode === toastContainer) {
         toast.remove();
       }
-    }, 2600);
+    }, durationMs);
   }
 
   /**
@@ -554,7 +661,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Populate Settings -> Preferences inputs from `state.preferences`.
+   * Populate Settings -> Preferences inputs from `state.preferences` and show discovered workspace slugs.
    *
    * @param {Preferences} prefs
    */
@@ -572,6 +679,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       ? prefs.reposFilter.join(', ')
       : '';
     prefJiraUrl.value = prefs.jiraBaseUrlOverride || '';
+
+    const slugs = state.workspaces
+      .map((ws) => ws.slug)
+      .filter((slug) => typeof slug === 'string' && slug.length > 0);
+    if (slugs.length > 0) {
+      availableWorkspacesHint.textContent = `Available: ${slugs.join(', ')}`;
+      availableWorkspacesHint.classList.remove('hidden');
+    } else {
+      availableWorkspacesHint.textContent = '';
+      availableWorkspacesHint.classList.add('hidden');
+    }
+
     hideInlineBanner(prefsStatusBanner);
   }
 
@@ -655,50 +774,216 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Update header connection chip based on auth, error, and rate-limit state.
+   * Update header connection chip based on auth, error, and rate-limit state, with a rich tooltip.
    */
   function renderHeaderStatusChip() {
     connectionStatusChip.className = 'status-chip';
+    const now = Date.now();
+    const syncedSlugs = state.snapshot.syncedWorkspaces.length > 0
+      ? state.snapshot.syncedWorkspaces
+      : state.workspaces.map((ws) => ws.slug).filter(Boolean);
+    const wsText = syncedSlugs.length > 0
+      ? `Workspaces: ${syncedSlugs.join(', ')}`
+      : 'No workspaces synced yet';
 
     if (!state.isAuthenticated) {
       connectionStatusChip.classList.add('status-chip-neutral');
       connectionStatusText.textContent = 'Not connected';
+      connectionStatusChip.title = 'Click to connect your Bitbucket account';
+      connectionStatusChip.setAttribute('aria-label', 'Connection status: Not connected. Open settings');
       return;
     }
+
+    const displayLabel = state.user?.displayName || state.username || 'Connected';
 
     if (state.snapshot.error) {
       connectionStatusChip.classList.add('status-chip-error');
       connectionStatusText.textContent = 'Sync issue';
+      connectionStatusChip.title = `${displayLabel} — ${state.snapshot.error}\n${wsText}`;
+      connectionStatusChip.setAttribute('aria-label', `Connection status: Sync issue. Open settings`);
       return;
     }
 
-    if (state.snapshot.rateLimitWarning || (state.syncState.backoffUntil && state.syncState.backoffUntil > Date.now())) {
+    if (state.snapshot.rateLimitWarning || (state.syncState.backoffUntil && state.syncState.backoffUntil > now)) {
       connectionStatusChip.classList.add('status-chip-warning');
       connectionStatusText.textContent = 'Rate limited';
+      const backoffNote = state.syncState.backoffUntil && state.syncState.backoffUntil > now
+        ? `Auto-polling paused until ${new Date(state.syncState.backoffUntil).toLocaleTimeString()}`
+        : 'Approaching Bitbucket API rate limit';
+      connectionStatusChip.title = `${displayLabel} — ${backoffNote}\n${wsText}`;
+      connectionStatusChip.setAttribute('aria-label', 'Connection status: Rate limited. Open settings');
       return;
     }
 
     connectionStatusChip.classList.add('status-chip-connected');
-    const displayLabel = state.user?.displayName || state.username || 'Connected';
     connectionStatusText.textContent = displayLabel;
+    connectionStatusChip.title = `Connected as ${displayLabel}\n${wsText}\nClick to open Settings`;
+    connectionStatusChip.setAttribute('aria-label', `Connected as ${displayLabel}. Open settings`);
   }
 
   /**
-   * Render footer timestamp (`#last-updated-text`).
+   * Render footer timestamp (`#last-updated-text`) cleanly with full-date tooltip.
    */
   function renderFooterTimestamp() {
     const ts = state.snapshot.lastUpdated;
     if (!ts) {
       lastUpdatedText.textContent = 'Never updated';
+      lastUpdatedText.removeAttribute('title');
       return;
     }
-    const timeLabel = new Date(ts).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit'
-    });
-    const ageMins = Math.max(0, Math.floor((Date.now() - ts) / 60_000));
-    const ageSuffix = ageMins < 1 ? 'just now' : ageMins < 60 ? `${ageMins}m ago` : `${Math.floor(ageMins / 60)}h ago`;
-    lastUpdatedText.textContent = `Updated ${timeLabel} (${ageSuffix})`;
+
+    const now = Date.now();
+    const diffMinutes = Math.max(0, Math.floor((now - ts) / 60_000));
+    let relativeLabel = 'just now';
+    if (diffMinutes >= 1 && diffMinutes < 60) {
+      relativeLabel = `${diffMinutes}m ago`;
+    } else if (diffMinutes >= 60) {
+      const diffHours = Math.floor(diffMinutes / 60);
+      if (diffHours < 24) {
+        relativeLabel = `${diffHours}h ago`;
+      } else {
+        const diffDays = Math.floor(diffHours / 24);
+        relativeLabel = `${diffDays}d ago`;
+      }
+    }
+
+    lastUpdatedText.textContent = `Updated ${relativeLabel}`;
+    lastUpdatedText.title = `Last synced: ${new Date(ts).toLocaleString()}`;
+  }
+
+  /**
+   * Build a crisp CI status pill (`.ci-badge`) from `pr.buildStatus`.
+   *
+   * @param {NonNullable<EnrichedPullRequest['buildStatus']>} buildStatus
+   * @returns {HTMLAnchorElement | HTMLSpanElement}
+   */
+  function buildCiBadgeElement(buildStatus) {
+    const safeUrl = sanitizeHttpsUrl(buildStatus.url);
+    const el = safeUrl ? document.createElement('a') : document.createElement('span');
+
+    let stateClass = 'ci-stopped';
+    let label = '■ CI';
+    if (buildStatus.state === 'SUCCESSFUL') {
+      stateClass = 'ci-successful';
+      label = buildStatus.totalCount > 1
+        ? `✓ ${buildStatus.passedCount}/${buildStatus.totalCount}`
+        : '✓ CI';
+    } else if (buildStatus.state === 'FAILED') {
+      stateClass = 'ci-failed';
+      label = buildStatus.totalCount > 1
+        ? `✕ ${buildStatus.passedCount}/${buildStatus.totalCount}`
+        : '✕ CI';
+    } else if (buildStatus.state === 'INPROGRESS') {
+      stateClass = 'ci-inprogress';
+      label = '⟳ CI';
+    } else if (buildStatus.state === 'STOPPED') {
+      stateClass = 'ci-stopped';
+      label = '■ CI';
+    }
+
+    el.className = `ci-badge ${stateClass}`;
+    el.textContent = label;
+
+    const buildName = buildStatus.name || 'Checks';
+    const countsPart = buildStatus.totalCount > 0
+      ? ` (${buildStatus.passedCount}/${buildStatus.totalCount} passed)`
+      : '';
+    el.title = `Build: ${buildName}${countsPart}`;
+
+    if (safeUrl && el instanceof HTMLAnchorElement) {
+      el.href = safeUrl;
+      el.target = '_blank';
+      el.rel = 'noopener noreferrer';
+      el.setAttribute('aria-label', `${el.title} — open build status`);
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void openSafeExternalUrl(safeUrl);
+      });
+    }
+
+    return el;
+  }
+
+  /**
+   * Build reviewer breakdown arrays and rich tooltip text for approval / changes-requested pills.
+   *
+   * @param {EnrichedPullRequest} pr
+   * @returns {{ approvedNames: string[], changesRequestedNames: string[], pendingNames: string[], approvalTooltip: string }}
+   */
+  function buildReviewerBreakdown(pr) {
+    /** @type {Map<string, { displayName: string, state: 'approved' | 'changes_requested' | 'pending' }>} */
+    const byUuid = new Map();
+    const reviewers = Array.isArray(pr.reviewers) ? pr.reviewers : [];
+    const participants = Array.isArray(pr.participants) ? pr.participants : [];
+
+    for (const r of reviewers) {
+      if (r.uuid && r.uuid !== pr.authorUuid) {
+        byUuid.set(r.uuid, {
+          displayName: r.displayName || 'Reviewer',
+          state: 'pending'
+        });
+      }
+    }
+
+    for (const p of participants) {
+      if (!p.uuid || p.uuid === pr.authorUuid) {
+        continue;
+      }
+      const existing = byUuid.get(p.uuid);
+      if (p.role === 'REVIEWER' || existing) {
+        /** @type {'approved' | 'changes_requested' | 'pending'} */
+        let reviewState = 'pending';
+        if (p.state === 'approved' || p.approved) {
+          reviewState = 'approved';
+        } else if (p.state === 'changes_requested') {
+          reviewState = 'changes_requested';
+        }
+        byUuid.set(p.uuid, {
+          displayName: p.displayName || existing?.displayName || 'Reviewer',
+          state: reviewState
+        });
+      }
+    }
+
+    /** @type {string[]} */
+    const approvedNames = [];
+    /** @type {string[]} */
+    const changesRequestedNames = [];
+    /** @type {string[]} */
+    const pendingNames = [];
+
+    for (const entry of byUuid.values()) {
+      if (entry.state === 'approved') {
+        approvedNames.push(entry.displayName);
+      } else if (entry.state === 'changes_requested') {
+        changesRequestedNames.push(entry.displayName);
+      } else {
+        pendingNames.push(entry.displayName);
+      }
+    }
+
+    /** @type {string[]} */
+    const lines = [];
+    if (approvedNames.length > 0) {
+      lines.push(`Approved: ${approvedNames.join(', ')}`);
+    }
+    if (changesRequestedNames.length > 0) {
+      lines.push(`Changes requested: ${changesRequestedNames.join(', ')}`);
+    }
+    if (pendingNames.length > 0) {
+      lines.push(`Pending: ${pendingNames.join(', ')}`);
+    }
+    const approvalTooltip = lines.length > 0
+      ? lines.join('\n')
+      : `${pr.approvalsCount} approval(s)`;
+
+    return {
+      approvedNames,
+      changesRequestedNames,
+      pendingNames,
+      approvalTooltip
+    };
   }
 
   /**
@@ -724,7 +1009,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     card.dataset.prKey = pr.key;
     card.tabIndex = 0;
 
-    // Top row: repo + PR ID + action/stale badges
+    // Top row: repo + PR ID + action/CI/stale badges
     const topRow = document.createElement('div');
     topRow.className = 'pr-card-top';
 
@@ -744,10 +1029,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     const badgesRow = document.createElement('div');
     badgesRow.className = 'pr-badges-row';
 
-    const badgeMeta = ACTION_BADGE_LABELS[pr.actionState] ?? { label: pr.actionState };
+    if (pr.buildStatus) {
+      badgesRow.appendChild(buildCiBadgeElement(pr.buildStatus));
+    }
+
+    const badgeMeta = ACTION_BADGE_LABELS[pr.actionState] ?? {
+      label: pr.actionState,
+      title: ''
+    };
     const actionBadge = document.createElement('span');
     actionBadge.className = `action-badge state-${pr.actionState}`;
     actionBadge.textContent = badgeMeta.label;
+    if (badgeMeta.title) {
+      actionBadge.title = badgeMeta.title;
+    }
     badgesRow.appendChild(actionBadge);
 
     if (pr.isStale) {
@@ -817,7 +1112,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       chipsRow.appendChild(branchChip);
     }
 
-    // Footer row: author, approvals/comments, quick actions, relative age
+    // Footer row: author, approvals/CR/tasks/comments/snooze, quick actions, relative age
     const footerRow = document.createElement('div');
     footerRow.className = 'pr-card-footer';
 
@@ -827,15 +1122,36 @@ document.addEventListener('DOMContentLoaded', async () => {
     const authorEl = document.createElement('span');
     authorEl.className = 'pr-author';
     authorEl.textContent = pr.authorName;
+    authorEl.title = pr.authorName;
     metaLeft.appendChild(authorEl);
+
+    const reviewerInfo = buildReviewerBreakdown(pr);
 
     if (pr.totalReviewers > 0 || pr.approvalsCount > 0) {
       const approvalsEl = document.createElement('span');
       approvalsEl.className = pr.approvalsCount > 0 ? 'pr-stat-pill has-approvals' : 'pr-stat-pill';
       const denom = Math.max(pr.totalReviewers, pr.approvalsCount);
       approvalsEl.textContent = `✓ ${pr.approvalsCount}/${denom}`;
-      approvalsEl.title = `${pr.approvalsCount} approval(s)`;
+      approvalsEl.title = reviewerInfo.approvalTooltip;
       metaLeft.appendChild(approvalsEl);
+    }
+
+    if (pr.changesRequestedCount > 0) {
+      const crEl = document.createElement('span');
+      crEl.className = 'pr-stat-pill meta-cr-badge';
+      crEl.textContent = `✕ ${pr.changesRequestedCount} CR`;
+      crEl.title = reviewerInfo.changesRequestedNames.length > 0
+        ? `Changes requested by: ${reviewerInfo.changesRequestedNames.join(', ')}`
+        : `${pr.changesRequestedCount} reviewer(s) requested changes`;
+      metaLeft.appendChild(crEl);
+    }
+
+    if (pr.taskCount > 0) {
+      const tasksEl = document.createElement('span');
+      tasksEl.className = 'pr-stat-pill meta-task-badge';
+      tasksEl.textContent = `☑ ${pr.taskCount}`;
+      tasksEl.title = `${pr.taskCount} unresolved task(s)`;
+      metaLeft.appendChild(tasksEl);
     }
 
     if (pr.commentCount > 0) {
@@ -844,6 +1160,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       commentsEl.textContent = `${pr.commentCount} cmt`;
       commentsEl.title = `${pr.commentCount} comment(s)`;
       metaLeft.appendChild(commentsEl);
+    }
+
+    const snoozeEntry = isSnoozed ? state.snoozedMap[pr.key] : undefined;
+    if (isSnoozed && snoozeEntry && activeFilter === 'snoozed') {
+      const snoozeBadge = document.createElement('span');
+      snoozeBadge.className = 'pr-stat-pill snooze-remaining-badge';
+      snoozeBadge.textContent = formatSnoozeRemaining(snoozeEntry.until, now);
+      snoozeBadge.title = `Snoozed until ${new Date(snoozeEntry.until).toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit'
+      })} (resurfaces early if PR updates)`;
+      metaLeft.appendChild(snoozeBadge);
     }
 
     const metaRight = document.createElement('div');
@@ -876,9 +1204,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
     quickActions.appendChild(snoozeBtn);
 
+    const isoTimestamp = pr.updatedOn || pr.createdOn;
     const ageEl = document.createElement('span');
     ageEl.className = 'pr-age';
-    ageEl.textContent = formatRelativeAge(pr.updatedOn || pr.createdOn, now);
+    ageEl.dataset.iso = isoTimestamp || '';
+    ageEl.textContent = formatRelativeAge(isoTimestamp, now);
+    if (isoTimestamp && !Number.isNaN(Date.parse(isoTimestamp))) {
+      ageEl.title = `Updated ${new Date(isoTimestamp).toLocaleString()}`;
+    }
 
     metaRight.append(quickActions, ageEl);
     footerRow.append(metaLeft, metaRight);
@@ -902,13 +1235,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Highlight a PR card as keyboard-selected and optionally scroll it into view.
+   * Highlight a PR card as keyboard-selected, sync focus out of any previously focused PR card,
+   * and smoothly scroll the selected card into view.
    *
    * @param {string | null} prKey
    * @param {boolean} [scrollIntoView]
    */
   function selectPrCard(prKey, scrollIntoView = true) {
     selectedPrKey = prKey;
+    const activeEl = document.activeElement;
+    if (activeEl instanceof HTMLElement) {
+      const focusedCard = activeEl.closest('.pr-card');
+      if (focusedCard instanceof HTMLElement && focusedCard.dataset.prKey !== prKey) {
+        activeEl.blur();
+      }
+    }
+
     const cards = prItemsContainer.querySelectorAll('.pr-card');
     for (const node of cards) {
       if (!(node instanceof HTMLElement)) {
@@ -918,7 +1260,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       node.classList.toggle('is-selected', match);
       node.setAttribute('aria-selected', match ? 'true' : 'false');
       if (match && scrollIntoView) {
-        node.scrollIntoView({ block: 'nearest' });
+        node.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
       }
     }
   }
@@ -935,6 +1277,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         ? 'Sync Issue (showing cached PRs)'
         : 'Sync Issue';
       errorMessage.textContent = errText;
+      errorSetupBtn.textContent = (state.snapshot.isAuthError || state.isAuthError) ? 'Update Token' : 'Preferences';
       errorAlert.classList.remove('hidden');
     } else {
       errorAlert.classList.add('hidden');
@@ -959,6 +1302,7 @@ document.addEventListener('DOMContentLoaded', async () => {
    * Render the Bitbucket PRs tab: filter pills, counts, search, banners, PR cards, or empty/onboarding state.
    */
   function renderBitbucketTab() {
+    const prevScrollTop = mainContent.scrollTop;
     const now = Date.now();
     extensionContainer.classList.toggle('compact-mode', Boolean(state.preferences.compactMode));
 
@@ -972,6 +1316,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (state.snapshot.error) {
         errorTitle.textContent = 'Connection Required';
         errorMessage.textContent = state.snapshot.error;
+        errorSetupBtn.textContent = 'Update Token';
         errorAlert.classList.remove('hidden');
       } else {
         errorAlert.classList.add('hidden');
@@ -1000,6 +1345,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isSelected = pillFilter === activeFilter;
       pill.classList.toggle('active', isSelected);
       pill.setAttribute('aria-selected', isSelected ? 'true' : 'false');
+      pill.tabIndex = isSelected ? 0 : -1;
     }
 
     prSearchClearBtn.classList.toggle('hidden', searchQuery.trim().length === 0);
@@ -1018,12 +1364,26 @@ document.addEventListener('DOMContentLoaded', async () => {
       selectedPrKey = null;
       emptyState.classList.remove('hidden');
 
-      if (searchQuery.trim()) {
-        emptyStateTitle.textContent = 'No matching pull requests';
-        emptyStateMessage.textContent = `Nothing matched "${searchQuery.trim()}" in this view.`;
-        emptyStateActionBtn.textContent = 'Clear Search';
-        emptyStateActionBtn.dataset.emptyAction = 'clear_search';
-        emptyStateActionBtn.classList.remove('hidden');
+      const trimmedQuery = searchQuery.trim();
+      if (trimmedQuery) {
+        const allMatches = activeFilter !== 'all'
+          ? filterAndSortPrs(prs, { filter: 'all', query: trimmedQuery, snoozedMap, now })
+          : [];
+
+        if (activeFilter !== 'all' && allMatches.length > 0) {
+          const filterLabel = FILTER_LABELS[activeFilter] ?? activeFilter;
+          emptyStateTitle.textContent = 'No matches in this filter';
+          emptyStateMessage.textContent = `No matches in ${filterLabel} — ${allMatches.length} match${allMatches.length === 1 ? '' : 'es'} in All PRs.`;
+          emptyStateActionBtn.textContent = 'Show in All PRs';
+          emptyStateActionBtn.dataset.emptyAction = 'show_in_all';
+          emptyStateActionBtn.classList.remove('hidden');
+        } else {
+          emptyStateTitle.textContent = 'No matching pull requests';
+          emptyStateMessage.textContent = `Nothing matched "${trimmedQuery}" in this view.`;
+          emptyStateActionBtn.textContent = 'Clear Search';
+          emptyStateActionBtn.dataset.emptyAction = 'clear_search';
+          emptyStateActionBtn.classList.remove('hidden');
+        }
       } else if (activeFilter === 'action_required' && counts.all > 0) {
         emptyStateTitle.textContent = 'Nothing needs your action!';
         emptyStateMessage.textContent = `You have ${counts.all} open pull request${counts.all === 1 ? '' : 's'} waiting on others.`;
@@ -1045,41 +1405,67 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     emptyState.classList.add('hidden');
-    if (!selectedPrKey || !visiblePrs.some((pr) => pr.key === selectedPrKey)) {
-      selectedPrKey = visiblePrs[0].key;
+    if (selectedPrKey && !visiblePrs.some((pr) => pr.key === selectedPrKey)) {
+      selectedPrKey = null;
     }
 
     const fragment = document.createDocumentFragment();
     for (const pr of visiblePrs) {
       const card = buildPrCardElement(
         pr,
-        pr.key === selectedPrKey,
+        Boolean(selectedPrKey && pr.key === selectedPrKey),
         isPrSnoozed(pr, snoozedMap, now),
         now
       );
       fragment.appendChild(card);
     }
     prItemsContainer.replaceChildren(fragment);
+
+    if (prevScrollTop > 0) {
+      mainContent.scrollTop = Math.min(prevScrollTop, Math.max(0, mainContent.scrollHeight - mainContent.clientHeight));
+    }
   }
 
   /**
-   * Render the Jira tab with active tickets extracted from open PRs and Mezzanine Jira launch button.
+   * Render the Jira tab with snooze-aware active tickets, Filter PRs drill-down, and adaptive Jira CTA.
    */
   function renderJiraTab() {
     const effectiveJiraUrl = getEffectiveJiraBaseUrl(state.preferences);
     const hasJiraUrl = Boolean(effectiveJiraUrl);
+    const hasOverrideUrl = Boolean(sanitizeHttpsUrl(state.preferences.jiraBaseUrlOverride));
 
     jiraSetupHint.classList.toggle('hidden', hasJiraUrl);
-    openJiraBtn.disabled = !hasJiraUrl;
-    openJiraBtn.title = hasJiraUrl
-      ? `Open ${effectiveJiraUrl}`
-      : 'Configure CENTRAL_URLS.MEZZANINE_JIRA_URL in src/config.js or set a Jira URL override in Preferences';
+    openJiraBtn.disabled = false;
+    if (!hasJiraUrl) {
+      openJiraBtn.textContent = 'Configure Jira URL';
+      openJiraBtn.title = 'Configure CENTRAL_URLS.MEZZANINE_JIRA_URL in src/config.js or set a Jira URL override in Preferences';
+    } else if (hasOverrideUrl) {
+      openJiraBtn.textContent = 'Open Jira ↗';
+      openJiraBtn.title = `Open ${effectiveJiraUrl}`;
+    } else {
+      openJiraBtn.textContent = 'Open Mezzanine Jira ↗';
+      openJiraBtn.title = `Open ${effectiveJiraUrl}`;
+    }
 
-    const tickets = collectActiveJiraTickets(state.snapshot.prList);
+    if (!state.isAuthenticated) {
+      jiraTicketsCount.textContent = 'Not connected';
+      jiraTicketsContainer.replaceChildren();
+      jiraEmptyTitle.textContent = 'Connect Bitbucket first';
+      jiraEmptyMessage.textContent = 'Sign in with your Bitbucket credentials to surface Jira keys referenced in your open pull requests.';
+      jiraConnectBtn.classList.remove('hidden');
+      jiraEmptyState.classList.remove('hidden');
+      return;
+    }
+
+    jiraConnectBtn.classList.add('hidden');
+    const now = Date.now();
+    const tickets = collectActiveJiraTickets(state.snapshot.prList, state.snoozedMap, now);
     jiraTicketsCount.textContent = `${tickets.length} active ticket${tickets.length === 1 ? '' : 's'}`;
 
     if (tickets.length === 0) {
       jiraTicketsContainer.replaceChildren();
+      jiraEmptyTitle.textContent = 'No Jira tickets found';
+      jiraEmptyMessage.textContent = 'Reference a Jira key (e.g. MEZ-123) in a PR title or branch name to surface it here.';
       jiraEmptyState.classList.remove('hidden');
       return;
     }
@@ -1116,7 +1502,27 @@ document.addEventListener('DOMContentLoaded', async () => {
       metaEl.textContent = `${ticket.prCount} linked open PR${ticket.prCount === 1 ? '' : 's'}`;
 
       info.append(keyRow, metaEl);
-      card.appendChild(info);
+
+      const actionsEl = document.createElement('div');
+      actionsEl.className = 'jira-ticket-actions';
+
+      const filterBtn = document.createElement('button');
+      filterBtn.type = 'button';
+      filterBtn.className = 'btn btn-ghost btn-sm';
+      filterBtn.textContent = 'Filter PRs';
+      filterBtn.title = `Filter Bitbucket PRs matching ${ticket.key}`;
+      filterBtn.setAttribute('aria-label', `Filter pull requests for ${ticket.key}`);
+      filterBtn.addEventListener('click', () => {
+        activeFilter = 'all';
+        selectedPrKey = null;
+        searchQuery = ticket.key;
+        prSearchInput.value = ticket.key;
+        switchTopTab('bitbucket-tab');
+        renderBitbucketTab();
+        prItemsContainer.focus();
+        prSearchInput.focus();
+      });
+      actionsEl.appendChild(filterBtn);
 
       const safeTicketUrl = sanitizeHttpsUrl(ticket.url);
       if (safeTicketUrl) {
@@ -1128,19 +1534,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         openBtn.addEventListener('click', () => {
           void openSafeExternalUrl(safeTicketUrl);
         });
-        card.appendChild(openBtn);
+        actionsEl.appendChild(openBtn);
       } else {
         const setUrlBtn = document.createElement('button');
         setUrlBtn.type = 'button';
         setUrlBtn.className = 'btn btn-ghost btn-sm';
-        setUrlBtn.textContent = 'Set Jira URL';
+        setUrlBtn.textContent = 'Set URL';
         setUrlBtn.addEventListener('click', () => {
           openSettingsPanel('preferences');
           prefJiraUrl.focus();
         });
-        card.appendChild(setUrlBtn);
+        actionsEl.appendChild(setUrlBtn);
       }
 
+      card.append(info, actionsEl);
       fragment.appendChild(card);
     }
 
@@ -1211,6 +1618,33 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  /**
+   * Suppress redundant `chrome.storage.onChanged` reloads briefly after a local action already fetched fresh state.
+   */
+  function markLocalStateMutation() {
+    suppressStorageRefreshUntil = Date.now() + 250;
+  }
+
+  /**
+   * Refresh footer and PR card relative timestamps in-place every 30s without rebuilding the PR DOM.
+   */
+  function refreshLiveTimestamps() {
+    renderFooterTimestamp();
+    const now = Date.now();
+    const ageNodes = prItemsContainer.querySelectorAll('.pr-age');
+    for (const node of ageNodes) {
+      if (node instanceof HTMLElement && node.dataset.iso) {
+        node.textContent = formatRelativeAge(node.dataset.iso, now);
+      }
+    }
+    if (activeTabId === 'bitbucket-tab' && activeFilter === 'snoozed') {
+      const snoozeBadges = prItemsContainer.querySelectorAll('.snooze-remaining-badge');
+      if (snoozeBadges.length > 0) {
+        renderBitbucketTab();
+      }
+    }
+  }
+
   // --- User Actions ---
 
   /**
@@ -1228,11 +1662,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     setSyncLoading(true);
     try {
+      markLocalStateMutation();
       const res = await sendWorkerMessage({
         action: 'SYNC_NOW',
         forceManual: true
       });
       await refreshStateFromWorker();
+      markLocalStateMutation();
 
       if (res.skipped && res.reason === 'cooldown') {
         const secs = Math.max(1, Math.ceil((Number(res.retryInMs) || 1000) / 1000));
@@ -1272,6 +1708,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
+   * Undo a PR snooze from the inline toast action button.
+   *
+   * @param {EnrichedPullRequest} pr
+   */
+  async function undoSnoozePr(pr) {
+    try {
+      markLocalStateMutation();
+      const res = await sendWorkerMessage({ action: 'UNSNOOZE_PR', prKey: pr.key });
+      if (res.ok === false) {
+        showToast(String(res.error || 'Could not undo snooze.'), 'error');
+        return;
+      }
+      await refreshStateFromWorker();
+      markLocalStateMutation();
+      showToast(`Restored #${pr.id}`, 'success');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to undo snooze.', 'error');
+    }
+  }
+
+  /**
    * Snooze a PR for 4h or unsnooze it immediately via the background service worker.
    *
    * @param {EnrichedPullRequest} pr
@@ -1279,6 +1736,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function toggleSnoozePr(pr) {
     const currentlySnoozed = isPrSnoozed(pr, state.snoozedMap);
     try {
+      markLocalStateMutation();
       const res = currentlySnoozed
         ? await sendWorkerMessage({ action: 'UNSNOOZE_PR', prKey: pr.key })
         : await sendWorkerMessage({
@@ -1294,7 +1752,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       await refreshStateFromWorker();
-      showToast(currentlySnoozed ? `Unsnoozed #${pr.id}` : `Snoozed #${pr.id} for 4h`, 'success');
+      markLocalStateMutation();
+
+      if (currentlySnoozed) {
+        showToast(`Unsnoozed #${pr.id}`, 'success');
+      } else {
+        showToast('Snoozed for 4h (auto-unsnoozes on update)', 'success', {
+          actionLabel: 'Undo',
+          onAction: () => undoSnoozePr(pr)
+        });
+      }
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to update snooze.', 'error');
     }
@@ -1384,6 +1851,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     setCredentialsFormBusy(true);
     showInlineBanner(authStatusBanner, 'Verifying and syncing pull requests...', 'info');
     try {
+      markLocalStateMutation();
       const res = await sendWorkerMessage({ action: 'SAVE_CREDENTIALS', creds });
       if (!res.ok) {
         showInlineBanner(authStatusBanner, String(res.error || 'Could not save credentials.'), 'error');
@@ -1393,6 +1861,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       bitbucketTokenInput.value = '';
       isReplacingToken = false;
       await refreshStateFromWorker({ applyDefaultFilter: true });
+      markLocalStateMutation();
       closeSettingsPanel();
       showToast('Bitbucket connected & synced!', 'success');
     } catch (err) {
@@ -1444,6 +1913,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     savePreferencesBtn.disabled = true;
     showInlineBanner(prefsStatusBanner, 'Saving preferences...', 'info');
     try {
+      markLocalStateMutation();
       const res = await sendWorkerMessage({
         action: 'UPDATE_PREFERENCES',
         preferences: nextPrefs
@@ -1454,12 +1924,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       await refreshStateFromWorker();
+      markLocalStateMutation();
       if (state.preferences.defaultFilter !== prevDefaultFilter) {
         activeFilter = state.preferences.defaultFilter;
+        selectedPrKey = null;
         renderBitbucketTab();
       }
       closeSettingsPanel();
-      showToast('Preferences saved.', 'success');
+      if (res.syncError) {
+        showToast(`Preferences saved, but sync failed: ${String(res.syncError)}`, 'error', { durationMs: 4200 });
+      } else {
+        showToast('Preferences saved.', 'success');
+      }
     } catch (err) {
       showInlineBanner(
         prefsStatusBanner,
@@ -1469,6 +1945,38 @@ document.addEventListener('DOMContentLoaded', async () => {
     } finally {
       savePreferencesBtn.disabled = false;
     }
+  }
+
+  /**
+   * Wire `ArrowLeft` / `ArrowRight` roving keyboard navigation for an ARIA `tablist`.
+   *
+   * @param {readonly HTMLButtonElement[]} buttons
+   * @param {(btn: HTMLButtonElement) => void} onActivate
+   */
+  function wireTablistArrowNavigation(buttons, onActivate) {
+    buttons.forEach((btn, index) => {
+      btn.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft' && e.key !== 'Home' && e.key !== 'End') {
+          return;
+        }
+        e.preventDefault();
+        let nextIndex = index;
+        if (e.key === 'ArrowRight') {
+          nextIndex = (index + 1) % buttons.length;
+        } else if (e.key === 'ArrowLeft') {
+          nextIndex = (index - 1 + buttons.length) % buttons.length;
+        } else if (e.key === 'Home') {
+          nextIndex = 0;
+        } else if (e.key === 'End') {
+          nextIndex = buttons.length - 1;
+        }
+        const nextBtn = buttons[nextIndex];
+        if (nextBtn) {
+          onActivate(nextBtn);
+          nextBtn.focus();
+        }
+      });
+    });
   }
 
   // --- Wire Event Listeners ---
@@ -1482,9 +1990,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  wireTablistArrowNavigation(tabButtons, (btn) => {
+    const nextTab = btn.dataset.tab;
+    if (nextTab) {
+      switchTopTab(nextTab);
+    }
+  });
+
+  connectionStatusChip.addEventListener('click', () => {
+    openSettingsPanel(state.isAuthenticated ? 'account' : 'account');
+  });
+
   toggleSettingsBtn.addEventListener('click', () => {
     if (settingsPanel.classList.contains('hidden')) {
-      openSettingsPanel(state.isAuthenticated ? 'account' : 'account');
+      openSettingsPanel(state.isAuthenticated ? 'preferences' : 'account');
     } else {
       closeSettingsPanel();
     }
@@ -1495,6 +2014,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   settingsAccountTab.addEventListener('click', () => switchSettingsSubtab('account'));
   settingsPreferencesTab.addEventListener('click', () => switchSettingsSubtab('preferences'));
+  wireTablistArrowNavigation([settingsAccountTab, settingsPreferencesTab], (btn) => {
+    switchSettingsSubtab(btn === settingsPreferencesTab ? 'preferences' : 'account');
+  });
 
   replaceTokenBtn.addEventListener('click', () => {
     isReplacingToken = true;
@@ -1519,12 +2041,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   confirmSignOutBtn.addEventListener('click', async () => {
     confirmSignOutBtn.disabled = true;
     try {
+      markLocalStateMutation();
       await sendWorkerMessage({ action: 'SIGN_OUT' });
       isReplacingToken = false;
       activeFilter = state.preferences.defaultFilter || DEFAULT_PREFERENCES.defaultFilter;
       searchQuery = '';
+      selectedPrKey = null;
       prSearchInput.value = '';
       await refreshStateFromWorker();
+      markLocalStateMutation();
       populateAccountSection();
       showToast('Signed out of Bitbucket.');
     } catch (err) {
@@ -1561,8 +2086,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   manualRefreshBtn.addEventListener('click', () => {
     void triggerManualSync();
   });
-  errorSetupBtn.addEventListener('click', () => openSettingsPanel('account', true));
+  errorSetupBtn.addEventListener('click', () => {
+    const isAuthErr = Boolean(state.snapshot.isAuthError || state.isAuthError || !state.isAuthenticated);
+    if (isAuthErr) {
+      openSettingsPanel('account', true);
+    } else {
+      openSettingsPanel('preferences');
+    }
+  });
   setupHintBtn.addEventListener('click', () => openSettingsPanel('account'));
+  jiraConnectBtn.addEventListener('click', () => openSettingsPanel('account'));
 
   for (const pill of filterPillButtons) {
     pill.addEventListener('click', () => {
@@ -1576,20 +2109,33 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  wireTablistArrowNavigation(filterPillButtons, (pill) => {
+    const nextFilter = /** @type {PrFilter | undefined} */ (pill.dataset.filter);
+    if (!nextFilter) {
+      return;
+    }
+    activeFilter = nextFilter;
+    selectedPrKey = null;
+    renderBitbucketTab();
+  });
+
   prSearchInput.addEventListener('input', () => {
     searchQuery = prSearchInput.value;
+    selectedPrKey = null;
     renderBitbucketTab();
   });
 
   prSearchClearBtn.addEventListener('click', () => {
     searchQuery = '';
     prSearchInput.value = '';
+    selectedPrKey = null;
     renderBitbucketTab();
     prSearchInput.focus();
   });
 
   emptyStateActionBtn.addEventListener('click', () => {
     const action = emptyStateActionBtn.dataset.emptyAction;
+    selectedPrKey = null;
     if (action === 'clear_search') {
       searchQuery = '';
       prSearchInput.value = '';
@@ -1648,14 +2194,32 @@ document.addEventListener('DOMContentLoaded', async () => {
     showToast('Product request saved.', 'success');
   });
 
-  shortcutsToggleBtn.addEventListener('click', () => {
+  shortcutsToggleBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
     toggleShortcutsPopover();
   });
   closeShortcutsBtn.addEventListener('click', closeShortcutsPopover);
 
+  document.addEventListener('click', (e) => {
+    if (shortcutsPopover.classList.contains('hidden')) {
+      return;
+    }
+    const clickTarget = e.target;
+    if (
+      clickTarget instanceof Node &&
+      !shortcutsPopover.contains(clickTarget) &&
+      !shortcutsToggleBtn.contains(clickTarget)
+    ) {
+      closeShortcutsPopover();
+    }
+  });
+
   // --- Live Background Sync Subscription ---
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== 'local') {
+      return;
+    }
+    if (Date.now() < suppressStorageRefreshUntil) {
       return;
     }
     const hasRelevantChange = Object.keys(changes).some((key) => WATCHED_STORAGE_KEYS.has(key));
@@ -1669,6 +2233,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       storageRefreshTimer = null;
       void refreshStateFromWorker();
     }, 40);
+  });
+
+  // --- Lightweight 30s Live Relative Timestamp Refresh ---
+  const liveTickInterval = window.setInterval(refreshLiveTimestamps, 30_000);
+  window.addEventListener('pagehide', () => {
+    window.clearInterval(liveTickInterval);
+  });
+  window.addEventListener('unload', () => {
+    window.clearInterval(liveTickInterval);
   });
 
   // --- Keyboard-First Triage Navigation ---
@@ -1699,6 +2272,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         e.preventDefault();
         searchQuery = '';
         prSearchInput.value = '';
+        selectedPrKey = null;
         renderBitbucketTab();
         return;
       }
@@ -1752,24 +2326,30 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const currentIndex = selectedPrKey
       ? visiblePrs.findIndex((pr) => pr.key === selectedPrKey)
-      : 0;
-    const safeIndex = currentIndex >= 0 ? currentIndex : 0;
+      : -1;
 
     if (e.key === 'j' || e.key === 'ArrowDown') {
       e.preventDefault();
-      const nextIndex = Math.min(visiblePrs.length - 1, safeIndex + 1);
+      const nextIndex = currentIndex < 0
+        ? 0
+        : Math.min(visiblePrs.length - 1, currentIndex + 1);
       selectPrCard(visiblePrs[nextIndex].key, true);
       return;
     }
 
     if (e.key === 'k' || e.key === 'ArrowUp') {
       e.preventDefault();
-      const prevIndex = Math.max(0, safeIndex - 1);
+      const prevIndex = currentIndex < 0
+        ? 0
+        : Math.max(0, currentIndex - 1);
       selectPrCard(visiblePrs[prevIndex].key, true);
       return;
     }
 
-    const selectedPr = visiblePrs[safeIndex];
+    if (currentIndex < 0) {
+      return;
+    }
+    const selectedPr = visiblePrs[currentIndex];
     if (!selectedPr) {
       return;
     }

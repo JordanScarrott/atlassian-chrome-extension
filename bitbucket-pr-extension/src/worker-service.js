@@ -292,6 +292,25 @@ export function createWorkerService(deps = {}) {
   }
 
   /**
+   * Derive whether a persisted error string indicates an authentication or scope/permission issue.
+   *
+   * @param {string | null} errorMessage
+   * @returns {boolean}
+   */
+  function deriveIsAuthError(errorMessage) {
+    if (typeof errorMessage !== 'string' || !errorMessage) {
+      return false;
+    }
+    return (
+      /\b(401|403)\b/.test(errorMessage) ||
+      /Authentication failed/i.test(errorMessage) ||
+      /Access denied/i.test(errorMessage) ||
+      /API token/i.test(errorMessage) ||
+      /account email is required/i.test(errorMessage)
+    );
+  }
+
+  /**
    * Fire Chrome desktop notifications for PRs that newly entered "Your Turn".
    *
    * @param {readonly import('./pr-triage.js').EnrichedPullRequest[]} newlyActionable
@@ -312,9 +331,11 @@ export function createWorkerService(deps = {}) {
       const notificationId = `pr:${pr.key}:${now}`;
       const actionLabel = pr.actionState === 'changes_requested'
         ? 'Changes requested on your PR'
-        : pr.actionState === 'ready_to_merge'
-          ? 'Approved and ready to merge'
-          : 'Your review is requested';
+        : pr.actionState === 'ci_failed'
+          ? 'CI build failed on your PR'
+          : pr.actionState === 'ready_to_merge'
+            ? 'Approved and ready to merge'
+            : 'Your review is requested';
 
       if (safePrUrl) {
         await saveNotificationUrl(notificationId, safePrUrl);
@@ -694,17 +715,26 @@ export function createWorkerService(deps = {}) {
     });
 
     if (scopeChanged && creds && creds.token) {
-      const syncRes = await syncNow({
+      const syncResult = await syncNow({
         forceManual: true,
         forceRefreshCache: true,
         bypassCooldown: true
       });
-      if (syncRes.ok && syncRes.counts) {
+      if (syncResult.ok && syncResult.counts) {
         return {
           ok: true,
           preferences: savedPrefs,
-          counts: syncRes.counts,
-          snapshot: syncRes.snapshot
+          counts: syncResult.counts,
+          snapshot: syncResult.snapshot
+        };
+      }
+      if (!syncResult.ok) {
+        return {
+          ok: true,
+          preferences: savedPrefs,
+          counts: syncResult.counts ?? counts,
+          ...(syncResult.snapshot ? { snapshot: syncResult.snapshot } : {}),
+          syncError: syncResult.error ?? 'Failed to sync pull requests for updated scope.'
         };
       }
     }
@@ -826,6 +856,7 @@ export function createWorkerService(deps = {}) {
 
     const enrichedPrs = enrichPrList(snapshot.prList, cachedUser?.uuid ?? '', preferences, now);
     const counts = computeCounts(enrichedPrs, snoozedMap, now);
+    const isAuthError = deriveIsAuthError(snapshot.error);
 
     return {
       isAuthenticated: Boolean(creds && creds.token),
@@ -833,8 +864,10 @@ export function createWorkerService(deps = {}) {
       username: creds ? creds.username : '',
       user: cachedUser,
       workspaces: cachedWorkspaces ? cachedWorkspaces.items : [],
+      isAuthError,
       snapshot: {
         ...snapshot,
+        isAuthError,
         prList: enrichedPrs
       },
       preferences,

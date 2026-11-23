@@ -643,3 +643,111 @@ test('HTTP 429 preserves cached PRs, sets rateLimitWarning, persists backoff acr
   assert.equal(stateAfterRestart.snapshot.rateLimitWarning, true);
   assert.ok((stateAfterRestart.syncState.backoffUntil ?? 0) > now);
 });
+
+test('ci_failed triggers explicit CI notification label, updatePreferences surfaces syncError on scope sync failure, and GET_STATE exposes isAuthError', async () => {
+  let now = Date.UTC(2026, 10, 23, 12, 0, 0);
+  const mock = createMockChromeApi();
+  const storage = createStorage(mock.localArea);
+
+  await storage.saveCredentials({ authType: 'bearer', username: '', token: 'tok' });
+  await storage.savePreferences({ notificationsEnabled: true });
+  await storage.setCachedUser(SAMPLE_USER);
+
+  let mode = 'ci_fail'; // 'ci_fail' | 'scope_404' | 'auth_401'
+  const client = {
+    async verifyCredentials() {
+      return { user: SAMPLE_USER, workspaces: SAMPLE_WORKSPACES, nearLimit: false };
+    },
+    async fetchPullRequests() {
+      if (mode === 'scope_404') {
+        throw new BitbucketApiError({
+          status: 404,
+          code: 'NOT_FOUND',
+          message: 'Requested Bitbucket resource was not found (404).',
+          retryAfter: null,
+          isTransient: false,
+          isAuthError: false
+        });
+      }
+      if (mode === 'auth_401') {
+        throw new BitbucketApiError({
+          status: 401,
+          code: 'UNAUTHORIZED',
+          message: 'Authentication failed (401). Check your email/API token or access token in Settings.',
+          retryAfter: null,
+          isTransient: false,
+          isAuthError: true
+        });
+      }
+      return {
+        prs: [
+          makePr({
+            key: 'acme/web#55',
+            id: 55,
+            title: 'MEZ-55 Auth refactor',
+            authorUuid: '{me}',
+            authorName: 'Jordan',
+            reviewers: [],
+            participants: [
+              { uuid: '{bob}', displayName: 'Bob', role: 'REVIEWER', approved: true, state: 'approved' }
+            ],
+            buildStatus: {
+              state: 'FAILED',
+              totalCount: 1,
+              passedCount: 0,
+              failedCount: 1,
+              inProgressCount: 0,
+              stoppedCount: 0,
+              url: 'https://ci.example.com/build/55',
+              name: 'Unit Tests',
+              updatedOn: '2026-11-23T11:55:00Z',
+              commitHash: 'abc123',
+              cachedAt: now
+            }
+          })
+        ],
+        user: SAMPLE_USER,
+        workspaces: SAMPLE_WORKSPACES,
+        nearLimit: false,
+        partialErrors: []
+      };
+    }
+  };
+
+  const worker = createWorkerService({
+    storage,
+    client,
+    chromeApi: mock.chromeApi,
+    nowFn: () => now
+  });
+
+  // 1. Authored PR with failing CI fires notification with explicit CI label
+  const sync1 = await worker.syncNow({ forceManual: false });
+  assert.equal(sync1.ok, true);
+  assert.equal(mock.createdNotifications.length, 1);
+  assert.equal(mock.createdNotifications[0].options.title, 'CI build failed on your PR: web');
+
+  // 2. Scope change causing sync failure returns { ok: true, ..., syncError }
+  mode = 'scope_404';
+  const prefRes = await worker.handleMessage({
+    action: 'UPDATE_PREFERENCES',
+    preferences: { reposFilter: ['acme/nonexistent'] }
+  });
+  assert.equal(prefRes.ok, true);
+  assert.match(String(prefRes.syncError), /404/);
+
+  const stateAfter404 = await worker.handleMessage({ action: 'GET_STATE' });
+  assert.equal(stateAfter404.isAuthError, false);
+  assert.equal(stateAfter404.snapshot.isAuthError, false);
+
+  // 3. Auth error (401) sets isAuthError: true in GET_STATE
+  now += 60_000;
+  mode = 'auth_401';
+  const fail401 = await worker.syncNow({ forceManual: true });
+  assert.equal(fail401.ok, false);
+  assert.equal(fail401.isAuthError, true);
+
+  const stateAfter401 = await worker.handleMessage({ action: 'GET_STATE' });
+  assert.equal(stateAfter401.isAuthError, true);
+  assert.equal(stateAfter401.snapshot.isAuthError, true);
+});

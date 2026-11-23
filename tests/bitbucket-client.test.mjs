@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 
 import {
   BitbucketApiError,
+  aggregateBuildStatuses,
   buildAuthHeader,
   createBitbucketClient,
   normalizePullRequest
 } from '../bitbucket-pr-extension/src/bitbucket-client.js';
-import { DEFAULT_PREFERENCES } from '../bitbucket-pr-extension/src/config.js';
+import { CACHE_TTL_MS, DEFAULT_PREFERENCES } from '../bitbucket-pr-extension/src/config.js';
 import { createStorage } from '../bitbucket-pr-extension/src/storage.js';
 
 function createMemoryStorage() {
@@ -217,6 +218,9 @@ test('fetchPullRequests uses caches, deduplicates authored + reviewing PRs, and 
       if (str.includes('/repositories/acme/secret-repo/pullrequests')) {
         return new Response('Forbidden', { status: 403 });
       }
+      if (str.includes('/statuses')) {
+        return jsonResponse({ values: [] });
+      }
       throw new Error(`Unexpected URL: ${str}`);
     }
   });
@@ -258,12 +262,17 @@ test('normalizePullRequest rejects malformed payloads and preserves canonical fi
     id: 7,
     title: '  Ship widget  ',
     author: { uuid: '{a}', display_name: 'Alice' },
-    source: { branch: { name: 'feat/x' }, repository: { full_name: 'ws/repo', name: 'repo' } },
+    source: {
+      branch: { name: 'feat/x' },
+      commit: { hash: 'deadbeef1234' },
+      repository: { full_name: 'ws/repo', name: 'repo' }
+    },
     destination: { branch: { name: 'main' } }
   });
   assert.equal(normalized?.key, 'ws/repo#7');
   assert.equal(normalized?.title, 'Ship widget');
   assert.equal(normalized?.url, 'https://bitbucket.org/ws/repo/pull-requests/7');
+  assert.equal(normalized?.sourceCommitHash, 'deadbeef1234');
 });
 
 test('fetchPullRequests includes required PR fields, merges authored + reviewing duplicates, follows only safe /2.0/ next URLs, and scopes reposFilter', async () => {
@@ -286,6 +295,7 @@ test('fetchPullRequests includes required PR fields, merges authored + reviewing
         const fields = (parsed.searchParams.get('fields') || '').split(',');
         assert.ok(fields.includes('next'));
         assert.ok(fields.includes('values.links.html.href'));
+        assert.ok(fields.includes('values.source.commit.hash'));
         assert.ok(fields.includes('values.participants.role'));
         assert.ok(fields.includes('values.participants.state'));
         assert.ok(fields.includes('values.reviewers.uuid'));
@@ -298,7 +308,7 @@ test('fetchPullRequests includes required PR fields, merges authored + reviewing
               title: 'Authored + Reviewing PR',
               state: 'OPEN',
               author: { uuid: '{me}', display_name: 'Jordan' },
-              source: { branch: { name: 'feat/MEZ-11' } },
+              source: { branch: { name: 'feat/MEZ-11' }, commit: { hash: 'abc999' } },
               destination: { branch: { name: 'main' }, repository: { full_name: 'Acme/api', name: 'api' } },
               reviewers: [{ uuid: '{other-rev}', display_name: 'Bob' }],
               participants: [
@@ -313,6 +323,9 @@ test('fetchPullRequests includes required PR fields, merges authored + reviewing
           next: 'https://evil.example.com/2.0/steal', // must be ignored!
           values: []
         });
+      }
+      if (str.includes('/repositories/Acme/api/pullrequests/55/statuses')) {
+        return jsonResponse({ values: [] });
       }
       if (str.includes('/repositories/acme/api/pullrequests')) {
         return jsonResponse({
@@ -346,6 +359,7 @@ test('fetchPullRequests includes required PR fields, merges authored + reviewing
   });
 
   assert.equal(res.prs.length, 1);
+  assert.equal(res.prs[0].sourceCommitHash, 'abc999');
   // Deduplication merges reviewers & participants rather than overwriting
   assert.equal(res.prs[0].reviewers.length, 2);
   assert.equal(res.prs[0].participants.length, 2);
@@ -396,4 +410,258 @@ test('fetchPullRequests throws on 429, TIMEOUT, and NETWORK errors instead of re
       (err) => err instanceof BitbucketApiError && err.isTransient === true
     );
   }
+});
+
+test('aggregateBuildStatuses enforces FAILED > INPROGRESS > STOPPED > SUCCESSFUL precedence and sanitizes URLs', () => {
+  const now = 1_700_000_000_000;
+  assert.equal(aggregateBuildStatuses([], 'abc', now), null);
+  assert.equal(aggregateBuildStatuses([{ state: 'UNKNOWN' }], 'abc', now), null);
+
+  // FAILED beats INPROGRESS, STOPPED, and SUCCESSFUL; unsafe URLs are rejected
+  const failedSummary = aggregateBuildStatuses(
+    [
+      { state: 'SUCCESSFUL', name: 'Lint', url: 'https://ci.example.com/lint', updated_on: '2026-11-23T10:00:00Z' },
+      { state: 'INPROGRESS', name: 'E2E', url: 'https://ci.example.com/e2e', updated_on: '2026-11-23T10:02:00Z' },
+      { state: 'FAILED', name: 'Unit Tests', url: 'http://insecure.example.com/unit', updated_on: '2026-11-23T10:01:00Z' },
+      { state: 'FAILED', name: 'Integration', url: 'https://ci.example.com/int', updated_on: '2026-11-23T10:03:00Z' },
+      { state: 'STOPPED', name: 'Deploy', url: 'https://ci.example.com/deploy', updated_on: '2026-11-23T09:59:00Z' }
+    ],
+    'commit-1',
+    now
+  );
+  assert.deepEqual(failedSummary, {
+    state: 'FAILED',
+    totalCount: 5,
+    passedCount: 1,
+    failedCount: 2,
+    inProgressCount: 1,
+    stoppedCount: 1,
+    url: 'https://ci.example.com/int',
+    name: 'Unit Tests',
+    updatedOn: '2026-11-23T10:03:00Z',
+    commitHash: 'commit-1',
+    cachedAt: now
+  });
+
+  // INPROGRESS beats STOPPED and SUCCESSFUL
+  const inProgressSummary = aggregateBuildStatuses(
+    [
+      { state: 'SUCCESSFUL', name: 'Lint', url: 'https://ci.example.com/lint', updated_on: '2026-11-23T10:00:00Z' },
+      { state: 'STOPPED', name: 'Old', url: 'https://ci.example.com/old', updated_on: '2026-11-23T10:01:00Z' },
+      { state: 'INPROGRESS', name: 'Build', url: 'javascript:alert(1)', updated_on: '2026-11-23T10:02:00Z' }
+    ],
+    'commit-2',
+    now
+  );
+  assert.equal(inProgressSummary?.state, 'INPROGRESS');
+  assert.equal(inProgressSummary?.url, null);
+  assert.equal(inProgressSummary?.name, 'Build');
+
+  // STOPPED beats SUCCESSFUL
+  const stoppedSummary = aggregateBuildStatuses(
+    [
+      { state: 'SUCCESSFUL', name: 'Lint', url: 'https://ci.example.com/lint', updated_on: '2026-11-23T10:00:00Z' },
+      { state: 'STOPPED', name: 'Manual Stop', url: 'https://ci.example.com/stop', updated_on: '2026-11-23T10:01:00Z' }
+    ],
+    'commit-3',
+    now
+  );
+  assert.equal(stoppedSummary?.state, 'STOPPED');
+  assert.equal(stoppedSummary?.url, 'https://ci.example.com/stop');
+
+  // SUCCESSFUL picks latest updated_on build URL
+  const successSummary = aggregateBuildStatuses(
+    [
+      { state: 'SUCCESSFUL', name: 'Older', url: 'https://ci.example.com/1', updated_on: '2026-11-23T10:00:00Z' },
+      { state: 'SUCCESSFUL', name: 'Latest', url: 'https://ci.example.com/2', updated_on: '2026-11-23T10:05:00Z' }
+    ],
+    'commit-4',
+    now
+  );
+  assert.equal(successSummary?.state, 'SUCCESSFUL');
+  assert.equal(successSummary?.url, 'https://ci.example.com/2');
+  assert.equal(successSummary?.name, 'Latest');
+});
+
+test('fetchPullRequests caches terminal build statuses for 6h, refreshes INPROGRESS after 60s, skips on nearLimit, and degrades gracefully on /statuses errors', async () => {
+  let now = 1_700_000_000_000;
+  const storage = createMemoryStorage();
+  await storage.setCachedUser({
+    uuid: '{me}',
+    displayName: 'Jordan',
+    username: 'jordan',
+    avatarUrl: null,
+    cachedAt: now
+  });
+  await storage.setCachedWorkspaces({
+    items: [{ slug: 'acme', name: 'Acme' }],
+    cachedAt: now
+  });
+
+  let commitA = 'sha-terminal-1';
+  let commitB = 'sha-active-1';
+  let statusMode = 'normal'; // 'normal' | 'updated_active' | 'near_limit_pr' | 'errors'
+  /** @type {string[]} */
+  const statusRequests = [];
+
+  const client = createBitbucketClient({
+    nowFn: () => now,
+    sleepFn: async () => {},
+    fetchFn: async (url) => {
+      const str = String(url);
+      if (str.includes('/workspaces/acme/pullrequests/')) {
+        return jsonResponse(
+          {
+            values: [
+              {
+                id: 1,
+                title: 'Terminal PR',
+                state: 'OPEN',
+                author: { uuid: '{me}', display_name: 'Jordan' },
+                source: { branch: { name: 'feat/1' }, commit: { hash: commitA } },
+                destination: { branch: { name: 'main' }, repository: { full_name: 'acme/app', name: 'app' } }
+              },
+              {
+                id: 2,
+                title: 'Active PR',
+                state: 'OPEN',
+                author: { uuid: '{me}', display_name: 'Jordan' },
+                source: { branch: { name: 'feat/2' }, commit: { hash: commitB } },
+                destination: { branch: { name: 'main' }, repository: { full_name: 'acme/app', name: 'app' } }
+              },
+              {
+                id: 3,
+                title: '403 Status PR',
+                state: 'OPEN',
+                author: { uuid: '{me}', display_name: 'Jordan' },
+                source: { branch: { name: 'feat/3' }, commit: { hash: 'sha-403' } },
+                destination: { branch: { name: 'main' }, repository: { full_name: 'acme/app', name: 'app' } }
+              }
+            ]
+          },
+          statusMode === 'near_limit_pr' ? { headers: { 'X-RateLimit-NearLimit': 'true' } } : {}
+        );
+      }
+      if (str.includes('/repositories/acme/app/pullrequests?')) {
+        return jsonResponse({ values: [] });
+      }
+      if (str.includes('/statuses')) {
+        statusRequests.push(str);
+        if (str.includes('/pullrequests/1/statuses')) {
+          return jsonResponse({
+            values: [
+              { state: 'SUCCESSFUL', name: 'Build #1', url: 'https://ci.example.com/1', updated_on: '2026-11-23T10:00:00Z' }
+            ]
+          });
+        }
+        if (str.includes('/pullrequests/2/statuses')) {
+          if (statusMode === 'errors') {
+            return new Response('Rate limited', { status: 429 });
+          }
+          if (statusMode === 'updated_active') {
+            return jsonResponse({
+              values: [
+                { state: 'FAILED', name: 'Pipeline #2', url: 'https://ci.example.com/2-fail', updated_on: '2026-11-23T10:05:00Z' }
+              ]
+            });
+          }
+          return jsonResponse({
+            values: [
+              { state: 'INPROGRESS', name: 'Pipeline #2', url: 'https://ci.example.com/2', updated_on: '2026-11-23T10:01:00Z' }
+            ]
+          });
+        }
+        if (str.includes('/pullrequests/3/statuses')) {
+          return new Response('Forbidden', { status: 403 });
+        }
+      }
+      throw new Error(`Unexpected URL: ${str}`);
+    }
+  });
+
+  const prefs = { ...DEFAULT_PREFERENCES, reposFilter: ['acme/app'] };
+
+  // Round 1: Fetches /statuses for PR 1, PR 2, PR 3; PR 3 returns 403 but sync still succeeds!
+  const run1 = await client.fetchPullRequests({
+    creds: { authType: 'bearer', token: 'tok' },
+    storage,
+    preferences: prefs
+  });
+  assert.equal(run1.prs.length, 3);
+  assert.equal(statusRequests.length, 3);
+  assert.equal(run1.prs.find((p) => p.id === 1)?.buildStatus?.state, 'SUCCESSFUL');
+  assert.equal(run1.prs.find((p) => p.id === 2)?.buildStatus?.state, 'INPROGRESS');
+  assert.equal(run1.prs.find((p) => p.id === 3)?.buildStatus, null);
+  assert.ok(run1.partialErrors.some((e) => e.scope === 'acme/app#3 (statuses)' && e.status === 403));
+
+  // Round 2 (30s later): Both terminal (6h TTL) and active (60s TTL) reuse cache -> 0 calls for #1 and #2!
+  now += 30_000;
+  statusRequests.length = 0;
+  const run2 = await client.fetchPullRequests({
+    creds: { authType: 'bearer', token: 'tok' },
+    storage,
+    preferences: prefs
+  });
+  assert.equal(statusRequests.length, 1); // only PR #3 (had no cached summary)
+  assert.ok(!statusRequests.some((u) => u.includes('/pullrequests/1/statuses')));
+  assert.ok(!statusRequests.some((u) => u.includes('/pullrequests/2/statuses')));
+  assert.equal(run2.prs.find((p) => p.id === 1)?.buildStatus?.state, 'SUCCESSFUL');
+  assert.equal(run2.prs.find((p) => p.id === 2)?.buildStatus?.state, 'INPROGRESS');
+
+  // Round 3 (past 60s active TTL, within 6h terminal TTL): PR #1 still cached (0 calls), PR #2 re-fetched
+  now += CACHE_TTL_MS.buildStatusActive;
+  statusMode = 'updated_active';
+  statusRequests.length = 0;
+  const run3 = await client.fetchPullRequests({
+    creds: { authType: 'bearer', token: 'tok' },
+    storage,
+    preferences: prefs
+  });
+  assert.ok(!statusRequests.some((u) => u.includes('/pullrequests/1/statuses')));
+  assert.ok(statusRequests.some((u) => u.includes('/pullrequests/2/statuses')));
+  assert.equal(run3.prs.find((p) => p.id === 2)?.buildStatus?.state, 'FAILED');
+
+  // Round 4: nearLimit = true skips ALL /statuses network calls and reuses cached entries
+  commitA = 'sha-new-commit-a';
+  statusMode = 'near_limit_pr';
+  statusRequests.length = 0;
+  const run4 = await client.fetchPullRequests({
+    creds: { authType: 'bearer', token: 'tok' },
+    storage,
+    preferences: prefs
+  });
+  assert.equal(run4.nearLimit, true);
+  assert.equal(statusRequests.length, 0);
+  assert.equal(run4.prs.find((p) => p.id === 1)?.buildStatus, null);
+  assert.equal(run4.prs.find((p) => p.id === 2)?.buildStatus?.state, 'FAILED');
+
+  // Round 5: 429 on /statuses sets nearLimit = true and preserves cached buildStatus without failing PR sync
+  commitB = 'sha-new-commit-b';
+  // Seed a cached entry for the new commit so we can verify fallback preservation on 429
+  const existingCache = await storage.getCachedBuildStatuses();
+  await storage.setCachedBuildStatuses({
+    ...existingCache,
+    'acme/app:sha-new-commit-b': {
+      state: 'INPROGRESS',
+      totalCount: 1,
+      passedCount: 0,
+      failedCount: 0,
+      inProgressCount: 1,
+      stoppedCount: 0,
+      url: 'https://ci.example.com/prev',
+      name: 'Prev Run',
+      updatedOn: '2026-11-23T10:00:00Z',
+      commitHash: 'sha-new-commit-b',
+      cachedAt: now - CACHE_TTL_MS.buildStatusActive - 1000
+    }
+  });
+  statusMode = 'errors';
+  const run5 = await client.fetchPullRequests({
+    creds: { authType: 'bearer', token: 'tok' },
+    storage,
+    preferences: prefs
+  });
+  assert.equal(run5.prs.length, 3);
+  assert.equal(run5.nearLimit, true);
+  assert.equal(run5.prs.find((p) => p.id === 2)?.buildStatus?.state, 'INPROGRESS');
 });

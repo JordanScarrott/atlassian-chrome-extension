@@ -35,11 +35,22 @@ test('DOM IDs, CSS selectors, classes, CSP, and MV3 runtime invariants stay cons
     'compact-mode',
     'state-needs_review',
     'state-changes_requested',
+    'state-ci_failed',
     'state-ready_to_merge',
     'state-waiting_reviewers',
     'state-approved_by_you',
     'state-changes_requested_by_you',
     'state-draft',
+    'ci-badge',
+    'ci-successful',
+    'ci-failed',
+    'ci-inprogress',
+    'ci-stopped',
+    'meta-task-badge',
+    'meta-cr-badge',
+    'snooze-remaining-badge',
+    'toast-action-btn',
+    'jira-ticket-actions',
     'toast-success',
     'toast-error',
     'inline-banner',
@@ -52,6 +63,7 @@ test('DOM IDs, CSS selectors, classes, CSP, and MV3 runtime invariants stay cons
   for (const cls of referencedClasses) {
     assert.ok(stylesCss.includes(`.${cls}`), `styles.css is missing selector .${cls}`);
   }
+  assert.ok(stylesCss.includes('@media (prefers-color-scheme: dark)'));
 
   // 2. CSP & Security: no inline event handlers in popup.html, no runtime innerHTML/eval in popup.js
   assert.equal(/\son[a-z]+\s*=/i.test(popupHtml), false);

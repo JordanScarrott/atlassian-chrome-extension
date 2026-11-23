@@ -58,7 +58,9 @@ export const CACHE_TTL_MS = Object.freeze({
   userProfile: 24 * 60 * 60 * 1000,
   workspaces: 60 * 60 * 1000,
   repositories: 30 * 60 * 1000,
-  prStaleAfter: 5 * 60 * 1000
+  prStaleAfter: 5 * 60 * 1000,
+  buildStatusTerminal: 6 * 60 * 60 * 1000,
+  buildStatusActive: 60 * 1000
 });
 
 export const THROTTLE_CONFIG = Object.freeze({
@@ -68,6 +70,7 @@ export const THROTTLE_CONFIG = Object.freeze({
   maxConcurrentRequests: 4,
   maxPagesPerEndpoint: 5,
   maxReposPerWorkspace: 25,
+  maxBuildStatusCacheEntries: 200,
   baseBackoffMs: 15_000,
   maxBackoffMs: 15 * 60 * 1000,
   nearLimitDelayMs: 1_500
@@ -94,6 +97,7 @@ export const STORAGE_KEYS = Object.freeze({
   CACHED_USER: 'cachedUser',
   CACHED_WORKSPACES: 'cachedWorkspaces',
   CACHED_REPOS: 'cachedRepos',
+  CACHED_BUILD_STATUSES: 'cachedBuildStatuses',
   PR_LIST: 'prList',
   LAST_UPDATED: 'lastUpdated',
   ERROR: 'error',
