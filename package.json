@@ -1,0 +1,25 @@
+{
+  "name": "atlassian-chrome-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Atlassian Chrome Extension (Bitbucket PR Tracker & Mezzanine Jira Hub) — Manifest V3",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/**/*.test.mjs",
+    "generate-icons": "node scripts/generate-icons.mjs",
+    "verify:extension": "node scripts/verify-extension.mjs",
+    "verify": "npm run verify:extension && npm run lint && npm run typecheck && npm test",
+    "package": "node scripts/package-extension.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.38",
+    "eslint": "^9.39.1",
+    "globals": "^16.5.0",
+    "typescript": "^5.9.3"
+  }
+}

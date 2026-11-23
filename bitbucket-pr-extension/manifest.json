@@ -1,21 +1,23 @@
 {
   "manifest_version": 3,
-  "name": "Bitbucket PR Tracker",
-  "version": "1.0.0",
-  "description": "Tracks open Bitbucket Pull Requests and shows the active count on the extension badge icon.",
+  "name": "Atlassian Extension Hub",
+  "version": "2.0.0",
+  "description": "Low-cognitive-load Bitbucket PR tracker (authored & reviewing), Jira ticket links, and Atlassian Hub.",
   "permissions": [
     "storage",
-    "alarms"
+    "alarms",
+    "notifications"
   ],
   "host_permissions": [
     "https://api.bitbucket.org/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Bitbucket Pull Requests",
+    "default_title": "Atlassian Extension Hub",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
