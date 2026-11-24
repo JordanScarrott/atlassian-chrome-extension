@@ -7,36 +7,50 @@ import {
   getEffectiveJiraBaseUrl,
   sanitizeHttpsUrl
 } from './src/config.js';
+import { isPrSnoozed } from './src/pr-triage.js';
 import {
-  ACTION_BADGE_LABELS,
-  buildReviewerBreakdown,
-  filterPrsByRelatedTicket,
-  formatFooterUpdated,
-  formatRelativeAge,
-  formatRemainingSnooze,
-  getCiBadgeDescriptor,
-  getCrossFilterEmptyHint,
-  getDeckDotDescriptor,
-  getHeaderConnectionDescriptor,
-  getOffscreenDeckAttention,
-  sortDeckPrs
-} from './src/popup-helpers.js';
+  highlightSelectedPrCard,
+  navigateDeckSlideInContainer
+} from './src/ui/pr-card-renderer.js';
 import {
-  buildRelatedPrMap,
-  collectActiveJiraTickets,
-  computeCounts,
-  filterAndSortPrs,
-  groupPrsByTicket,
-  isPrSnoozed
-} from './src/pr-triage.js';
-import { normalizeAuthType } from './src/storage.js';
+  hideSettingsDrawer,
+  renderAccountSection,
+  renderPreferencesForm,
+  renderSettingsSubtab,
+  readValidatedCredentialInputs,
+  readValidatedGitHubInputs,
+  readValidatedPreferencesInputs,
+  resolveAccountSectionElements,
+  resolvePreferencesFormElements,
+  resolveSettingsDrawerControls,
+  showInlineBanner,
+  showSettingsDrawer,
+  syncAuthMethodFields,
+  toggleSecretInputVisibility
+} from './src/ui/settings-renderer.js';
+import {
+  TOP_TABS,
+  refreshRelativeTimestampsInDom,
+  renderAddProductForm,
+  renderBitbucketTab as renderBitbucketTabView,
+  renderConfluenceTab as renderConfluenceTabView,
+  renderFooterTimestamp,
+  renderHeaderStatusChip,
+  renderJiraTab as renderJiraTabView,
+  renderShortcutsPopoverState,
+  renderStaticMetadata,
+  renderSyncLoadingState,
+  renderTopTabSelection,
+  resolveBitbucketTabElements,
+  resolveJiraTabElements,
+  resolveShellDomElements,
+  showToastBanner
+} from './src/ui/tabs-renderer.js';
 
 /** @typedef {import('./src/config.js').Preferences} Preferences */
 /** @typedef {import('./src/pr-triage.js').EnrichedPullRequest} EnrichedPullRequest */
 /** @typedef {import('./src/pr-triage.js').PrCounts} PrCounts */
 /** @typedef {import('./src/pr-triage.js').PrFilter} PrFilter */
-/** @typedef {import('./src/pr-triage.js').RelatedPrSummary} RelatedPrSummary */
-/** @typedef {import('./src/pr-triage.js').TicketPrGroup} TicketPrGroup */
 /** @typedef {import('./src/storage.js').AuthType} AuthType */
 /** @typedef {import('./src/storage.js').CachedUser} CachedUser */
 /** @typedef {import('./src/storage.js').PrSnapshot} PrSnapshot */
@@ -44,6 +58,7 @@ import { normalizeAuthType } from './src/storage.js';
 /** @typedef {import('./src/storage.js').SnoozedMap} SnoozedMap */
 /** @typedef {import('./src/storage.js').SyncState} SyncState */
 /** @typedef {import('./src/storage.js').WorkspaceSummary} WorkspaceSummary */
+/** @typedef {import('./src/ui/pr-card-renderer.js').PrCardCallbacks} PrCardCallbacks */
 
 /**
  * @typedef {Object} GitHubBootstrapState
@@ -71,7 +86,6 @@ import { normalizeAuthType } from './src/storage.js';
  */
 
 const SNOOZE_FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
-const TOP_TABS = ['bitbucket-tab', 'jira-tab', 'confluence-tab', 'add-product-tab'];
 
 /** @type {ReadonlySet<string>} */
 const WATCHED_STORAGE_KEYS = new Set([
@@ -94,22 +108,6 @@ const WATCHED_STORAGE_KEYS = new Set([
 ]);
 
 /**
- * Resolve a DOM element by ID and assert its concrete element class for strict type safety.
- *
- * @template {HTMLElement} T
- * @param {string} id
- * @param {new (...args: any[]) => T} ElementClass
- * @returns {T}
- */
-function getEl(id, ElementClass) {
-  const el = document.getElementById(id);
-  if (!(el instanceof ElementClass)) {
-    throw new Error(`Expected #${id} to exist as ${ElementClass.name}`);
-  }
-  return el;
-}
-
-/**
  * Send a typed message to the MV3 background service worker, checking `chrome.runtime.lastError`.
  *
  * @template {Record<string, any>} [T=Record<string, any>]
@@ -127,45 +125,6 @@ function sendWorkerMessage(payload) {
       resolve(/** @type {T} */ (response ?? {}));
     });
   });
-}
-
-/**
- * Parse comma-separated workspace or repository filter strings into trimmed, deduplicated slugs.
- *
- * @param {string} rawText
- * @returns {string[]}
- */
-function parseCsvList(rawText) {
-  const seen = new Set();
-  /** @type {string[]} */
-  const items = [];
-  for (const part of rawText.split(',')) {
-    const trimmed = part.trim();
-    if (trimmed && !seen.has(trimmed)) {
-      seen.add(trimmed);
-      items.push(trimmed);
-    }
-  }
-  return items;
-}
-
-/**
- * Extract 1-2 uppercase avatar initials from a display name or username.
- *
- * @param {string} name
- * @param {string} [fallback]
- * @returns {string}
- */
-function getInitials(name, fallback = 'BB') {
-  const cleaned = name.trim();
-  if (!cleaned) {
-    return fallback;
-  }
-  const parts = cleaned.split(/\s+/).filter(Boolean);
-  if (parts.length >= 2) {
-    return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
-  }
-  return cleaned.slice(0, 2).toUpperCase();
 }
 
 /**
@@ -218,162 +177,51 @@ function createEmptyState() {
 
 document.addEventListener('DOMContentLoaded', async () => {
   // --- DOM References ---
-  const extensionContainer = getEl('extension-container', HTMLDivElement);
-  const mainContent = getEl('main-content', HTMLElement);
-  const appTitle = getEl('app-title', HTMLHeadingElement);
-  const connectionStatusChip = getEl('connection-status-chip', HTMLButtonElement);
-  const connectionStatusText = getEl('connection-status-text', HTMLSpanElement);
-  const manualRefreshBtn = getEl('manual-refresh-btn', HTMLButtonElement);
-  const toggleSettingsBtn = getEl('toggle-settings-btn', HTMLButtonElement);
+  const shellEls = resolveShellDomElements();
+  const {
+    appTitle,
+    connectionStatusChip,
+    connectionStatusText,
+    manualRefreshBtn,
+    toggleSettingsBtn,
+    tabButtons,
+    tabPanels,
+    prSearchInput,
+    loadingIndicator,
+    clearRelatedScopeBtn,
+    setupHintBtn,
+    setupHintGitHubBtn,
+    jiraOpenPrefsBtn,
+    confluenceConfiguredCard,
+    confluencePlaceholderCard,
+    openConfluenceBtn,
+    addProductForm,
+    customProductFeedbackInput,
+    productRequestSuccessAlert,
+    lastUpdatedText,
+    shortcutsToggleBtn,
+    shortcutsPopover,
+    closeShortcutsBtn,
+    appVersionEl,
+    toastContainer
+  } = shellEls;
 
-  const tabButtons = /** @type {HTMLButtonElement[]} */ (
-    Array.from(document.querySelectorAll('.tab-btn')).filter((el) => el instanceof HTMLButtonElement)
-  );
-  const tabPanels = /** @type {HTMLElement[]} */ (
-    Array.from(document.querySelectorAll('.tab-panel')).filter((el) => el instanceof HTMLElement)
-  );
+  const settingsControls = resolveSettingsDrawerControls();
+  const { settingsPanel, settingsAccountTab, settingsPreferencesTab } = settingsControls;
 
-  // Settings Drawer & Sub-tabs
-  const settingsPanel = getEl('settings-panel', HTMLElement);
-  const closeSettingsBtn = getEl('close-settings-btn', HTMLButtonElement);
-  const settingsAccountTab = getEl('settings-account-tab', HTMLButtonElement);
-  const settingsPreferencesTab = getEl('settings-preferences-tab', HTMLButtonElement);
-  const settingsAccountPanel = getEl('settings-account-panel', HTMLDivElement);
-  const settingsPreferencesPanel = getEl('settings-preferences-panel', HTMLDivElement);
+  const accountSectionElements = resolveAccountSectionElements();
+  const preferencesFormElements = resolvePreferencesFormElements();
+  const bitbucketTabElements = resolveBitbucketTabElements();
+  const jiraTabElements = resolveJiraTabElements();
 
-  // Bitbucket Account Summary
-  const accountSummaryCard = getEl('account-summary-card', HTMLDivElement);
-  const accountAvatar = getEl('account-avatar', HTMLDivElement);
-  const accountDisplayName = getEl('account-display-name', HTMLDivElement);
-  const accountUsername = getEl('account-username', HTMLDivElement);
-  const accountAuthType = getEl('account-auth-type', HTMLSpanElement);
-  const accountWorkspaceCount = getEl('account-workspace-count', HTMLSpanElement);
-  const replaceTokenBtn = getEl('replace-token-btn', HTMLButtonElement);
-  const signOutBtn = getEl('sign-out-btn', HTMLButtonElement);
-  const signOutConfirm = getEl('sign-out-confirm', HTMLDivElement);
-  const confirmSignOutBtn = getEl('confirm-sign-out-btn', HTMLButtonElement);
-  const cancelSignOutBtn = getEl('cancel-sign-out-btn', HTMLButtonElement);
-
-  // Bitbucket Credentials Form
-  const credentialsForm = getEl('credentials-form', HTMLFormElement);
-  const createApiTokenLink = getEl('create-api-token-link', HTMLAnchorElement);
-  const requiredScopesList = getEl('required-scopes-list', HTMLUListElement);
-  const authTypeSelect = getEl('auth-type', HTMLSelectElement);
-  const usernameGroup = getEl('username-group', HTMLDivElement);
-  const bitbucketUsernameInput = getEl('bitbucket-username', HTMLInputElement);
-  const tokenLabel = getEl('token-label', HTMLLabelElement);
-  const bitbucketTokenInput = getEl('bitbucket-token', HTMLInputElement);
-  const toggleTokenVisibilityBtn = getEl('toggle-token-visibility', HTMLButtonElement);
-  const tokenHelpText = getEl('token-help', HTMLParagraphElement);
-  const authStatusBanner = getEl('auth-status-banner', HTMLDivElement);
-  const testConnectionBtn = getEl('test-connection-btn', HTMLButtonElement);
-  const saveSettingsBtn = getEl('save-settings-btn', HTMLButtonElement);
-  const cancelSettingsBtn = getEl('cancel-settings-btn', HTMLButtonElement);
-
-  // GitHub Account Summary & Credentials Form
-  const githubSummaryCard = getEl('github-summary-card', HTMLDivElement);
-  const githubAvatar = getEl('github-avatar', HTMLDivElement);
-  const githubDisplayName = getEl('github-display-name', HTMLDivElement);
-  const githubUsername = getEl('github-username', HTMLDivElement);
-  const githubApiUrlDisplay = getEl('github-api-url-display', HTMLSpanElement);
-  const githubReplaceTokenBtn = getEl('github-replace-token-btn', HTMLButtonElement);
-  const githubSignOutBtn = getEl('github-sign-out-btn', HTMLButtonElement);
-  const githubSignOutConfirm = getEl('github-sign-out-confirm', HTMLDivElement);
-  const githubConfirmSignOutBtn = getEl('github-confirm-sign-out-btn', HTMLButtonElement);
-  const githubCancelSignOutBtn = getEl('github-cancel-sign-out-btn', HTMLButtonElement);
-
-  const githubCredentialsForm = getEl('github-credentials-form', HTMLFormElement);
-  const createGitHubTokenLink = getEl('create-github-token-link', HTMLAnchorElement);
-  const githubRequiredScopesList = getEl('github-required-scopes-list', HTMLUListElement);
-  const githubTokenInput = getEl('github-token', HTMLInputElement);
-  const toggleGitHubTokenVisibilityBtn = getEl('toggle-github-token-visibility', HTMLButtonElement);
-  const githubApiUrlInput = getEl('github-api-url', HTMLInputElement);
-  const githubAuthStatusBanner = getEl('github-auth-status-banner', HTMLDivElement);
-  const testGitHubConnectionBtn = getEl('test-github-connection-btn', HTMLButtonElement);
-  const saveGitHubSettingsBtn = getEl('save-github-settings-btn', HTMLButtonElement);
-  const cancelGitHubSettingsBtn = getEl('cancel-github-settings-btn', HTMLButtonElement);
-
-  // Preferences Form
-  const preferencesForm = getEl('preferences-form', HTMLFormElement);
-  const prefPollInterval = getEl('pref-poll-interval', HTMLSelectElement);
-  const prefBadgeMode = getEl('pref-badge-mode', HTMLSelectElement);
-  const prefStaleHours = getEl('pref-stale-hours', HTMLSelectElement);
-  const prefDefaultFilter = getEl('pref-default-filter', HTMLSelectElement);
-  const prefNotifications = getEl('pref-notifications', HTMLInputElement);
-  const prefCompactMode = getEl('pref-compact-mode', HTMLInputElement);
-  const prefWorkspacesFilter = getEl('pref-workspaces-filter', HTMLInputElement);
-  const availableWorkspacesHint = getEl('available-workspaces-hint', HTMLParagraphElement);
-  const prefReposFilter = getEl('pref-repos-filter', HTMLInputElement);
-  const prefJiraUrl = getEl('pref-jira-url', HTMLInputElement);
-  const prefsStatusBanner = getEl('prefs-status-banner', HTMLDivElement);
-  const savePreferencesBtn = getEl('save-preferences-btn', HTMLButtonElement);
-  const cancelPreferencesBtn = getEl('cancel-preferences-btn', HTMLButtonElement);
-
-  // Bitbucket PRs Tab
-  const triageControls = getEl('triage-controls', HTMLDivElement);
-  const filterPillButtons = /** @type {HTMLButtonElement[]} */ (
-    Array.from(document.querySelectorAll('.filter-pill')).filter((el) => el instanceof HTMLButtonElement)
-  );
-  const countActionRequired = getEl('count-action-required', HTMLSpanElement);
-  const countReviewing = getEl('count-reviewing', HTMLSpanElement);
-  const countAuthored = getEl('count-authored', HTMLSpanElement);
-  const countAll = getEl('count-all', HTMLSpanElement);
-  const countSnoozed = getEl('count-snoozed', HTMLSpanElement);
-  const prSearchInput = getEl('pr-search-input', HTMLInputElement);
-  const prSearchClearBtn = getEl('pr-search-clear-btn', HTMLButtonElement);
-  const groupByTicketBtn = getEl('group-by-ticket-btn', HTMLButtonElement);
-  const prCountTitle = getEl('pr-count-title', HTMLSpanElement);
-
-  const loadingIndicator = getEl('loading-indicator', HTMLDivElement);
-  const errorAlert = getEl('error-alert', HTMLDivElement);
-  const errorTitle = getEl('error-title', HTMLElement);
-  const errorMessage = getEl('error-message', HTMLParagraphElement);
-  const errorSetupBtn = getEl('error-setup-btn', HTMLButtonElement);
-  const rateLimitBanner = getEl('rate-limit-banner', HTMLDivElement);
-  const backoffBanner = getEl('backoff-banner', HTMLDivElement);
-  const backoffMessage = getEl('backoff-message', HTMLParagraphElement);
-
-  const relatedScopeBanner = getEl('related-scope-banner', HTMLDivElement);
-  const relatedScopeText = getEl('related-scope-text', HTMLSpanElement);
-  const clearRelatedScopeBtn = getEl('clear-related-scope-btn', HTMLButtonElement);
-
-  const prItemsContainer = getEl('pr-items-container', HTMLDivElement);
-  const emptyState = getEl('empty-state', HTMLDivElement);
-  const emptyStateTitle = getEl('empty-state-title', HTMLHeadingElement);
-  const emptyStateMessage = getEl('empty-state-message', HTMLParagraphElement);
-  const emptyStateActionBtn = getEl('empty-state-action-btn', HTMLButtonElement);
-  const setupHint = getEl('setup-hint', HTMLDivElement);
-  const setupHintBtn = getEl('setup-hint-btn', HTMLButtonElement);
-  const setupHintGitHubBtn = getEl('setup-hint-github-btn', HTMLButtonElement);
-
-  // Jira Tab
-  const openJiraBtn = getEl('open-jira-btn', HTMLButtonElement);
-  const jiraSetupHint = getEl('jira-setup-hint', HTMLDivElement);
-  const jiraOpenPrefsBtn = getEl('jira-open-prefs-btn', HTMLButtonElement);
-  const jiraTicketsCount = getEl('jira-tickets-count', HTMLSpanElement);
-  const jiraTicketsContainer = getEl('jira-tickets-container', HTMLDivElement);
-  const jiraEmptyState = getEl('jira-empty-state', HTMLDivElement);
-  const jiraEmptyTitle = getEl('jira-empty-title', HTMLHeadingElement);
-  const jiraEmptyMessage = getEl('jira-empty-message', HTMLParagraphElement);
-  const jiraConnectBtn = getEl('jira-connect-btn', HTMLButtonElement);
-
-  // Confluence Tab
-  const confluenceConfiguredCard = getEl('confluence-configured-card', HTMLDivElement);
-  const confluencePlaceholderCard = getEl('confluence-placeholder-card', HTMLDivElement);
-  const openConfluenceBtn = getEl('open-confluence-btn', HTMLButtonElement);
-
-  // + Add Product Tab
-  const addProductForm = getEl('add-product-form', HTMLFormElement);
-  const customProductFeedbackInput = getEl('custom-product-feedback', HTMLTextAreaElement);
-  const productRequestSuccessAlert = getEl('product-request-success', HTMLDivElement);
-
-  // Footer, Shortcuts & Toasts
-  const lastUpdatedText = getEl('last-updated-text', HTMLDivElement);
-  const shortcutsToggleBtn = getEl('shortcuts-toggle-btn', HTMLButtonElement);
-  const shortcutsPopover = getEl('shortcuts-popover', HTMLElement);
-  const closeShortcutsBtn = getEl('close-shortcuts-btn', HTMLButtonElement);
-  const appVersionEl = getEl('app-version', HTMLDivElement);
-  const toastContainer = getEl('toast-container', HTMLDivElement);
+  const {
+    prSearchClearBtn,
+    groupByTicketBtn,
+    errorSetupBtn,
+    prItemsContainer,
+    emptyStateActionBtn
+  } = bitbucketTabElements;
+  const { openJiraBtn, jiraConnectBtn } = jiraTabElements;
 
   // --- Popup View State ---
   /** @type {WorkerBootstrapState} */
@@ -410,12 +258,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   let storageRefreshTimer = null;
   /** @type {number | null} */
   let productFeedbackTimer = null;
-  /** @type {number | null} */
-  let toastDismissTimer = null;
   /** @type {number} */
   let suppressStorageRefreshUntil = 0;
   /** @type {number} */
   let stateRequestSeq = 0;
+
+  /** @type {{ currentTimer: number | null }} */
+  const toastTimerRef = { currentTimer: null };
 
   // --- Helper Utilities ---
 
@@ -445,50 +294,10 @@ document.addEventListener('DOMContentLoaded', async () => {
    *
    * @param {string} message
    * @param {'neutral' | 'success' | 'error'} [variant]
-   * @param {{ actionLabel?: string, onAction?: () => void | Promise<void>, durationMs?: number }} [options]
+   * @param {{ actionLabel?: string, onAction?: () => void | Promise<unknown>, durationMs?: number }} [options]
    */
   function showToast(message, variant = 'neutral', options = {}) {
-    if (toastDismissTimer !== null) {
-      window.clearTimeout(toastDismissTimer);
-      toastDismissTimer = null;
-    }
-
-    const toast = document.createElement('div');
-    toast.className = variant === 'neutral' ? 'toast' : `toast toast-${variant}`;
-
-    const textSpan = document.createElement('span');
-    textSpan.textContent = message;
-    toast.appendChild(textSpan);
-
-    if (options.actionLabel && typeof options.onAction === 'function') {
-      const actionBtn = document.createElement('button');
-      actionBtn.type = 'button';
-      actionBtn.className = 'toast-action-btn';
-      actionBtn.textContent = options.actionLabel;
-      const onAction = options.onAction;
-      actionBtn.addEventListener('click', () => {
-        if (toastDismissTimer !== null) {
-          window.clearTimeout(toastDismissTimer);
-          toastDismissTimer = null;
-        }
-        toast.remove();
-        void onAction();
-      });
-      toast.appendChild(actionBtn);
-    }
-
-    toastContainer.replaceChildren(toast);
-
-    const durationMs = typeof options.durationMs === 'number'
-      ? options.durationMs
-      : (options.actionLabel ? 4500 : 2600);
-
-    toastDismissTimer = window.setTimeout(() => {
-      toastDismissTimer = null;
-      if (toast.parentNode === toastContainer) {
-        toast.remove();
-      }
-    }, durationMs);
+    toastTimerRef.currentTimer = showToastBanner(toastContainer, message, variant, options, toastTimerRef);
   }
 
   /**
@@ -508,91 +317,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Show an inline status banner inside Settings forms.
-   *
-   * @param {HTMLDivElement} bannerEl
-   * @param {string} message
-   * @param {'info' | 'success' | 'error' | 'warning'} variant
-   */
-  function showInlineBanner(bannerEl, message, variant) {
-    bannerEl.className = `inline-banner ${variant}`;
-    bannerEl.textContent = message;
-    bannerEl.classList.remove('hidden');
-  }
-
-  /**
-   * Hide and clear an inline status banner.
-   *
-   * @param {HTMLDivElement} bannerEl
-   */
-  function hideInlineBanner(bannerEl) {
-    bannerEl.textContent = '';
-    bannerEl.className = 'inline-banner hidden';
-  }
-
-  /**
-   * Populate static setup metadata from `config.js` and `manifest.json`.
-   */
-  function renderStaticMetadata() {
-    const manifestVersion = chrome.runtime.getManifest().version;
-    appVersionEl.textContent = `v${manifestVersion}`;
-
-    const safeApiTokenDocs = sanitizeHttpsUrl(AUTH_SETUP_LINKS.atlassianApiTokens);
-    if (safeApiTokenDocs) {
-      createApiTokenLink.href = safeApiTokenDocs;
-    }
-
-    const scopeNodes = AUTH_SETUP_LINKS.requiredScopes.map((scope) => {
-      const li = document.createElement('li');
-      li.textContent = scope;
-      return li;
-    });
-    requiredScopesList.replaceChildren(...scopeNodes);
-
-    const safeGitHubTokenDocs = sanitizeHttpsUrl(AUTH_SETUP_LINKS.githubTokens);
-    if (safeGitHubTokenDocs) {
-      createGitHubTokenLink.href = safeGitHubTokenDocs;
-    }
-
-    const githubScopeNodes = AUTH_SETUP_LINKS.githubRequiredScopes.map((scope) => {
-      const li = document.createElement('li');
-      li.textContent = scope;
-      return li;
-    });
-    githubRequiredScopesList.replaceChildren(...githubScopeNodes);
-  }
-
-  /**
    * Toggle between top-level product tabs (`bitbucket-tab`, `jira-tab`, `confluence-tab`, `add-product-tab`).
    *
    * @param {string} nextTabId
    */
   function switchTopTab(nextTabId) {
-    if (!TOP_TABS.includes(nextTabId)) {
-      return;
-    }
-    activeTabId = nextTabId;
-
-    for (const btn of tabButtons) {
-      const isSelected = btn.dataset.tab === nextTabId;
-      btn.classList.toggle('active', isSelected);
-      btn.setAttribute('aria-selected', isSelected ? 'true' : 'false');
-      btn.tabIndex = isSelected ? 0 : -1;
-    }
-
-    const targetPanelId = `${nextTabId}-panel`;
-    for (const panel of tabPanels) {
-      panel.classList.toggle('hidden', panel.id !== targetPanelId);
-    }
-
-    if (nextTabId === 'bitbucket-tab') {
-      appTitle.textContent = 'Atlassian Hub';
-    } else if (nextTabId === 'jira-tab') {
-      appTitle.textContent = 'Jira Hub';
-    } else if (nextTabId === 'confluence-tab') {
-      appTitle.textContent = 'Confluence Hub';
-    } else {
-      appTitle.textContent = 'Customizer';
+    if (renderTopTabSelection({ tabButtons, tabPanels, appTitle }, nextTabId)) {
+      activeTabId = nextTabId;
     }
   }
 
@@ -602,135 +333,43 @@ document.addEventListener('DOMContentLoaded', async () => {
    * @param {'account' | 'preferences'} subtab
    */
   function switchSettingsSubtab(subtab) {
-    const isAccount = subtab === 'account';
-
-    settingsAccountTab.classList.toggle('active', isAccount);
-    settingsAccountTab.setAttribute('aria-selected', isAccount ? 'true' : 'false');
-    settingsAccountTab.tabIndex = isAccount ? 0 : -1;
-
-    settingsPreferencesTab.classList.toggle('active', !isAccount);
-    settingsPreferencesTab.setAttribute('aria-selected', !isAccount ? 'true' : 'false');
-    settingsPreferencesTab.tabIndex = !isAccount ? 0 : -1;
-
-    settingsAccountPanel.classList.toggle('hidden', !isAccount);
-    settingsPreferencesPanel.classList.toggle('hidden', isAccount);
+    renderSettingsSubtab(
+      {
+        settingsAccountTab,
+        settingsPreferencesTab,
+        settingsAccountPanel: settingsControls.settingsAccountPanel,
+        settingsPreferencesPanel: settingsControls.settingsPreferencesPanel
+      },
+      subtab
+    );
   }
 
   /**
-   * Update authentication form fields based on selected auth type (`api_token` vs `bearer`).
-   */
-  function syncAuthMethodFields() {
-    const selected = normalizeAuthType(authTypeSelect.value);
-    if (selected === 'api_token') {
-      usernameGroup.classList.remove('hidden');
-      tokenLabel.textContent = 'Atlassian API Token';
-      bitbucketTokenInput.placeholder = 'Paste API token here';
-      tokenHelpText.textContent = 'Use your Atlassian account email paired with a scoped Bitbucket API token.';
-    } else {
-      usernameGroup.classList.add('hidden');
-      tokenLabel.textContent = 'Access Token (Bearer)';
-      bitbucketTokenInput.placeholder = 'Paste Bearer access token here';
-      tokenHelpText.textContent = 'Uses Authorization: Bearer <token>. Email is not required.';
-    }
-  }
-
-  /**
-   * Populate Settings -> Account & Setup UI (Bitbucket Cloud + GitHub) without ever injecting stored token plaintext.
+   * Populate Settings -> Account & Setup UI (Bitbucket Cloud + GitHub).
    */
   function populateAccountSection() {
-    const bbAuthed = isBitbucketAuthenticated();
-    const showBbSummary = bbAuthed && !isReplacingToken;
-    accountSummaryCard.classList.toggle('hidden', !showBbSummary);
-    credentialsForm.classList.toggle('hidden', showBbSummary);
-    signOutConfirm.classList.add('hidden');
-
-    if (showBbSummary) {
-      const displayName = state.user?.displayName || state.username || 'Bitbucket User';
-      const secondaryIdentity = state.username || (state.user?.username ? `@${state.user.username}` : 'Authenticated');
-      const wsCount = state.workspaces.length || state.snapshot.syncedWorkspaces.length;
-
-      accountAvatar.textContent = getInitials(displayName, 'BB');
-      accountDisplayName.textContent = displayName;
-      accountUsername.textContent = secondaryIdentity;
-      accountAuthType.textContent = state.authType === 'bearer' ? 'Bearer' : 'API Token';
-      accountWorkspaceCount.textContent = `${wsCount} workspace${wsCount === 1 ? '' : 's'}`;
-    }
-
-    authTypeSelect.value = normalizeAuthType(state.authType);
-    bitbucketUsernameInput.value = state.username || '';
-    // Security invariant: never populate stored token plaintext into the DOM
-    bitbucketTokenInput.value = '';
-    bitbucketTokenInput.type = 'password';
-    toggleTokenVisibilityBtn.setAttribute('aria-label', 'Show token');
-    toggleTokenVisibilityBtn.title = 'Show token';
-    syncAuthMethodFields();
-    hideInlineBanner(authStatusBanner);
-
-    // GitHub Account & Setup section
-    const ghAuthed = isGitHubAuthenticated();
-    const showGhSummary = ghAuthed && !isReplacingGitHubToken;
-    githubSummaryCard.classList.toggle('hidden', !showGhSummary);
-    githubCredentialsForm.classList.toggle('hidden', showGhSummary);
-    githubSignOutConfirm.classList.add('hidden');
-
-    const defaultGhApi = getEffectiveGitHubApiBaseUrl();
-    const currentGhApi = state.github?.apiBaseUrl || '';
-
-    if (showGhSummary) {
-      const ghUser = state.github?.user;
-      const ghName = ghUser?.displayName || ghUser?.username || 'GitHub User';
-      const ghHandle = ghUser?.username ? `@${ghUser.username}` : 'Authenticated';
-      const effectiveApi = currentGhApi || defaultGhApi;
-      const isCustomApi = effectiveApi !== defaultGhApi;
-
-      githubAvatar.textContent = getInitials(ghName, 'GH');
-      githubDisplayName.textContent = ghName;
-      githubUsername.textContent = ghHandle;
-      githubApiUrlDisplay.textContent = isCustomApi ? effectiveApi : 'github.com';
-      githubApiUrlDisplay.title = `GitHub API: ${effectiveApi}`;
-    }
-
-    // Security invariant: never populate stored GitHub token plaintext into the DOM
-    githubTokenInput.value = '';
-    githubTokenInput.type = 'password';
-    toggleGitHubTokenVisibilityBtn.setAttribute('aria-label', 'Show GitHub token');
-    toggleGitHubTokenVisibilityBtn.title = 'Show token';
-    githubApiUrlInput.value = currentGhApi;
-    hideInlineBanner(githubAuthStatusBanner);
+    renderAccountSection(accountSectionElements, {
+      bitbucketAuthenticated: isBitbucketAuthenticated(),
+      isReplacingToken,
+      authType: state.authType,
+      username: state.username,
+      user: state.user,
+      workspaces: state.workspaces,
+      syncedWorkspaces: state.snapshot.syncedWorkspaces,
+      githubAuthenticated: isGitHubAuthenticated(),
+      isReplacingGitHubToken,
+      githubApiBaseUrl: state.github?.apiBaseUrl || '',
+      githubUser: state.github?.user ?? null
+    });
   }
 
   /**
-   * Populate Settings -> Preferences inputs from `state.preferences` and show discovered workspace slugs.
+   * Populate Settings -> Preferences inputs from `state.preferences`.
    *
    * @param {Preferences} prefs
    */
   function populatePreferencesForm(prefs) {
-    prefPollInterval.value = String(prefs.pollIntervalMinutes);
-    prefBadgeMode.value = prefs.badgeMode;
-    prefStaleHours.value = String(prefs.staleThresholdHours);
-    prefDefaultFilter.value = prefs.defaultFilter;
-    prefNotifications.checked = Boolean(prefs.notificationsEnabled);
-    prefCompactMode.checked = Boolean(prefs.compactMode);
-    prefWorkspacesFilter.value = Array.isArray(prefs.workspacesFilter)
-      ? prefs.workspacesFilter.join(', ')
-      : '';
-    prefReposFilter.value = Array.isArray(prefs.reposFilter)
-      ? prefs.reposFilter.join(', ')
-      : '';
-    prefJiraUrl.value = prefs.jiraBaseUrlOverride || '';
-
-    const slugs = state.workspaces
-      .map((ws) => ws.slug)
-      .filter((slug) => typeof slug === 'string' && slug.length > 0);
-    if (slugs.length > 0) {
-      availableWorkspacesHint.textContent = `Available: ${slugs.join(', ')}`;
-      availableWorkspacesHint.classList.remove('hidden');
-    } else {
-      availableWorkspacesHint.textContent = '';
-      availableWorkspacesHint.classList.add('hidden');
-    }
-
-    hideInlineBanner(prefsStatusBanner);
+    renderPreferencesForm(preferencesFormElements, prefs, state.workspaces);
   }
 
   /**
@@ -754,47 +393,35 @@ document.addEventListener('DOMContentLoaded', async () => {
     populateAccountSection();
     populatePreferencesForm(state.preferences);
     switchSettingsSubtab(subtab);
-    settingsPanel.classList.remove('hidden');
-    toggleSettingsBtn.setAttribute('aria-expanded', 'true');
     closeShortcutsPopover();
-
-    if (subtab === 'account') {
-      if (opts.focusTarget === 'github') {
-        if (!githubCredentialsForm.classList.contains('hidden')) {
-          githubTokenInput.focus();
-          githubTokenInput.scrollIntoView({ block: 'nearest' });
-        } else {
-          githubReplaceTokenBtn.focus();
-          githubReplaceTokenBtn.scrollIntoView({ block: 'nearest' });
-        }
-      } else if (!credentialsForm.classList.contains('hidden')) {
-        if (authTypeSelect.value === 'api_token' && !bitbucketUsernameInput.value.trim()) {
-          bitbucketUsernameInput.focus();
-        } else {
-          bitbucketTokenInput.focus();
-        }
-      } else {
-        replaceTokenBtn.focus();
-      }
-    } else {
-      prefPollInterval.focus();
-    }
+    showSettingsDrawer(
+      {
+        settingsPanel,
+        toggleSettingsBtn,
+        githubCredentialsForm: accountSectionElements.githubCredentialsForm,
+        githubTokenInput: accountSectionElements.githubTokenInput,
+        githubReplaceTokenBtn: settingsControls.githubReplaceTokenBtn,
+        credentialsForm: accountSectionElements.credentialsForm,
+        authTypeSelect: accountSectionElements.authTypeSelect,
+        bitbucketUsernameInput: accountSectionElements.bitbucketUsernameInput,
+        bitbucketTokenInput: accountSectionElements.bitbucketTokenInput,
+        replaceTokenBtn: settingsControls.replaceTokenBtn,
+        prefPollInterval: preferencesFormElements.prefPollInterval
+      },
+      subtab,
+      opts.focusTarget
+    );
   }
 
   /**
    * Close the Settings drawer and discard any unsaved form edits.
    */
   function closeSettingsPanel() {
-    const focusWasInside = settingsPanel.contains(document.activeElement);
     isReplacingToken = false;
     isReplacingGitHubToken = false;
     populateAccountSection();
     populatePreferencesForm(state.preferences);
-    settingsPanel.classList.add('hidden');
-    toggleSettingsBtn.setAttribute('aria-expanded', 'false');
-    if (focusWasInside) {
-      toggleSettingsBtn.focus();
-    }
+    hideSettingsDrawer(settingsPanel, toggleSettingsBtn);
   }
 
   /**
@@ -803,11 +430,7 @@ document.addEventListener('DOMContentLoaded', async () => {
    * @param {boolean} [forceOpen]
    */
   function toggleShortcutsPopover(forceOpen) {
-    const shouldOpen = typeof forceOpen === 'boolean'
-      ? forceOpen
-      : shortcutsPopover.classList.contains('hidden');
-    shortcutsPopover.classList.toggle('hidden', !shouldOpen);
-    shortcutsToggleBtn.setAttribute('aria-expanded', shouldOpen ? 'true' : 'false');
+    renderShortcutsPopoverState(shortcutsPopover, shortcutsToggleBtn, forceOpen);
   }
 
   /**
@@ -824,814 +447,18 @@ document.addEventListener('DOMContentLoaded', async () => {
    */
   function setSyncLoading(loading) {
     isSyncing = loading;
-    loadingIndicator.classList.toggle('hidden', !loading);
-    manualRefreshBtn.disabled = loading;
-    manualRefreshBtn.classList.toggle('is-spinning', loading);
+    renderSyncLoadingState(loadingIndicator, manualRefreshBtn, loading);
   }
 
   /**
-   * Update header connection chip based on single/dual provider auth, error, and rate-limit state.
-   */
-  function renderHeaderStatusChip() {
-    const descriptor = getHeaderConnectionDescriptor({
-      bitbucketAuthenticated: isBitbucketAuthenticated(),
-      bitbucketUser: state.user,
-      bitbucketUsername: state.username,
-      github: state.github,
-      syncedWorkspaces: state.snapshot.syncedWorkspaces,
-      workspaces: state.workspaces,
-      error: state.snapshot.error,
-      rateLimitWarning: state.snapshot.rateLimitWarning,
-      backoffUntil: state.syncState.backoffUntil,
-      now: Date.now()
-    });
-
-    connectionStatusChip.className = `status-chip status-chip-${descriptor.variant}`;
-    connectionStatusText.textContent = descriptor.text;
-    connectionStatusChip.title = descriptor.title;
-    connectionStatusChip.setAttribute('aria-label', descriptor.ariaLabel);
-  }
-
-  /**
-   * Render footer timestamp (`#last-updated-text`) cleanly with full-date tooltip.
-   */
-  function renderFooterTimestamp() {
-    const ts = state.snapshot.lastUpdated;
-    lastUpdatedText.textContent = formatFooterUpdated(ts);
-    if (typeof ts === 'number' && Number.isFinite(ts) && ts > 0) {
-      lastUpdatedText.title = `Last synced: ${new Date(ts).toLocaleString()}`;
-    } else {
-      lastUpdatedText.removeAttribute('title');
-    }
-  }
-
-  /**
-   * Build a crisp CI status pill (`.ci-badge`) from `pr.buildStatus`.
-   *
-   * @param {NonNullable<EnrichedPullRequest['buildStatus']>} buildStatus
-   * @returns {HTMLAnchorElement | HTMLSpanElement | null}
-   */
-  function buildCiBadgeElement(buildStatus) {
-    const descriptor = getCiBadgeDescriptor(buildStatus);
-    if (!descriptor) {
-      return null;
-    }
-
-    const { stateClass, label, tooltip, safeUrl } = descriptor;
-    const el = safeUrl ? document.createElement('a') : document.createElement('span');
-    el.className = `ci-badge ${stateClass}`;
-    el.textContent = label;
-    el.title = tooltip;
-
-    if (safeUrl && el instanceof HTMLAnchorElement) {
-      el.href = safeUrl;
-      el.target = '_blank';
-      el.rel = 'noopener noreferrer';
-      el.setAttribute('aria-label', `${tooltip} — open build status`);
-      el.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        void openSafeExternalUrl(safeUrl);
-      });
-    }
-
-    return el;
-  }
-
-  /**
-   * Build a subtle provider micro-badge (`BB` or `GH`) element.
-   *
-   * @param {'bitbucket' | 'github'} provider
-   * @returns {HTMLSpanElement}
-   */
-  function buildProviderBadgeElement(provider) {
-    const badge = document.createElement('span');
-    badge.className = provider === 'github'
-      ? 'provider-badge provider-gh'
-      : 'provider-badge provider-bb';
-    badge.textContent = provider === 'github' ? 'GH' : 'BB';
-    badge.title = provider === 'github' ? 'GitHub pull request' : 'Bitbucket Cloud pull request';
-    return badge;
-  }
-
-  /**
-   * Build a single accessible PR card DOM element without `innerHTML`.
-   *
-   * @param {EnrichedPullRequest} pr
-   * @param {boolean} isSelected
-   * @param {boolean} isSnoozed
-   * @param {number} now
-   * @param {{
-   *   showProviderBadge?: boolean,
-   *   relatedSummary?: RelatedPrSummary | null
-   * }} [options]
-   * @returns {HTMLDivElement}
-   */
-  function buildPrCardElement(pr, isSelected, isSnoozed, now, options = {}) {
-    const card = document.createElement('div');
-    card.className = 'pr-card';
-    if (pr.isYourTurn) {
-      card.classList.add('is-your-turn');
-    }
-    if (isSelected) {
-      card.classList.add('is-selected');
-    }
-    card.setAttribute('role', 'option');
-    card.setAttribute('aria-selected', isSelected ? 'true' : 'false');
-    card.dataset.prKey = pr.key;
-    card.tabIndex = 0;
-
-    // Top row: provider badge + repo + PR ID + action/CI/stale/related badges
-    const topRow = document.createElement('div');
-    topRow.className = 'pr-card-top';
-
-    const repoRow = document.createElement('div');
-    repoRow.className = 'pr-repo-row';
-
-    if (options.showProviderBadge) {
-      repoRow.appendChild(buildProviderBadgeElement(pr.provider));
-    }
-
-    const repoEl = document.createElement('span');
-    repoEl.className = 'pr-repo';
-    repoEl.textContent = pr.repoFullName || pr.repoName;
-    repoRow.appendChild(repoEl);
-
-    const idEl = document.createElement('span');
-    idEl.className = 'pr-id-tag';
-    idEl.textContent = `#${pr.id}`;
-    repoRow.appendChild(idEl);
-
-    const badgesRow = document.createElement('div');
-    badgesRow.className = 'pr-badges-row';
-
-    if (options.relatedSummary && !activeRelatedTicketKey) {
-      const relatedCount = options.relatedSummary.relatedKeys.length;
-      const ticketKey = options.relatedSummary.ticketKey;
-      if (relatedCount > 0 && ticketKey) {
-        const relatedBtn = document.createElement('button');
-        relatedBtn.type = 'button';
-        relatedBtn.className = 'related-pr-pill';
-        relatedBtn.textContent = `🔗 +${relatedCount} ${ticketKey}`;
-        relatedBtn.title = `Show ${relatedCount + 1} related PRs for ${ticketKey}`;
-        relatedBtn.setAttribute('aria-label', `Show ${relatedCount + 1} related PRs for ${ticketKey}`);
-        relatedBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          activeRelatedTicketKey = ticketKey;
-          selectedPrKey = null;
-          renderBitbucketTab();
-        });
-        badgesRow.appendChild(relatedBtn);
-      }
-    }
-
-    if (pr.buildStatus) {
-      const ciBadgeEl = buildCiBadgeElement(pr.buildStatus);
-      if (ciBadgeEl) {
-        badgesRow.appendChild(ciBadgeEl);
-      }
-    }
-
-    const badgeMeta = ACTION_BADGE_LABELS[pr.actionState] ?? {
-      label: pr.actionState,
-      title: ''
-    };
-    const actionBadge = document.createElement('span');
-    actionBadge.className = `action-badge state-${pr.actionState}`;
-    actionBadge.textContent = badgeMeta.label;
-    if (badgeMeta.title) {
-      actionBadge.title = badgeMeta.title;
-    }
-    badgesRow.appendChild(actionBadge);
-
-    if (pr.isStale) {
-      const staleBadge = document.createElement('span');
-      staleBadge.className = 'stale-badge';
-      staleBadge.textContent = 'Stale';
-      staleBadge.title = `No updates for ${Math.floor(pr.ageHours)}h`;
-      badgesRow.appendChild(staleBadge);
-    }
-
-    topRow.append(repoRow, badgesRow);
-
-    // Title link
-    const safePrUrl = sanitizeHttpsUrl(pr.url);
-    const titleLink = document.createElement('a');
-    titleLink.className = 'pr-title-link';
-    titleLink.textContent = pr.title;
-    if (safePrUrl) {
-      titleLink.href = safePrUrl;
-      titleLink.target = '_blank';
-      titleLink.rel = 'noopener noreferrer';
-    }
-    titleLink.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      selectPrCard(pr.key, false);
-      void openSafeExternalUrl(pr.url);
-    });
-
-    // Jira chips + source branch
-    const chipsRow = document.createElement('div');
-    chipsRow.className = 'pr-chips-row';
-    const jiraTickets = Array.isArray(pr.jiraTickets) ? pr.jiraTickets : [];
-
-    for (const ticket of jiraTickets) {
-      const safeTicketUrl = sanitizeHttpsUrl(ticket.url);
-      if (safeTicketUrl) {
-        const chipLink = document.createElement('a');
-        chipLink.className = 'jira-chip';
-        chipLink.href = safeTicketUrl;
-        chipLink.target = '_blank';
-        chipLink.rel = 'noopener noreferrer';
-        chipLink.textContent = `${ticket.key} ↗`;
-        chipLink.title = `Open ${ticket.key} in Jira`;
-        chipLink.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          void openSafeExternalUrl(safeTicketUrl);
-        });
-        chipsRow.appendChild(chipLink);
-      } else {
-        const chipStatic = document.createElement('span');
-        chipStatic.className = 'jira-chip jira-chip-static';
-        chipStatic.textContent = ticket.key;
-        chipStatic.title = 'Set Jira Base URL in Preferences or src/config.js to enable direct links';
-        chipsRow.appendChild(chipStatic);
-      }
-    }
-
-    if (pr.sourceBranch) {
-      const branchChip = document.createElement('span');
-      branchChip.className = 'pr-branch-chip';
-      branchChip.textContent = pr.sourceBranch;
-      branchChip.title = pr.destinationBranch
-        ? `${pr.sourceBranch} -> ${pr.destinationBranch}`
-        : pr.sourceBranch;
-      chipsRow.appendChild(branchChip);
-    }
-
-    // Footer row: author, approvals/CR/tasks/comments/snooze, quick actions, relative age
-    const footerRow = document.createElement('div');
-    footerRow.className = 'pr-card-footer';
-
-    const metaLeft = document.createElement('div');
-    metaLeft.className = 'pr-meta-left';
-
-    const authorEl = document.createElement('span');
-    authorEl.className = 'pr-author';
-    authorEl.textContent = pr.authorName;
-    authorEl.title = pr.authorName;
-    metaLeft.appendChild(authorEl);
-
-    const reviewerInfo = buildReviewerBreakdown(pr);
-
-    if (pr.totalReviewers > 0 || pr.approvalsCount > 0) {
-      const approvalsEl = document.createElement('span');
-      approvalsEl.className = pr.approvalsCount > 0 ? 'pr-stat-pill has-approvals' : 'pr-stat-pill';
-      const denom = Math.max(pr.totalReviewers, pr.approvalsCount);
-      approvalsEl.textContent = `✓ ${pr.approvalsCount}/${denom}`;
-      approvalsEl.title = reviewerInfo.approvalTooltip;
-      metaLeft.appendChild(approvalsEl);
-    }
-
-    if (pr.changesRequestedCount > 0) {
-      const crEl = document.createElement('span');
-      crEl.className = 'pr-stat-pill meta-cr-badge';
-      crEl.textContent = `✕ ${pr.changesRequestedCount} CR`;
-      crEl.title = reviewerInfo.changesRequestedNames.length > 0
-        ? `Changes requested by: ${reviewerInfo.changesRequestedNames.join(', ')}`
-        : `${pr.changesRequestedCount} reviewer(s) requested changes`;
-      metaLeft.appendChild(crEl);
-    }
-
-    if (pr.taskCount > 0) {
-      const tasksEl = document.createElement('span');
-      tasksEl.className = 'pr-stat-pill meta-task-badge';
-      tasksEl.textContent = `☑ ${pr.taskCount}`;
-      tasksEl.title = `${pr.taskCount} unresolved task(s)`;
-      metaLeft.appendChild(tasksEl);
-    }
-
-    if (pr.commentCount > 0) {
-      const commentsEl = document.createElement('span');
-      commentsEl.className = 'pr-stat-pill';
-      commentsEl.textContent = `${pr.commentCount} cmt`;
-      commentsEl.title = `${pr.commentCount} comment(s)`;
-      metaLeft.appendChild(commentsEl);
-    }
-
-    const snoozeEntry = isSnoozed ? state.snoozedMap[pr.key] : undefined;
-    if (isSnoozed && snoozeEntry && activeFilter === 'snoozed') {
-      const remainingText = formatRemainingSnooze(snoozeEntry.until, now);
-      if (remainingText) {
-        const snoozeBadge = document.createElement('span');
-        snoozeBadge.className = 'pr-stat-pill snooze-remaining-badge';
-        snoozeBadge.textContent = remainingText;
-        snoozeBadge.title = `Snoozed until ${new Date(snoozeEntry.until).toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit'
-        })} (resurfaces early if PR updates)`;
-        metaLeft.appendChild(snoozeBadge);
-      }
-    }
-
-    const metaRight = document.createElement('div');
-    metaRight.className = 'pr-meta-right';
-
-    const quickActions = document.createElement('div');
-    quickActions.className = 'pr-quick-actions';
-
-    const copyBtn = document.createElement('button');
-    copyBtn.type = 'button';
-    copyBtn.className = 'quick-action-btn';
-    copyBtn.textContent = 'Copy';
-    copyBtn.title = 'Copy PR link (c)';
-    copyBtn.setAttribute('aria-label', `Copy link for ${pr.title}`);
-    copyBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      void copyPrLink(pr);
-    });
-    quickActions.appendChild(copyBtn);
-
-    const snoozeBtn = document.createElement('button');
-    snoozeBtn.type = 'button';
-    snoozeBtn.className = 'quick-action-btn';
-    snoozeBtn.textContent = isSnoozed ? 'Unsnooze' : 'Snooze 4h';
-    snoozeBtn.title = isSnoozed ? 'Unsnooze PR (s)' : 'Snooze PR for 4 hours (s)';
-    snoozeBtn.setAttribute('aria-label', `${snoozeBtn.textContent} ${pr.title}`);
-    snoozeBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      void toggleSnoozePr(pr);
-    });
-    quickActions.appendChild(snoozeBtn);
-
-    const isoTimestamp = pr.updatedOn || pr.createdOn;
-    const ageEl = document.createElement('span');
-    ageEl.className = 'pr-age';
-    ageEl.dataset.iso = isoTimestamp || '';
-    ageEl.textContent = formatRelativeAge(isoTimestamp, now);
-    if (isoTimestamp && !Number.isNaN(Date.parse(isoTimestamp))) {
-      ageEl.title = `Updated ${new Date(isoTimestamp).toLocaleString()}`;
-    }
-
-    metaRight.append(quickActions, ageEl);
-    footerRow.append(metaLeft, metaRight);
-
-    card.append(topRow, titleLink);
-    if (chipsRow.childElementCount > 0) {
-      card.appendChild(chipsRow);
-    }
-    card.appendChild(footerRow);
-
-    card.addEventListener('click', () => {
-      selectPrCard(pr.key, false);
-      void openSafeExternalUrl(pr.url);
-    });
-
-    card.addEventListener('focus', () => {
-      selectPrCard(pr.key, false);
-    });
-
-    return card;
-  }
-
-  /**
-   * Build a collapsible Ticket Group element. Multi-PR linked tickets render as a
-   * horizontal swipeable Ticket Deck (with color-coded mini-map dots, off-screen attention badge,
-   * prev/next buttons, and optional `⊞` vertical stack toggle); `UNLINKED` stays a vertical list.
-   *
-   * @param {TicketPrGroup} group
-   * @param {SnoozedMap} snoozedMap
-   * @param {number} now
-   * @param {boolean} showProviderBadge
-   * @returns {{ element: HTMLDivElement, orderedPrs: EnrichedPullRequest[], trackEl: HTMLDivElement | null }}
-   */
-  function buildTicketGroupElement(group, snoozedMap, now, showProviderBadge) {
-    const groupEl = document.createElement('div');
-    const isCollapsed = collapsedGroups.has(group.groupKey);
-    const isExpandedStack = expandedStackGroups.has(group.groupKey);
-    groupEl.className = 'ticket-group';
-    groupEl.dataset.groupKey = group.groupKey;
-    if (isCollapsed) {
-      groupEl.classList.add('is-collapsed');
-    }
-    if (isExpandedStack) {
-      groupEl.classList.add('is-expanded-stack');
-    }
-
-    const orderedPrs = sortDeckPrs(group.prs);
-    const isDeck = !group.isUnlinked && orderedPrs.length > 1;
-
-    // Header row
-    const headerRow = document.createElement('div');
-    headerRow.className = 'ticket-group-header-row';
-
-    const headerBtn = document.createElement('button');
-    headerBtn.type = 'button';
-    headerBtn.className = 'ticket-group-header';
-    headerBtn.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
-    headerBtn.setAttribute('aria-label', `${group.label} (${orderedPrs.length} pull requests)`);
-
-    const chevron = document.createElement('span');
-    chevron.className = 'ticket-group-chevron';
-    chevron.setAttribute('aria-hidden', 'true');
-    chevron.textContent = '▾';
-    headerBtn.appendChild(chevron);
-
-    const safeTicketUrl = sanitizeHttpsUrl(group.ticketUrl);
-    if (!safeTicketUrl) {
-      const labelSpan = document.createElement('span');
-      labelSpan.className = 'ticket-group-key';
-      labelSpan.textContent = group.label;
-      headerBtn.appendChild(labelSpan);
-    }
-
-    const countBadge = document.createElement('span');
-    countBadge.className = 'ticket-group-count';
-    countBadge.textContent = String(orderedPrs.length);
-    countBadge.title = `${orderedPrs.length} pull request${orderedPrs.length === 1 ? '' : 's'}`;
-    headerBtn.appendChild(countBadge);
-
-    if (group.yourTurnCount > 0) {
-      const turnPill = document.createElement('span');
-      turnPill.className = 'ticket-group-meta-pill is-action';
-      turnPill.textContent = `${group.yourTurnCount} Your Turn`;
-      headerBtn.appendChild(turnPill);
-    }
-
-    const approvedPill = document.createElement('span');
-    approvedPill.className = group.approvedCount > 0
-      ? 'ticket-group-meta-pill is-approved'
-      : 'ticket-group-meta-pill';
-    approvedPill.textContent = `${group.approvedCount}/${orderedPrs.length} Approved`;
-    headerBtn.appendChild(approvedPill);
-
-    if (group.ciFailedCount > 0) {
-      const ciPill = document.createElement('span');
-      ciPill.className = 'ticket-group-meta-pill is-ci-failed';
-      ciPill.textContent = `${group.ciFailedCount} CI Failed`;
-      headerBtn.appendChild(ciPill);
-    }
-
-    if (group.providers.length > 1) {
-      for (const prov of group.providers) {
-        headerBtn.appendChild(buildProviderBadgeElement(prov));
-      }
-    }
-
-    headerBtn.addEventListener('click', () => {
-      const nextCollapsed = !collapsedGroups.has(group.groupKey);
-      if (nextCollapsed) {
-        collapsedGroups.add(group.groupKey);
-      } else {
-        collapsedGroups.delete(group.groupKey);
-      }
-      groupEl.classList.toggle('is-collapsed', nextCollapsed);
-      headerBtn.setAttribute('aria-expanded', nextCollapsed ? 'false' : 'true');
-    });
-
-    if (safeTicketUrl) {
-      const keyLink = document.createElement('a');
-      keyLink.className = 'ticket-group-key-link';
-      keyLink.href = safeTicketUrl;
-      keyLink.target = '_blank';
-      keyLink.rel = 'noopener noreferrer';
-      keyLink.textContent = `${group.label} ↗`;
-      keyLink.title = `Open ${group.label} in Jira`;
-      keyLink.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        void openSafeExternalUrl(safeTicketUrl);
-      });
-      headerRow.append(keyLink, headerBtn);
-    } else {
-      headerRow.appendChild(headerBtn);
-    }
-
-    const bodyEl = document.createElement('div');
-    bodyEl.className = 'ticket-group-body';
-
-    if (!isDeck) {
-      for (const pr of orderedPrs) {
-        const card = buildPrCardElement(
-          pr,
-          Boolean(selectedPrKey && pr.key === selectedPrKey),
-          isPrSnoozed(pr, snoozedMap, now),
-          now,
-          { showProviderBadge }
-        );
-        bodyEl.appendChild(card);
-      }
-      groupEl.append(headerRow, bodyEl);
-      return { element: groupEl, orderedPrs, trackEl: null };
-    }
-
-    // Horizontal Ticket Deck for multi-PR linked tickets
-    let activeSlideIndex = deckActiveSlideMap.get(group.groupKey) ?? 0;
-    const selectedIndexInDeck = selectedPrKey
-      ? orderedPrs.findIndex((p) => p.key === selectedPrKey)
-      : -1;
-    if (selectedIndexInDeck >= 0) {
-      activeSlideIndex = selectedIndexInDeck;
-    }
-    activeSlideIndex = Math.max(0, Math.min(orderedPrs.length - 1, activeSlideIndex));
-    deckActiveSlideMap.set(group.groupKey, activeSlideIndex);
-
-    const deckBar = document.createElement('div');
-    deckBar.className = 'ticket-deck-bar';
-
-    const deckLeft = document.createElement('div');
-    deckLeft.className = 'ticket-deck-left';
-
-    const counterEl = document.createElement('span');
-    counterEl.className = 'ticket-deck-counter';
-    deckLeft.appendChild(counterEl);
-
-    const dotsWrap = document.createElement('div');
-    dotsWrap.className = 'ticket-deck-dots';
-    dotsWrap.setAttribute('role', 'tablist');
-    dotsWrap.setAttribute('aria-label', `PR slides for ${group.label}`);
-
-    /** @type {HTMLButtonElement[]} */
-    const dotButtons = orderedPrs.map((pr, idx) => {
-      const dotDesc = getDeckDotDescriptor(pr);
-      const dotBtn = document.createElement('button');
-      dotBtn.type = 'button';
-      dotBtn.className = `ticket-deck-dot ${dotDesc.colorClass}`;
-      dotBtn.title = dotDesc.tooltip;
-      dotBtn.setAttribute('aria-label', `Slide ${idx + 1} of ${orderedPrs.length}: ${dotDesc.tooltip}`);
-      dotBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        goToSlide(idx, true);
-      });
-      dotsWrap.appendChild(dotBtn);
-      return dotBtn;
-    });
-    deckLeft.appendChild(dotsWrap);
-
-    const offscreenBtn = document.createElement('button');
-    offscreenBtn.type = 'button';
-    offscreenBtn.className = 'deck-offscreen-badge hidden';
-    deckLeft.appendChild(offscreenBtn);
-
-    const navWrap = document.createElement('div');
-    navWrap.className = 'ticket-deck-nav';
-
-    const prevBtn = document.createElement('button');
-    prevBtn.type = 'button';
-    prevBtn.className = 'deck-nav-btn';
-    prevBtn.textContent = '‹';
-    prevBtn.title = 'Previous PR in deck (h / ←)';
-    prevBtn.setAttribute('aria-label', `Previous PR in ${group.label}`);
-
-    const nextBtn = document.createElement('button');
-    nextBtn.type = 'button';
-    nextBtn.className = 'deck-nav-btn';
-    nextBtn.textContent = '›';
-    nextBtn.title = 'Next PR in deck (l / →)';
-    nextBtn.setAttribute('aria-label', `Next PR in ${group.label}`);
-
-    const expandStackBtn = document.createElement('button');
-    expandStackBtn.type = 'button';
-    expandStackBtn.className = 'deck-expand-btn';
-    expandStackBtn.textContent = '⊞';
-    expandStackBtn.setAttribute('aria-pressed', isExpandedStack ? 'true' : 'false');
-    expandStackBtn.title = isExpandedStack ? 'Collapse to horizontal deck' : 'Stack all PRs vertically';
-    expandStackBtn.setAttribute('aria-label', `Toggle vertical stack for ${group.label}`);
-
-    navWrap.append(prevBtn, nextBtn, expandStackBtn);
-    deckBar.append(deckLeft, navWrap);
-
-    const trackEl = document.createElement('div');
-    trackEl.className = 'ticket-deck-track';
-    trackEl.dataset.groupKey = group.groupKey;
-
-    /** @type {HTMLDivElement[]} */
-    const slideElements = orderedPrs.map((pr) => {
-      const slide = document.createElement('div');
-      slide.className = 'ticket-deck-slide';
-      slide.dataset.prKey = pr.key;
-      const card = buildPrCardElement(
-        pr,
-        Boolean(selectedPrKey && pr.key === selectedPrKey),
-        isPrSnoozed(pr, snoozedMap, now),
-        now,
-        { showProviderBadge }
-      );
-      slide.appendChild(card);
-      trackEl.appendChild(slide);
-      return slide;
-    });
-
-    /**
-     * Synchronize deck counter, mini-map dots, prev/next disabled states, and off-screen attention badge.
-     *
-     * @param {number} idx
-     */
-    function syncDeckChrome(idx) {
-      const clamped = Math.max(0, Math.min(orderedPrs.length - 1, idx));
-      activeSlideIndex = clamped;
-      deckActiveSlideMap.set(group.groupKey, clamped);
-      counterEl.textContent = `${clamped + 1} / ${orderedPrs.length}`;
-
-      dotButtons.forEach((dot, dotIdx) => {
-        const active = dotIdx === clamped;
-        dot.classList.toggle('is-active', active);
-        dot.setAttribute('aria-selected', active ? 'true' : 'false');
-      });
-
-      const stacked = expandedStackGroups.has(group.groupKey);
-      prevBtn.disabled = stacked || clamped <= 0;
-      nextBtn.disabled = stacked || clamped >= orderedPrs.length - 1;
-      prevBtn.classList.toggle('hidden', stacked);
-      nextBtn.classList.toggle('hidden', stacked);
-      dotsWrap.classList.toggle('hidden', stacked);
-      counterEl.classList.toggle('hidden', stacked);
-
-      const offscreen = stacked
-        ? null
-        : getOffscreenDeckAttention(orderedPrs, clamped, snoozedMap, Date.now());
-      if (offscreen) {
-        offscreenBtn.textContent = offscreen.label;
-        offscreenBtn.title = `Jump to off-screen PR needing action`;
-        offscreenBtn.dataset.targetIndex = String(offscreen.targetIndex);
-        offscreenBtn.classList.remove('hidden');
-      } else {
-        offscreenBtn.classList.add('hidden');
-      }
-    }
-
-    /**
-     * Scroll deck smoothly to `targetIndex` and optionally select the PR card.
-     *
-     * @param {number} targetIndex
-     * @param {boolean} [selectTarget]
-     * @param {'auto' | 'smooth'} [behavior]
-     */
-    function goToSlide(targetIndex, selectTarget = false, behavior = 'smooth') {
-      const clamped = Math.max(0, Math.min(orderedPrs.length - 1, targetIndex));
-      syncDeckChrome(clamped);
-      const slideEl = slideElements[clamped];
-      if (slideEl) {
-        const slideWidth = trackEl.clientWidth || slideEl.offsetWidth;
-        if (slideWidth > 0 && typeof trackEl.scrollTo === 'function') {
-          trackEl.scrollTo({
-            left: clamped * (slideWidth + 6),
-            behavior
-          });
-        } else if (typeof slideEl.scrollIntoView === 'function') {
-          slideEl.scrollIntoView({ inline: 'start', block: 'nearest', behavior });
-        }
-      }
-      if (selectTarget) {
-        const targetPr = orderedPrs[clamped];
-        if (targetPr) {
-          selectPrCard(targetPr.key, false);
-        }
-      }
-    }
-
-    offscreenBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const targetIdx = Number.parseInt(offscreenBtn.dataset.targetIndex || '0', 10);
-      if (Number.isFinite(targetIdx)) {
-        goToSlide(targetIdx, true);
-      }
-    });
-
-    prevBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      goToSlide(activeSlideIndex - 1, true);
-    });
-
-    nextBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      goToSlide(activeSlideIndex + 1, true);
-    });
-
-    expandStackBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const nextStacked = !expandedStackGroups.has(group.groupKey);
-      if (nextStacked) {
-        expandedStackGroups.add(group.groupKey);
-      } else {
-        expandedStackGroups.delete(group.groupKey);
-      }
-      groupEl.classList.toggle('is-expanded-stack', nextStacked);
-      expandStackBtn.setAttribute('aria-pressed', nextStacked ? 'true' : 'false');
-      expandStackBtn.title = nextStacked ? 'Collapse to horizontal deck' : 'Stack all PRs vertically';
-      syncDeckChrome(activeSlideIndex);
-      if (!nextStacked) {
-        goToSlide(activeSlideIndex, false, 'auto');
-      }
-    });
-
-    let scrollSyncTimer = /** @type {number | null} */ (null);
-    trackEl.addEventListener('scroll', () => {
-      if (expandedStackGroups.has(group.groupKey)) {
-        return;
-      }
-      if (scrollSyncTimer !== null) {
-        window.clearTimeout(scrollSyncTimer);
-      }
-      scrollSyncTimer = window.setTimeout(() => {
-        scrollSyncTimer = null;
-        const width = trackEl.clientWidth;
-        if (width <= 0) {
-          return;
-        }
-        const inferredIdx = Math.round(trackEl.scrollLeft / (width + 6));
-        if (inferredIdx !== activeSlideIndex && inferredIdx >= 0 && inferredIdx < orderedPrs.length) {
-          syncDeckChrome(inferredIdx);
-        }
-      }, 60);
-    }, { passive: true });
-
-    syncDeckChrome(activeSlideIndex);
-    if (!isExpandedStack && activeSlideIndex > 0) {
-      window.requestAnimationFrame(() => goToSlide(activeSlideIndex, false, 'auto'));
-    }
-
-    bodyEl.append(deckBar, trackEl);
-    groupEl.append(headerRow, bodyEl);
-    return { element: groupEl, orderedPrs, trackEl };
-  }
-
-  /**
-   * Highlight a PR card as keyboard-selected, sync focus out of any previously focused PR card,
-   * smoothly scroll the selected card into view (and align its Ticket Deck slide if needed).
+   * Highlight a PR card as keyboard-selected and align its DOM focus/scroll state.
    *
    * @param {string | null} prKey
    * @param {boolean} [scrollIntoView]
    */
   function selectPrCard(prKey, scrollIntoView = true) {
     selectedPrKey = prKey;
-    const activeEl = document.activeElement;
-    if (activeEl instanceof HTMLElement) {
-      const focusedCard = activeEl.closest('.pr-card');
-      if (focusedCard instanceof HTMLElement && focusedCard.dataset.prKey !== prKey) {
-        activeEl.blur();
-      }
-    }
-
-    const cards = prItemsContainer.querySelectorAll('.pr-card');
-    for (const node of cards) {
-      if (!(node instanceof HTMLElement)) {
-        continue;
-      }
-      const match = Boolean(prKey && node.dataset.prKey === prKey);
-      node.classList.toggle('is-selected', match);
-      node.setAttribute('aria-selected', match ? 'true' : 'false');
-      if (match && scrollIntoView) {
-        const parentGroup = node.closest('.ticket-group');
-        if (parentGroup instanceof HTMLElement && parentGroup.classList.contains('is-collapsed')) {
-          const groupKey = parentGroup.dataset.groupKey;
-          if (groupKey) {
-            collapsedGroups.delete(groupKey);
-            parentGroup.classList.remove('is-collapsed');
-            const hdr = parentGroup.querySelector('.ticket-group-header');
-            if (hdr) {
-              hdr.setAttribute('aria-expanded', 'true');
-            }
-          }
-        }
-        node.scrollIntoView({ block: 'nearest', inline: 'start', behavior: 'smooth' });
-      }
-    }
-  }
-
-  /**
-   * Render non-blocking error, rate-limit, and backoff banners above the PR list.
-   *
-   * @param {number} now
-   */
-  function renderStatusBanners(now) {
-    const errText = state.snapshot.error;
-    if (errText) {
-      errorTitle.textContent = state.snapshot.prList.length > 0
-        ? 'Sync Issue (showing cached PRs)'
-        : 'Sync Issue';
-      errorMessage.textContent = errText;
-      errorSetupBtn.textContent = (state.snapshot.isAuthError || state.isAuthError) ? 'Update Token' : 'Preferences';
-      errorAlert.classList.remove('hidden');
-    } else {
-      errorAlert.classList.add('hidden');
-    }
-
-    rateLimitBanner.classList.toggle('hidden', !state.snapshot.rateLimitWarning);
-
-    const backoffUntil = state.syncState.backoffUntil;
-    if (state.isAuthenticated && typeof backoffUntil === 'number' && backoffUntil > now) {
-      const remainingSec = Math.max(1, Math.ceil((backoffUntil - now) / 1000));
-      const etaLabel = remainingSec >= 60
-        ? `${Math.ceil(remainingSec / 60)}m`
-        : `${remainingSec}s`;
-      backoffMessage.textContent = `Auto-polling paused for ~${etaLabel}. You can still click Refresh anytime.`;
-      backoffBanner.classList.remove('hidden');
-    } else {
-      backoffBanner.classList.add('hidden');
-    }
+    highlightSelectedPrCard(prItemsContainer, prKey, { scrollIntoView, collapsedGroups });
   }
 
   /**
@@ -1644,343 +471,128 @@ document.addEventListener('DOMContentLoaded', async () => {
     groupByTicketBtn.disabled = isGroupByTicketUpdating;
   }
 
+  /** @type {PrCardCallbacks} */
+  const prCardCallbacks = {
+    onOpenUrl: (rawUrl) => openSafeExternalUrl(rawUrl),
+    onCopyUrl: (pr) => copyPrLink(pr),
+    onToggleSnooze: (pr) => toggleSnoozePr(pr),
+    onSelectCard: (prKey, scrollIntoView = false) => {
+      selectPrCard(prKey, scrollIntoView);
+    },
+    onSelectRelatedTicket: (ticketKey) => {
+      activeRelatedTicketKey = ticketKey;
+      selectedPrKey = null;
+      renderBitbucketTab();
+    },
+    onGroupCollapseToggle: (groupKey, nextCollapsed) => {
+      if (nextCollapsed) {
+        collapsedGroups.add(groupKey);
+      } else {
+        collapsedGroups.delete(groupKey);
+      }
+    },
+    onDeckIndexChange: (groupKey, slideIndex) => {
+      deckActiveSlideMap.set(groupKey, slideIndex);
+    },
+    onDeckExpandToggle: (groupKey, nextExpanded) => {
+      if (nextExpanded) {
+        expandedStackGroups.add(groupKey);
+      } else {
+        expandedStackGroups.delete(groupKey);
+      }
+    }
+  };
+
   /**
-   * Render the PR list tab: filter pills, counts, search, By Ticket toggle, Related scope banner,
-   * Flat or Ticket-Deck grouped PR cards, or empty/onboarding state.
+   * Render the PR list tab via `tabs-renderer.js`.
    */
   function renderBitbucketTab() {
-    const prevScrollTop = mainContent.scrollTop;
-    const now = Date.now();
-    extensionContainer.classList.toggle('compact-mode', Boolean(state.preferences.compactMode));
+    const result = renderBitbucketTabView(
+      bitbucketTabElements,
+      {
+        isAuthenticated: state.isAuthenticated,
+        bitbucketAuthenticated: isBitbucketAuthenticated(),
+        githubAuthenticated: isGitHubAuthenticated(),
+        isAuthError: Boolean(state.snapshot.isAuthError || state.isAuthError),
+        isGroupByTicketUpdating,
+        prList: state.snapshot.prList,
+        error: state.snapshot.error,
+        rateLimitWarning: state.snapshot.rateLimitWarning,
+        backoffUntil: state.syncState.backoffUntil,
+        preferences: state.preferences,
+        snoozedMap: state.snoozedMap,
+        activeFilter,
+        searchQuery,
+        activeRelatedTicketKey,
+        selectedPrKey,
+        collapsedGroups,
+        expandedStackGroups,
+        deckActiveSlideMap
+      },
+      prCardCallbacks
+    );
 
-    if (!state.isAuthenticated) {
-      activeRelatedTicketKey = null;
-      relatedScopeBanner.classList.add('hidden');
-      triageControls.classList.add('hidden');
-      prItemsContainer.replaceChildren();
-      emptyState.classList.add('hidden');
-      setupHint.classList.remove('hidden');
-      rateLimitBanner.classList.add('hidden');
-      backoffBanner.classList.add('hidden');
-      if (state.snapshot.error) {
-        errorTitle.textContent = 'Connection Required';
-        errorMessage.textContent = state.snapshot.error;
-        errorSetupBtn.textContent = 'Update Token';
-        errorAlert.classList.remove('hidden');
-      } else {
-        errorAlert.classList.add('hidden');
-      }
-      visiblePrs = [];
-      navigablePrs = [];
-      selectedPrKey = null;
-      return;
-    }
-
-    setupHint.classList.add('hidden');
-    triageControls.classList.remove('hidden');
-    renderStatusBanners(now);
-    renderGroupByTicketToggle();
-
-    const prs = state.snapshot.prList;
-    const snoozedMap = state.snoozedMap;
-    const counts = computeCounts(prs, snoozedMap, now);
-    const showProviderBadge = (isBitbucketAuthenticated() && isGitHubAuthenticated()) ||
-      prs.some((pr) => pr.provider === 'github');
-
-    countActionRequired.textContent = String(counts.actionRequired);
-    countReviewing.textContent = String(counts.reviewing);
-    countAuthored.textContent = String(counts.authored);
-    countAll.textContent = String(counts.all);
-    countSnoozed.textContent = String(counts.snoozed);
-
-    for (const pill of filterPillButtons) {
-      const pillFilter = pill.dataset.filter;
-      const isSelected = pillFilter === activeFilter;
-      pill.classList.toggle('active', isSelected);
-      pill.setAttribute('aria-selected', isSelected ? 'true' : 'false');
-      pill.tabIndex = isSelected ? 0 : -1;
-    }
-
-    prSearchClearBtn.classList.toggle('hidden', searchQuery.trim().length === 0);
-
-    if (activeRelatedTicketKey) {
-      visiblePrs = filterPrsByRelatedTicket(prs, activeRelatedTicketKey);
-      relatedScopeText.textContent = `Related PRs for ${activeRelatedTicketKey} (${visiblePrs.length})`;
-      relatedScopeBanner.classList.remove('hidden');
-    } else {
-      relatedScopeBanner.classList.add('hidden');
-      visiblePrs = filterAndSortPrs(prs, {
-        filter: activeFilter,
-        query: searchQuery,
-        snoozedMap,
-        now
-      });
-    }
-
-    prCountTitle.textContent = `${visiblePrs.length} PR${visiblePrs.length === 1 ? '' : 's'}`;
-
-    if (visiblePrs.length === 0) {
-      prItemsContainer.replaceChildren();
-      navigablePrs = [];
-      selectedPrKey = null;
-      emptyState.classList.remove('hidden');
-
-      if (activeRelatedTicketKey) {
-        emptyStateTitle.textContent = 'No related PRs open';
-        emptyStateMessage.textContent = `No open pull requests reference ${activeRelatedTicketKey}.`;
-        emptyStateActionBtn.textContent = 'Show All PRs';
-        emptyStateActionBtn.dataset.emptyAction = 'clear_related';
-        emptyStateActionBtn.classList.remove('hidden');
-        return;
-      }
-
-      const trimmedQuery = searchQuery.trim();
-      if (trimmedQuery) {
-        const crossHint = getCrossFilterEmptyHint({
-          activeFilter,
-          searchQuery: trimmedQuery,
-          allPrs: prs,
-          snoozedMap,
-          now
-        });
-
-        if (crossHint) {
-          emptyStateTitle.textContent = 'No matches in this filter';
-          emptyStateMessage.textContent = crossHint.label;
-          emptyStateActionBtn.textContent = 'Show in All PRs';
-          emptyStateActionBtn.dataset.emptyAction = 'show_in_all';
-          emptyStateActionBtn.classList.remove('hidden');
-        } else {
-          emptyStateTitle.textContent = 'No matching pull requests';
-          emptyStateMessage.textContent = `Nothing matched "${trimmedQuery}" in this view.`;
-          emptyStateActionBtn.textContent = 'Clear Search';
-          emptyStateActionBtn.dataset.emptyAction = 'clear_search';
-          emptyStateActionBtn.classList.remove('hidden');
-        }
-      } else if (activeFilter === 'action_required' && counts.all > 0) {
-        emptyStateTitle.textContent = 'Nothing needs your action!';
-        emptyStateMessage.textContent = `You have ${counts.all} open pull request${counts.all === 1 ? '' : 's'} waiting on others.`;
-        emptyStateActionBtn.textContent = 'View All PRs';
-        emptyStateActionBtn.dataset.emptyAction = 'view_all';
-        emptyStateActionBtn.classList.remove('hidden');
-      } else if (activeFilter === 'snoozed') {
-        emptyStateTitle.textContent = 'No snoozed pull requests';
-        emptyStateMessage.textContent = 'Use Snooze 4h (or press s) to temporarily hide a PR until it updates.';
-        emptyStateActionBtn.textContent = 'View All PRs';
-        emptyStateActionBtn.dataset.emptyAction = 'view_all';
-        emptyStateActionBtn.classList.remove('hidden');
-      } else {
-        emptyStateTitle.textContent = 'All caught up!';
-        emptyStateMessage.textContent = 'No open pull requests in this view.';
-        emptyStateActionBtn.classList.add('hidden');
-      }
-      return;
-    }
-
-    emptyState.classList.add('hidden');
-    if (selectedPrKey && !visiblePrs.some((pr) => pr.key === selectedPrKey)) {
-      selectedPrKey = null;
-    }
-
-    const fragment = document.createDocumentFragment();
-    const shouldGroup = Boolean(state.preferences.groupByTicket) && !activeRelatedTicketKey;
-
-    if (shouldGroup) {
-      const groups = groupPrsByTicket(visiblePrs, snoozedMap, now);
-      /** @type {EnrichedPullRequest[]} */
-      const nextNavigable = [];
-      for (const group of groups) {
-        const rendered = buildTicketGroupElement(group, snoozedMap, now, showProviderBadge);
-        fragment.appendChild(rendered.element);
-        nextNavigable.push(...rendered.orderedPrs);
-      }
-      navigablePrs = nextNavigable;
-    } else {
-      const relatedMap = buildRelatedPrMap(prs);
-      navigablePrs = visiblePrs;
-      for (const pr of visiblePrs) {
-        const card = buildPrCardElement(
-          pr,
-          Boolean(selectedPrKey && pr.key === selectedPrKey),
-          isPrSnoozed(pr, snoozedMap, now),
-          now,
-          {
-            showProviderBadge,
-            relatedSummary: relatedMap[pr.key] ?? null
-          }
-        );
-        fragment.appendChild(card);
-      }
-    }
-
-    prItemsContainer.replaceChildren(fragment);
-
-    if (prevScrollTop > 0) {
-      mainContent.scrollTop = Math.min(prevScrollTop, Math.max(0, mainContent.scrollHeight - mainContent.clientHeight));
-    }
+    visiblePrs = result.visiblePrs;
+    navigablePrs = result.navigablePrs;
+    selectedPrKey = result.selectedPrKey;
+    activeRelatedTicketKey = result.activeRelatedTicketKey;
   }
 
   /**
-   * Render the Jira tab with snooze-aware active tickets, Filter PRs drill-down, and adaptive Jira CTA.
+   * Render the Jira tab via `tabs-renderer.js`.
    */
   function renderJiraTab() {
-    const effectiveJiraUrl = getEffectiveJiraBaseUrl(state.preferences);
-    const hasJiraUrl = Boolean(effectiveJiraUrl);
-    const hasOverrideUrl = Boolean(sanitizeHttpsUrl(state.preferences.jiraBaseUrlOverride));
-
-    jiraSetupHint.classList.toggle('hidden', hasJiraUrl);
-    openJiraBtn.disabled = false;
-    if (!hasJiraUrl) {
-      openJiraBtn.textContent = 'Configure Jira URL';
-      openJiraBtn.title = 'Configure CENTRAL_URLS.MEZZANINE_JIRA_URL in src/config.js or set a Jira URL override in Preferences';
-    } else if (hasOverrideUrl) {
-      openJiraBtn.textContent = 'Open Jira ↗';
-      openJiraBtn.title = `Open ${effectiveJiraUrl}`;
-    } else {
-      openJiraBtn.textContent = 'Open Mezzanine Jira ↗';
-      openJiraBtn.title = `Open ${effectiveJiraUrl}`;
-    }
-
-    if (!state.isAuthenticated) {
-      jiraTicketsCount.textContent = 'Not connected';
-      jiraTicketsContainer.replaceChildren();
-      jiraEmptyTitle.textContent = 'Connect an account first';
-      jiraEmptyMessage.textContent = 'Connect Bitbucket or GitHub in Settings to surface Jira keys referenced in your open pull requests.';
-      jiraConnectBtn.classList.remove('hidden');
-      jiraEmptyState.classList.remove('hidden');
-      return;
-    }
-
-    jiraConnectBtn.classList.add('hidden');
-    const now = Date.now();
-    const tickets = collectActiveJiraTickets(state.snapshot.prList, state.snoozedMap, now);
-    jiraTicketsCount.textContent = `${tickets.length} active ticket${tickets.length === 1 ? '' : 's'}`;
-
-    if (tickets.length === 0) {
-      jiraTicketsContainer.replaceChildren();
-      jiraEmptyTitle.textContent = 'No Jira tickets found';
-      jiraEmptyMessage.textContent = 'Reference a Jira key (e.g. MEZ-123) in a PR title or branch name to surface it here.';
-      jiraEmptyState.classList.remove('hidden');
-      return;
-    }
-
-    jiraEmptyState.classList.add('hidden');
-    const fragment = document.createDocumentFragment();
-
-    for (const ticket of tickets) {
-      const card = document.createElement('div');
-      card.className = ticket.hasYourTurn
-        ? 'jira-ticket-card has-your-turn'
-        : 'jira-ticket-card';
-
-      const info = document.createElement('div');
-      info.className = 'jira-ticket-info';
-
-      const keyRow = document.createElement('div');
-      keyRow.className = 'jira-ticket-key-row';
-
-      const keyEl = document.createElement('span');
-      keyEl.className = 'jira-ticket-key';
-      keyEl.textContent = ticket.key;
-      keyRow.appendChild(keyEl);
-
-      if (ticket.hasYourTurn) {
-        const badge = document.createElement('span');
-        badge.className = 'action-badge state-needs_review';
-        badge.textContent = 'Needs Action';
-        keyRow.appendChild(badge);
-      }
-
-      const metaEl = document.createElement('div');
-      metaEl.className = 'jira-ticket-meta';
-      metaEl.textContent = `${ticket.prCount} linked open PR${ticket.prCount === 1 ? '' : 's'}`;
-
-      info.append(keyRow, metaEl);
-
-      const actionsEl = document.createElement('div');
-      actionsEl.className = 'jira-ticket-actions';
-
-      const filterBtn = document.createElement('button');
-      filterBtn.type = 'button';
-      filterBtn.className = 'btn btn-ghost btn-sm';
-      filterBtn.textContent = 'Filter PRs';
-      filterBtn.title = `Filter PRs matching ${ticket.key}`;
-      filterBtn.setAttribute('aria-label', `Filter pull requests for ${ticket.key}`);
-      filterBtn.addEventListener('click', () => {
-        activeRelatedTicketKey = null;
-        activeFilter = 'all';
-        selectedPrKey = null;
-        searchQuery = ticket.key;
-        prSearchInput.value = ticket.key;
-        switchTopTab('bitbucket-tab');
-        renderBitbucketTab();
-        prItemsContainer.focus();
-        prSearchInput.focus();
-      });
-      actionsEl.appendChild(filterBtn);
-
-      const safeTicketUrl = sanitizeHttpsUrl(ticket.url);
-      if (safeTicketUrl) {
-        const openBtn = document.createElement('button');
-        openBtn.type = 'button';
-        openBtn.className = 'btn btn-secondary btn-sm';
-        openBtn.textContent = 'Open ↗';
-        openBtn.setAttribute('aria-label', `Open ${ticket.key} in Jira`);
-        openBtn.addEventListener('click', () => {
-          void openSafeExternalUrl(safeTicketUrl);
-        });
-        actionsEl.appendChild(openBtn);
-      } else {
-        const setUrlBtn = document.createElement('button');
-        setUrlBtn.type = 'button';
-        setUrlBtn.className = 'btn btn-ghost btn-sm';
-        setUrlBtn.textContent = 'Set URL';
-        setUrlBtn.addEventListener('click', () => {
+    renderJiraTabView(
+      jiraTabElements,
+      {
+        isAuthenticated: state.isAuthenticated,
+        preferences: state.preferences,
+        prList: state.snapshot.prList,
+        snoozedMap: state.snoozedMap
+      },
+      {
+        onFilterPrsByTicket: (ticketKey) => {
+          activeRelatedTicketKey = null;
+          activeFilter = 'all';
+          selectedPrKey = null;
+          searchQuery = ticketKey;
+          prSearchInput.value = ticketKey;
+          switchTopTab('bitbucket-tab');
+          renderBitbucketTab();
+          prItemsContainer.focus();
+          prSearchInput.focus();
+        },
+        onOpenUrl: (rawUrl) => openSafeExternalUrl(rawUrl),
+        onOpenJiraUrlSettings: () => {
           openSettingsPanel('preferences');
-          prefJiraUrl.focus();
-        });
-        actionsEl.appendChild(setUrlBtn);
+          preferencesFormElements.prefJiraUrl.focus();
+        }
       }
-
-      card.append(info, actionsEl);
-      fragment.appendChild(card);
-    }
-
-    jiraTicketsContainer.replaceChildren(fragment);
-  }
-
-  /**
-   * Render the Confluence tab (using `CENTRAL_URLS.CONFLUENCE_URL` if configured, else Coming Soon placeholder).
-   */
-  function renderConfluenceTab() {
-    const safeConfluenceUrl = sanitizeHttpsUrl(CENTRAL_URLS.CONFLUENCE_URL);
-    confluenceConfiguredCard.classList.toggle('hidden', !safeConfluenceUrl);
-    confluencePlaceholderCard.classList.toggle('hidden', Boolean(safeConfluenceUrl));
-  }
-
-  /**
-   * Populate `+ Add Product` form inputs from stored feedback.
-   */
-  function renderAddProductForm() {
-    const selectedSet = new Set(state.productFeedback.requestedProducts);
-    const checkboxes = addProductForm.querySelectorAll('input[name="products"]');
-    for (const el of checkboxes) {
-      if (el instanceof HTMLInputElement) {
-        el.checked = selectedSet.has(el.value);
-      }
-    }
-    customProductFeedbackInput.value = state.productFeedback.productFeedback || '';
+    );
   }
 
   /**
    * Render all UI regions from current `state`.
    */
   function renderAll() {
-    renderHeaderStatusChip();
-    renderFooterTimestamp();
+    renderHeaderStatusChip(
+      { connectionStatusChip, connectionStatusText },
+      {
+        bitbucketAuthenticated: isBitbucketAuthenticated(),
+        bitbucketUser: state.user,
+        bitbucketUsername: state.username,
+        github: state.github,
+        syncedWorkspaces: state.snapshot.syncedWorkspaces,
+        workspaces: state.workspaces,
+        error: state.snapshot.error,
+        rateLimitWarning: state.snapshot.rateLimitWarning,
+        backoffUntil: state.syncState.backoffUntil
+      }
+    );
+    renderFooterTimestamp(lastUpdatedText, state.snapshot.lastUpdated);
     renderBitbucketTab();
     renderJiraTab();
-    renderConfluenceTab();
+    renderConfluenceTabView({ confluenceConfiguredCard, confluencePlaceholderCard });
 
     // Only refresh Settings form inputs when drawer is closed to avoid clobbering active user edits
     if (settingsPanel.classList.contains('hidden')) {
@@ -2007,7 +619,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         activeFilter = state.preferences.defaultFilter || DEFAULT_PREFERENCES.defaultFilter;
       }
       if (options.updateAddProduct) {
-        renderAddProductForm();
+        renderAddProductForm(addProductForm, customProductFeedbackInput, state.productFeedback);
       }
       renderAll();
     }
@@ -2024,19 +636,10 @@ document.addEventListener('DOMContentLoaded', async () => {
    * Refresh footer and PR card relative timestamps in-place every 30s without rebuilding the PR DOM.
    */
   function refreshLiveTimestamps() {
-    renderFooterTimestamp();
-    const now = Date.now();
-    const ageNodes = prItemsContainer.querySelectorAll('.pr-age');
-    for (const node of ageNodes) {
-      if (node instanceof HTMLElement && node.dataset.iso) {
-        node.textContent = formatRelativeAge(node.dataset.iso, now);
-      }
-    }
-    if (activeTabId === 'bitbucket-tab' && activeFilter === 'snoozed') {
-      const snoozeBadges = prItemsContainer.querySelectorAll('.snooze-remaining-badge');
-      if (snoozeBadges.length > 0) {
-        renderBitbucketTab();
-      }
+    renderFooterTimestamp(lastUpdatedText, state.snapshot.lastUpdated);
+    const hasSnoozeBadges = refreshRelativeTimestampsInDom(prItemsContainer, Date.now());
+    if (activeTabId === 'bitbucket-tab' && activeFilter === 'snoozed' && hasSnoozeBadges) {
+      renderBitbucketTab();
     }
   }
 
@@ -2204,66 +807,43 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Collect and validate credential inputs from the Bitbucket Account & Setup form.
-   *
-   * @returns {{ authType: AuthType, username: string, token: string } | null}
-   */
-  function readValidatedCredentialInputs() {
-    const authType = normalizeAuthType(authTypeSelect.value);
-    const username = bitbucketUsernameInput.value.trim();
-    const token = bitbucketTokenInput.value.trim();
-
-    if (authType === 'api_token' && !username) {
-      showInlineBanner(authStatusBanner, 'Enter your Atlassian account email for API Token login.', 'error');
-      bitbucketUsernameInput.focus();
-      return null;
-    }
-    if (!token) {
-      showInlineBanner(authStatusBanner, 'Paste your Bitbucket token before continuing.', 'error');
-      bitbucketTokenInput.focus();
-      return null;
-    }
-    return { authType, username, token };
-  }
-
-  /**
    * Disable/enable Bitbucket Account form controls during async verification or saving.
    *
    * @param {boolean} busy
    */
   function setCredentialsFormBusy(busy) {
-    testConnectionBtn.disabled = busy;
-    saveSettingsBtn.disabled = busy;
-    cancelSettingsBtn.disabled = busy;
+    settingsControls.testConnectionBtn.disabled = busy;
+    settingsControls.saveSettingsBtn.disabled = busy;
+    settingsControls.cancelSettingsBtn.disabled = busy;
   }
 
   /**
    * Test entered Bitbucket credentials without persisting them.
    */
   async function handleTestConnection() {
-    const creds = readValidatedCredentialInputs();
+    const creds = readValidatedCredentialInputs(accountSectionElements);
     if (!creds) {
       return;
     }
 
     setCredentialsFormBusy(true);
-    showInlineBanner(authStatusBanner, 'Testing Bitbucket connection...', 'info');
+    showInlineBanner(accountSectionElements.authStatusBanner, 'Testing Bitbucket connection...', 'info');
     try {
       const res = await sendWorkerMessage({ action: 'TEST_CONNECTION', creds });
       if (res.ok) {
         const name = res.user?.displayName || 'Bitbucket User';
         const wsCount = Array.isArray(res.workspaces) ? res.workspaces.length : 0;
         showInlineBanner(
-          authStatusBanner,
+          accountSectionElements.authStatusBanner,
           `Verified as ${name} (${wsCount} accessible workspace${wsCount === 1 ? '' : 's'}).`,
           'success'
         );
       } else {
-        showInlineBanner(authStatusBanner, String(res.error || 'Verification failed.'), 'error');
+        showInlineBanner(accountSectionElements.authStatusBanner, String(res.error || 'Verification failed.'), 'error');
       }
     } catch (err) {
       showInlineBanner(
-        authStatusBanner,
+        accountSectionElements.authStatusBanner,
         err instanceof Error ? err.message : 'Failed to test connection.',
         'error'
       );
@@ -2279,22 +859,22 @@ document.addEventListener('DOMContentLoaded', async () => {
    */
   async function handleSaveCredentials(e) {
     e.preventDefault();
-    const creds = readValidatedCredentialInputs();
+    const creds = readValidatedCredentialInputs(accountSectionElements);
     if (!creds) {
       return;
     }
 
     setCredentialsFormBusy(true);
-    showInlineBanner(authStatusBanner, 'Verifying and syncing pull requests...', 'info');
+    showInlineBanner(accountSectionElements.authStatusBanner, 'Verifying and syncing pull requests...', 'info');
     try {
       markLocalStateMutation();
       const res = await sendWorkerMessage({ action: 'SAVE_CREDENTIALS', creds });
       if (!res.ok) {
-        showInlineBanner(authStatusBanner, String(res.error || 'Could not save credentials.'), 'error');
+        showInlineBanner(accountSectionElements.authStatusBanner, String(res.error || 'Could not save credentials.'), 'error');
         return;
       }
 
-      bitbucketTokenInput.value = '';
+      accountSectionElements.bitbucketTokenInput.value = '';
       isReplacingToken = false;
       await refreshStateFromWorker({ applyDefaultFilter: true });
       markLocalStateMutation();
@@ -2302,7 +882,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       showToast('Bitbucket connected & synced!', 'success');
     } catch (err) {
       showInlineBanner(
-        authStatusBanner,
+        accountSectionElements.authStatusBanner,
         err instanceof Error ? err.message : 'Failed to save credentials.',
         'error'
       );
@@ -2312,68 +892,40 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Collect and validate GitHub PAT & optional Enterprise API URL from the GitHub form.
-   *
-   * @returns {{ token: string, apiBaseUrl: string } | null}
-   */
-  function readValidatedGitHubInputs() {
-    const token = githubTokenInput.value.trim();
-    const apiBaseUrl = githubApiUrlInput.value.trim();
-
-    if (!token) {
-      showInlineBanner(githubAuthStatusBanner, 'Paste your GitHub Personal Access Token before continuing.', 'error');
-      githubTokenInput.focus();
-      return null;
-    }
-
-    if (apiBaseUrl && !sanitizeHttpsUrl(apiBaseUrl)) {
-      showInlineBanner(
-        githubAuthStatusBanner,
-        'GitHub API Base URL must be a valid https:// URL (e.g. https://api.github.com or https://github.company.com/api/v3).',
-        'error'
-      );
-      githubApiUrlInput.focus();
-      return null;
-    }
-
-    return { token, apiBaseUrl };
-  }
-
-  /**
    * Disable/enable GitHub Account form controls during async verification or saving.
    *
    * @param {boolean} busy
    */
   function setGitHubFormBusy(busy) {
-    testGitHubConnectionBtn.disabled = busy;
-    saveGitHubSettingsBtn.disabled = busy;
-    cancelGitHubSettingsBtn.disabled = busy;
+    settingsControls.testGitHubConnectionBtn.disabled = busy;
+    settingsControls.saveGitHubSettingsBtn.disabled = busy;
+    settingsControls.cancelGitHubSettingsBtn.disabled = busy;
   }
 
   /**
    * Test entered GitHub PAT credentials without persisting them.
    */
   async function handleTestGitHubConnection() {
-    const creds = readValidatedGitHubInputs();
+    const creds = readValidatedGitHubInputs(accountSectionElements);
     if (!creds) {
       return;
     }
 
     setGitHubFormBusy(true);
-    showInlineBanner(githubAuthStatusBanner, 'Testing GitHub connection...', 'info');
+    showInlineBanner(accountSectionElements.githubAuthStatusBanner, 'Testing GitHub connection...', 'info');
     try {
       const res = await sendWorkerMessage({ action: 'TEST_GITHUB_CONNECTION', creds });
       if (res.ok) {
         const display = res.user?.displayName || 'GitHub User';
         const login = res.user?.username ? `@${res.user.username}` : '';
         const identity = login && display !== res.user?.username ? `${display} (${login})` : (login || display);
-        showInlineBanner(githubAuthStatusBanner, `Verified as ${identity}.`, 'success');
+        showInlineBanner(accountSectionElements.githubAuthStatusBanner, `Verified as ${identity}.`, 'success');
       } else {
-        showInlineBanner(githubAuthStatusBanner, String(res.error || 'GitHub verification failed.'), 'error');
+        showInlineBanner(accountSectionElements.githubAuthStatusBanner, String(res.error || 'GitHub verification failed.'), 'error');
       }
     } catch (err) {
       showInlineBanner(
-        githubAuthStatusBanner,
+        accountSectionElements.githubAuthStatusBanner,
         err instanceof Error ? err.message : 'Failed to test GitHub connection.',
         'error'
       );
@@ -2389,22 +941,22 @@ document.addEventListener('DOMContentLoaded', async () => {
    */
   async function handleSaveGitHubCredentials(e) {
     e.preventDefault();
-    const creds = readValidatedGitHubInputs();
+    const creds = readValidatedGitHubInputs(accountSectionElements);
     if (!creds) {
       return;
     }
 
     setGitHubFormBusy(true);
-    showInlineBanner(githubAuthStatusBanner, 'Verifying and syncing GitHub pull requests...', 'info');
+    showInlineBanner(accountSectionElements.githubAuthStatusBanner, 'Verifying and syncing GitHub pull requests...', 'info');
     try {
       markLocalStateMutation();
       const res = await sendWorkerMessage({ action: 'SAVE_GITHUB_CREDENTIALS', creds });
       if (!res.ok) {
-        showInlineBanner(githubAuthStatusBanner, String(res.error || 'Could not save GitHub credentials.'), 'error');
+        showInlineBanner(accountSectionElements.githubAuthStatusBanner, String(res.error || 'Could not save GitHub credentials.'), 'error');
         return;
       }
 
-      githubTokenInput.value = '';
+      accountSectionElements.githubTokenInput.value = '';
       isReplacingGitHubToken = false;
       await refreshStateFromWorker({ applyDefaultFilter: true });
       markLocalStateMutation();
@@ -2412,7 +964,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       showToast('GitHub connected & synced!', 'success');
     } catch (err) {
       showInlineBanner(
-        githubAuthStatusBanner,
+        accountSectionElements.githubAuthStatusBanner,
         err instanceof Error ? err.message : 'Failed to save GitHub credentials.',
         'error'
       );
@@ -2429,35 +981,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function handleSavePreferences(e) {
     e.preventDefault();
     const prevDefaultFilter = state.preferences.defaultFilter;
-    const rawJiraUrl = prefJiraUrl.value.trim();
-
-    if (rawJiraUrl) {
-      const sanitized = sanitizeHttpsUrl(rawJiraUrl);
-      if (!sanitized) {
-        showInlineBanner(
-          prefsStatusBanner,
-          'Jira Base URL override must be a valid https:// URL (e.g. https://mezzanine.jira.example.com).',
-          'error'
-        );
-        prefJiraUrl.focus();
-        return;
-      }
+    const nextPrefs = readValidatedPreferencesInputs(preferencesFormElements);
+    if (!nextPrefs) {
+      return;
     }
 
-    const nextPrefs = {
-      pollIntervalMinutes: Number(prefPollInterval.value),
-      badgeMode: prefBadgeMode.value,
-      staleThresholdHours: Number(prefStaleHours.value),
-      defaultFilter: prefDefaultFilter.value,
-      notificationsEnabled: prefNotifications.checked,
-      compactMode: prefCompactMode.checked,
-      workspacesFilter: parseCsvList(prefWorkspacesFilter.value),
-      reposFilter: parseCsvList(prefReposFilter.value),
-      jiraBaseUrlOverride: rawJiraUrl
-    };
-
-    savePreferencesBtn.disabled = true;
-    showInlineBanner(prefsStatusBanner, 'Saving preferences...', 'info');
+    settingsControls.savePreferencesBtn.disabled = true;
+    showInlineBanner(preferencesFormElements.prefsStatusBanner, 'Saving preferences...', 'info');
     try {
       markLocalStateMutation();
       const res = await sendWorkerMessage({
@@ -2465,7 +995,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         preferences: nextPrefs
       });
       if (res.ok === false) {
-        showInlineBanner(prefsStatusBanner, String(res.error || 'Could not save preferences.'), 'error');
+        showInlineBanner(preferencesFormElements.prefsStatusBanner, String(res.error || 'Could not save preferences.'), 'error');
         return;
       }
 
@@ -2484,62 +1014,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     } catch (err) {
       showInlineBanner(
-        prefsStatusBanner,
+        preferencesFormElements.prefsStatusBanner,
         err instanceof Error ? err.message : 'Failed to save preferences.',
         'error'
       );
     } finally {
-      savePreferencesBtn.disabled = false;
+      settingsControls.savePreferencesBtn.disabled = false;
     }
-  }
-
-  /**
-   * Navigate to the previous or next slide inside the Ticket Deck containing `selectedPrKey`.
-   *
-   * @param {-1 | 1} delta
-   * @returns {boolean}
-   */
-  function navigateDeckSlideForSelectedPr(delta) {
-    if (!selectedPrKey) {
-      return false;
-    }
-    const cards = Array.from(prItemsContainer.querySelectorAll('.pr-card'));
-    const selectedCard = cards.find(
-      (node) => node instanceof HTMLElement && node.dataset.prKey === selectedPrKey
-    );
-    if (!(selectedCard instanceof HTMLElement)) {
-      return false;
-    }
-    const groupEl = selectedCard.closest('.ticket-group');
-    if (!(groupEl instanceof HTMLElement) || groupEl.classList.contains('is-expanded-stack')) {
-      return false;
-    }
-    const slides = Array.from(groupEl.querySelectorAll('.ticket-deck-slide'));
-    if (slides.length <= 1) {
-      return false;
-    }
-    const slideIdx = slides.findIndex(
-      (s) => s instanceof HTMLElement && s.dataset.prKey === selectedPrKey
-    );
-    if (slideIdx < 0) {
-      return false;
-    }
-    const nextIdx = Math.max(0, Math.min(slides.length - 1, slideIdx + delta));
-    if (nextIdx === slideIdx) {
-      return true;
-    }
-    const navBtn = groupEl.querySelector(delta < 0 ? '.deck-nav-btn:first-of-type' : '.deck-nav-btn:nth-of-type(2)');
-    if (navBtn instanceof HTMLButtonElement && !navBtn.disabled) {
-      navBtn.click();
-      return true;
-    }
-    const nextSlide = slides[nextIdx];
-    const nextKey = nextSlide instanceof HTMLElement ? nextSlide.dataset.prKey : null;
-    if (nextKey) {
-      selectPrCard(nextKey, true);
-      return true;
-    }
-    return false;
   }
 
   /**
@@ -2603,10 +1084,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       closeSettingsPanel();
     }
   });
-  closeSettingsBtn.addEventListener('click', closeSettingsPanel);
-  cancelSettingsBtn.addEventListener('click', closeSettingsPanel);
-  cancelGitHubSettingsBtn.addEventListener('click', closeSettingsPanel);
-  cancelPreferencesBtn.addEventListener('click', closeSettingsPanel);
+  settingsControls.closeSettingsBtn.addEventListener('click', closeSettingsPanel);
+  settingsControls.cancelSettingsBtn.addEventListener('click', closeSettingsPanel);
+  settingsControls.cancelGitHubSettingsBtn.addEventListener('click', closeSettingsPanel);
+  settingsControls.cancelPreferencesBtn.addEventListener('click', closeSettingsPanel);
 
   settingsAccountTab.addEventListener('click', () => switchSettingsSubtab('account'));
   settingsPreferencesTab.addEventListener('click', () => switchSettingsSubtab('preferences'));
@@ -2614,28 +1095,31 @@ document.addEventListener('DOMContentLoaded', async () => {
     switchSettingsSubtab(btn === settingsPreferencesTab ? 'preferences' : 'account');
   });
 
-  replaceTokenBtn.addEventListener('click', () => {
+  settingsControls.replaceTokenBtn.addEventListener('click', () => {
     isReplacingToken = true;
     populateAccountSection();
-    if (authTypeSelect.value === 'api_token' && !bitbucketUsernameInput.value.trim()) {
-      bitbucketUsernameInput.focus();
+    if (
+      accountSectionElements.authTypeSelect.value === 'api_token' &&
+      !accountSectionElements.bitbucketUsernameInput.value.trim()
+    ) {
+      accountSectionElements.bitbucketUsernameInput.focus();
     } else {
-      bitbucketTokenInput.focus();
+      accountSectionElements.bitbucketTokenInput.focus();
     }
   });
 
-  signOutBtn.addEventListener('click', () => {
-    signOutConfirm.classList.remove('hidden');
-    confirmSignOutBtn.focus();
+  settingsControls.signOutBtn.addEventListener('click', () => {
+    accountSectionElements.signOutConfirm.classList.remove('hidden');
+    settingsControls.confirmSignOutBtn.focus();
   });
 
-  cancelSignOutBtn.addEventListener('click', () => {
-    signOutConfirm.classList.add('hidden');
-    signOutBtn.focus();
+  settingsControls.cancelSignOutBtn.addEventListener('click', () => {
+    accountSectionElements.signOutConfirm.classList.add('hidden');
+    settingsControls.signOutBtn.focus();
   });
 
-  confirmSignOutBtn.addEventListener('click', async () => {
-    confirmSignOutBtn.disabled = true;
+  settingsControls.confirmSignOutBtn.addEventListener('click', async () => {
+    settingsControls.confirmSignOutBtn.disabled = true;
     try {
       markLocalStateMutation();
       await sendWorkerMessage({ action: 'SIGN_OUT' });
@@ -2652,28 +1136,28 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to sign out.', 'error');
     } finally {
-      confirmSignOutBtn.disabled = false;
+      settingsControls.confirmSignOutBtn.disabled = false;
     }
   });
 
-  githubReplaceTokenBtn.addEventListener('click', () => {
+  settingsControls.githubReplaceTokenBtn.addEventListener('click', () => {
     isReplacingGitHubToken = true;
     populateAccountSection();
-    githubTokenInput.focus();
+    accountSectionElements.githubTokenInput.focus();
   });
 
-  githubSignOutBtn.addEventListener('click', () => {
-    githubSignOutConfirm.classList.remove('hidden');
-    githubConfirmSignOutBtn.focus();
+  settingsControls.githubSignOutBtn.addEventListener('click', () => {
+    accountSectionElements.githubSignOutConfirm.classList.remove('hidden');
+    settingsControls.githubConfirmSignOutBtn.focus();
   });
 
-  githubCancelSignOutBtn.addEventListener('click', () => {
-    githubSignOutConfirm.classList.add('hidden');
-    githubSignOutBtn.focus();
+  settingsControls.githubCancelSignOutBtn.addEventListener('click', () => {
+    accountSectionElements.githubSignOutConfirm.classList.add('hidden');
+    settingsControls.githubSignOutBtn.focus();
   });
 
-  githubConfirmSignOutBtn.addEventListener('click', async () => {
-    githubConfirmSignOutBtn.disabled = true;
+  settingsControls.githubConfirmSignOutBtn.addEventListener('click', async () => {
+    settingsControls.githubConfirmSignOutBtn.disabled = true;
     try {
       markLocalStateMutation();
       await sendWorkerMessage({ action: 'SIGN_OUT_GITHUB' });
@@ -2687,50 +1171,54 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to sign out of GitHub.', 'error');
     } finally {
-      githubConfirmSignOutBtn.disabled = false;
+      settingsControls.githubConfirmSignOutBtn.disabled = false;
     }
   });
 
-  createApiTokenLink.addEventListener('click', (e) => {
+  settingsControls.createApiTokenLink.addEventListener('click', (e) => {
     e.preventDefault();
     void openSafeExternalUrl(AUTH_SETUP_LINKS.atlassianApiTokens);
   });
 
-  createGitHubTokenLink.addEventListener('click', (e) => {
+  settingsControls.createGitHubTokenLink.addEventListener('click', (e) => {
     e.preventDefault();
     void openSafeExternalUrl(AUTH_SETUP_LINKS.githubTokens);
   });
 
-  authTypeSelect.addEventListener('change', syncAuthMethodFields);
-  toggleTokenVisibilityBtn.addEventListener('click', () => {
-    const showing = bitbucketTokenInput.type === 'text';
-    bitbucketTokenInput.type = showing ? 'password' : 'text';
-    const nextLabel = showing ? 'Show token' : 'Hide token';
-    toggleTokenVisibilityBtn.setAttribute('aria-label', nextLabel);
-    toggleTokenVisibilityBtn.title = nextLabel;
+  accountSectionElements.authTypeSelect.addEventListener('change', () => {
+    syncAuthMethodFields(accountSectionElements);
+  });
+  accountSectionElements.toggleTokenVisibilityBtn.addEventListener('click', () => {
+    toggleSecretInputVisibility(
+      accountSectionElements.bitbucketTokenInput,
+      accountSectionElements.toggleTokenVisibilityBtn,
+      'Show token',
+      'Hide token'
+    );
   });
 
-  toggleGitHubTokenVisibilityBtn.addEventListener('click', () => {
-    const showing = githubTokenInput.type === 'text';
-    githubTokenInput.type = showing ? 'password' : 'text';
-    const nextLabel = showing ? 'Show GitHub token' : 'Hide GitHub token';
-    toggleGitHubTokenVisibilityBtn.setAttribute('aria-label', nextLabel);
-    toggleGitHubTokenVisibilityBtn.title = nextLabel;
+  accountSectionElements.toggleGitHubTokenVisibilityBtn.addEventListener('click', () => {
+    toggleSecretInputVisibility(
+      accountSectionElements.githubTokenInput,
+      accountSectionElements.toggleGitHubTokenVisibilityBtn,
+      'Show GitHub token',
+      'Hide GitHub token'
+    );
   });
 
-  testConnectionBtn.addEventListener('click', () => {
+  settingsControls.testConnectionBtn.addEventListener('click', () => {
     void handleTestConnection();
   });
-  credentialsForm.addEventListener('submit', (e) => {
+  accountSectionElements.credentialsForm.addEventListener('submit', (e) => {
     void handleSaveCredentials(e);
   });
-  testGitHubConnectionBtn.addEventListener('click', () => {
+  settingsControls.testGitHubConnectionBtn.addEventListener('click', () => {
     void handleTestGitHubConnection();
   });
-  githubCredentialsForm.addEventListener('submit', (e) => {
+  accountSectionElements.githubCredentialsForm.addEventListener('submit', (e) => {
     void handleSaveGitHubCredentials(e);
   });
-  preferencesForm.addEventListener('submit', (e) => {
+  settingsControls.preferencesForm.addEventListener('submit', (e) => {
     void handleSavePreferences(e);
   });
 
@@ -2753,7 +1241,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupHintGitHubBtn.addEventListener('click', () => openSettingsPanel('account', { focusTarget: 'github' }));
   jiraConnectBtn.addEventListener('click', () => openSettingsPanel('account'));
 
-  for (const pill of filterPillButtons) {
+  for (const pill of bitbucketTabElements.filterPillButtons) {
     pill.addEventListener('click', () => {
       const nextFilter = /** @type {PrFilter | undefined} */ (pill.dataset.filter);
       if (!nextFilter) {
@@ -2766,7 +1254,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  wireTablistArrowNavigation(filterPillButtons, (pill) => {
+  wireTablistArrowNavigation(bitbucketTabElements.filterPillButtons, (pill) => {
     const nextFilter = /** @type {PrFilter | undefined} */ (pill.dataset.filter);
     if (!nextFilter) {
       return;
@@ -2822,7 +1310,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const effectiveJiraUrl = getEffectiveJiraBaseUrl(state.preferences);
     if (!effectiveJiraUrl) {
       openSettingsPanel('preferences');
-      prefJiraUrl.focus();
+      preferencesFormElements.prefJiraUrl.focus();
       return;
     }
     void openSafeExternalUrl(effectiveJiraUrl);
@@ -2830,7 +1318,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   jiraOpenPrefsBtn.addEventListener('click', () => {
     openSettingsPanel('preferences');
-    prefJiraUrl.focus();
+    preferencesFormElements.prefJiraUrl.focus();
   });
 
   openConfluenceBtn.addEventListener('click', () => {
@@ -3015,14 +1503,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     if (e.key === 'h' || e.key === 'ArrowLeft') {
-      if (navigateDeckSlideForSelectedPr(-1)) {
+      if (navigateDeckSlideInContainer(prItemsContainer, selectedPrKey, -1, selectPrCard)) {
         e.preventDefault();
         return;
       }
     }
 
     if (e.key === 'l' || e.key === 'ArrowRight') {
-      if (navigateDeckSlideForSelectedPr(1)) {
+      if (navigateDeckSlideInContainer(prItemsContainer, selectedPrKey, 1, selectPrCard)) {
         e.preventDefault();
         return;
       }
@@ -3082,7 +1570,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   // --- Bootstrap Initial State ---
-  renderStaticMetadata();
+  renderStaticMetadata(
+    {
+      appVersionEl,
+      createApiTokenLink: settingsControls.createApiTokenLink,
+      requiredScopesList: settingsControls.requiredScopesList,
+      createGitHubTokenLink: settingsControls.createGitHubTokenLink,
+      githubRequiredScopesList: settingsControls.githubRequiredScopesList
+    },
+    chrome.runtime.getManifest().version
+  );
   try {
     await refreshStateFromWorker({ applyDefaultFilter: true, updateAddProduct: true });
   } catch (err) {

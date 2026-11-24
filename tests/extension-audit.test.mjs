@@ -8,22 +8,36 @@ const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const EXT_DIR = path.join(ROOT_DIR, 'bitbucket-pr-extension');
 
 test('DOM IDs, CSS selectors, classes, CSP, and MV3 runtime invariants stay consistent', async () => {
-  const [popupHtml, popupJs, stylesCss, backgroundJs] = await Promise.all([
+  const uiDir = path.join(EXT_DIR, 'src', 'ui');
+  const uiEntries = await fs.readdir(uiDir);
+  const uiFiles = uiEntries.filter((f) => f.endsWith('.js')).sort();
+
+  const [popupHtml, popupJs, stylesCss, backgroundJs, ...uiContents] = await Promise.all([
     fs.readFile(path.join(EXT_DIR, 'popup.html'), 'utf8'),
     fs.readFile(path.join(EXT_DIR, 'popup.js'), 'utf8'),
     fs.readFile(path.join(EXT_DIR, 'styles.css'), 'utf8'),
-    fs.readFile(path.join(EXT_DIR, 'background.js'), 'utf8')
+    fs.readFile(path.join(EXT_DIR, 'background.js'), 'utf8'),
+    ...uiFiles.map((file) => fs.readFile(path.join(uiDir, file), 'utf8'))
   ]);
+
+  const uiJsSources = [
+    { name: 'popup.js', content: popupJs },
+    ...uiFiles.map((file, idx) => ({ name: `src/ui/${file}`, content: uiContents[idx] }))
+  ];
 
   // 1. Collect all HTML IDs from popup.html
   const htmlIds = new Set(Array.from(popupHtml.matchAll(/\bid="([^"]+)"/g), (m) => m[1]));
 
-  // Every getEl('id', ...) call in popup.js must reference an existing element ID in popup.html
-  const getElIds = Array.from(popupJs.matchAll(/getEl\(\s*'([^']+)'/g), (m) => m[1]);
-  assert.ok(getElIds.length > 0);
-  for (const id of getElIds) {
-    assert.ok(htmlIds.has(id), `popup.js references missing HTML id="#${id}"`);
+  // Every getEl('id', ...) call in popup.js and src/ui/*.js must reference an existing element ID in popup.html
+  let totalGetElCount = 0;
+  for (const source of uiJsSources) {
+    const getElIds = Array.from(source.content.matchAll(/getEl\(\s*'([^']+)'/g), (m) => m[1]);
+    totalGetElCount += getElIds.length;
+    for (const id of getElIds) {
+      assert.ok(htmlIds.has(id), `${source.name} references missing HTML id="#${id}"`);
+    }
   }
+  assert.ok(totalGetElCount > 0);
 
   // Every .className / classList CSS selector toggled in popup.js must exist in styles.css
   const referencedClasses = [
@@ -94,10 +108,16 @@ test('DOM IDs, CSS selectors, classes, CSP, and MV3 runtime invariants stay cons
   }
   assert.ok(stylesCss.includes('@media (prefers-color-scheme: dark)'));
 
-  // 2. CSP & Security: no inline event handlers in popup.html, no runtime innerHTML/eval in popup.js
+  // 2. CSP & Security: no inline event handlers in popup.html, no runtime innerHTML/eval in popup.js or src/ui/*.js
   assert.equal(/\son[a-z]+\s*=/i.test(popupHtml), false);
-  const strippedPopupJs = popupJs.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
-  assert.equal(/\binnerHTML\b|\bouterHTML\b|\binsertAdjacentHTML\b/.test(strippedPopupJs), false);
+  for (const source of uiJsSources) {
+    const stripped = source.content.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+    assert.equal(
+      /\binnerHTML\b|\bouterHTML\b|\binsertAdjacentHTML\b|\beval\s*\(/.test(stripped),
+      false,
+      `${source.name} must not use innerHTML/outerHTML/insertAdjacentHTML/eval`
+    );
+  }
 
   // 3. MV3 runtime messaging safety
   assert.ok(popupJs.includes('chrome.runtime.lastError'));
