@@ -1,18 +1,22 @@
-# Atlassian Extension Hub (Bitbucket PR Tracker & Mezzanine Jira Hub)
+# Atlassian Extension Hub (Bitbucket + GitHub PR Tracker & Mezzanine Jira Hub)
 
-A zero-build, Manifest V3 Chrome Extension (**v2.0.0**) that turns your browser toolbar into a low-cognitive-load **Bitbucket Cloud PR & Atlassian Hub**. Built with native ES Modules, strict XSS/URL-sanitization guardrails, and an attention-set triage workflow inspired by Google's Critique/Gerrit "Your Turn" model.
+A zero-build, Manifest V3 Chrome Extension (**v2.0.0**) that turns your browser toolbar into a low-cognitive-load **Bitbucket Cloud, GitHub & Atlassian PR Hub**. Built with native ES Modules, strict XSS/URL-sanitization guardrails, and an attention-set triage workflow inspired by Google's Critique/Gerrit "Your Turn" model.
 
 ---
 
 ## Features
 
-- **"Your Turn" Attention Set (Authored & Reviewing):** Tracks both pull requests awaiting your review and PRs you authored. Automatically surfaces what requires your action (`Needs Action` vs `Reviewing`, `My PRs`, `All`, and `Snoozed`), surfaces unresolved tasks and change-request counts, ranks items by priority, and flags stale PRs (`24h` / `48h` / `72h`).
+- **"Your Turn" Attention Set (Authored & Reviewing):** Tracks both pull requests awaiting your review and PRs you authored across **Bitbucket Cloud** and **GitHub** (github.com or GitHub Enterprise Server). Automatically surfaces what requires your action (`Needs Action` vs `Reviewing`, `My PRs`, `All`, and `Snoozed`), surfaces unresolved tasks and change-request counts, ranks items by priority, and flags stale PRs (`24h` / `48h` / `72h`).
+- **Modular GitHub Connection (`BB` / `GH`):** Connect Bitbucket Cloud, GitHub, or both simultaneously in **Settings (⚙) → Account & Setup**. When both providers are active (or when viewing GitHub PRs), cards display subtle `BB` / `GH` badges and the header status chip reflects your combined connections (`Bitbucket + GitHub`, `GitHub (@user)`, or Bitbucket display name).
+- **System One AI Triage (`⚡ ~2m`, `⏱ ~15m`, `🧠 Deep`, `🔥 Hotfix`, `⚠ High Risk`):** Optional, strictly confidence-gated (`>= 75%`) PR effort and production-risk scoring powered by **Jev / Clef Flash** (self-hosted or TypeSafe `/v1/systemone`) or **Gemini Decision 1** (`gemini-decision-1`). Evaluates PR metadata + diffstats per commit hash (zero repeat AI calls for unchanged PRs, never sends raw code diffs), surfaces at most 1 effort badge + 1 alert badge per card, unlocks the **⚡ Quick Wins** filter toggle when `<5m` PRs are available, and supports `effort:quick`, `effort:medium`, `effort:deep`, `risk:high`, and `alert:hotfix` search tokens.
+- **By-Ticket Grouping (`g`) & Horizontal Ticket Decks:** Toggle **By Ticket** (`g`) to group open PRs by primary Jira key (e.g. `MEZ-123`) or `#123` issue reference. Multi-PR tickets render as a **Ticket Deck** (horizontal swipeable carousel sorted by urgency so slide 1 is always most urgent), complete with color-coded status dots (`1 / 3`), an off-screen `+N needs action →` indicator, `‹` / `›` or `h` / `l` navigation, and a `⊞` vertical-stack toggle.
+- **Inline Related PRs (`🔗 +N`):** In flat list view, PR cards sharing a Jira key or `#123` issue ref across Bitbucket and GitHub show a clickable **`🔗 +N <TICKET>`** pill. Clicking it scopes the list to all related open PRs across providers (`Related PRs for PROJ-123 (3)` + **Show all** / `Esc`).
 - **Live CI / Build Status & Presubmit Escalation:** Displays commit build status pills (`✓ CI`, `✕ CI`, `⟳ CI`, `■ CI`) directly on PR cards with deep links to CI runs, escalates authored PRs with failing builds to **CI Failed** (`Needs Action`), and supports search tokens (`ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`).
-- **Auto-Detected Jira Ticket Chips & Active Jira Tab:** Extracts Jira issue keys (e.g. `MEZ-123`) from PR titles and branch names, displays clickable chips directly on PR cards, and aggregates active tickets in the **Jira** tab with one-click **Filter PRs** drill-down.
-- **Keyboard-First Triage & Smart Snooze:** Navigate (`j`/`k`, `ArrowLeft`/`ArrowRight` tablist navigation), open, copy links, refresh, and snooze PRs for 4 hours with an inline **Undo** toast and remaining duration indicator. Snoozed PRs automatically unsnooze early if new commits or comments update the PR.
-- **Automatic Dark Mode & WCAG AA Contrast:** Automatically adapts to your OS theme via `@media (prefers-color-scheme: dark)` with high-contrast Atlassian tokens in both light and dark modes.
-- **Resilient Caching & Rate-Limit Stewardship:** Caches user profile, workspaces, repositories, and commit build statuses with TTLs; deduplicates concurrent syncs; enforces a 10s manual refresh cooldown, 4-request concurrency cap, and 12s request timeouts; paces requests on `X-RateLimit-NearLimit`; and backs off automatically on HTTP `429 Retry-After` while keeping cached PRs usable (stale-while-revalidate).
-- **Configurable Preferences:** Customize polling interval (`Manual` to `30m`), toolbar badge mode (`Needs Action`, `All Open PRs`, or `Off`), desktop notifications, stale threshold, default PR filter, compact card density, workspace/repository allowlists, and Jira URL override.
+- **Auto-Detected Jira Ticket Chips & Active Jira Tab:** Extracts Jira issue keys (e.g. `MEZ-123`) from PR titles, branch names, and descriptions, displays clickable chips directly on PR cards, and aggregates active tickets in the **Jira** tab with one-click **Filter PRs** drill-down.
+- **Keyboard-First Triage & Smart Snooze:** Navigate (`j`/`k`, `h`/`l`, `ArrowLeft`/`ArrowRight` tablist navigation), open, copy links, refresh, and snooze PRs for 4 hours with an inline **Undo** toast and remaining duration indicator. Snoozed PRs automatically unsnooze early if new commits or comments update the PR.
+- **Automatic Dark Mode & WCAG AA Contrast:** Automatically adapts to your OS theme via `@media (prefers-color-scheme: dark)` with high-contrast tokens in both light and dark modes.
+- **Resilient Caching & Rate-Limit Stewardship:** Caches user profiles, workspaces, repositories, and commit build statuses with TTLs; deduplicates concurrent syncs; enforces a 10s manual refresh cooldown, 4-request concurrency cap, and 12s request timeouts; paces requests on `X-RateLimit-NearLimit`; and backs off automatically on HTTP `429 Retry-After` while keeping cached PRs usable (stale-while-revalidate).
+- **Configurable Preferences:** Customize polling interval (`Manual` to `30m`), toolbar badge mode (`Needs Action`, `All Open PRs`, or `Off`), desktop notifications, stale threshold, default PR filter, compact card density, workspace/repository allowlists, **By Ticket** grouping, and Jira URL override.
 - **Modular Atlassian Hub Tabs:** Switch between **Bitbucket PRs**, **Jira** (Active Jira Tickets + quick open), **Confluence** (quick launch when configured / integration roadmap), and **+ Add Product** (local feature request customizer).
 
 ---
@@ -24,26 +28,58 @@ The extension runs directly from source using native Manifest V3 ES Modules—no
 1. Open Google Chrome and navigate to `chrome://extensions/`.
 2. Enable **Developer mode** (toggle in the top-right corner).
 3. Click **Load unpacked** and select the `bitbucket-pr-extension/` directory.
-4. Pin **Atlassian Extension Hub** to your toolbar, open it, and click **Connect Bitbucket** to enter your Atlassian Scoped API Token (or Workspace/Repository Access Token).
+4. Pin **Atlassian Extension Hub** to your toolbar, open it, and click **Connect Bitbucket** (with an Atlassian Scoped API Token or Access Token) and/or **Connect GitHub** (with a GitHub Personal Access Token).
 
 For detailed authentication setup, scopes, and troubleshooting, see [bitbucket-pr-extension/INSTALLATION.md](./bitbucket-pr-extension/INSTALLATION.md).
 
 ---
 
-## Configuring the Mezzanine Jira URL
+## Configuring Central URLs (Mezzanine Jira, Confluence & GitHub Enterprise)
 
-One-click Jira ticket deep links (`<base-url>/browse/<KEY>`) and the **Open Mezzanine Jira** button can be configured centrally in code or per-user in the UI:
+One-click Jira ticket deep links (`<base-url>/browse/<KEY>`), Confluence launch links, and default GitHub / GitHub Enterprise Server endpoints can be configured centrally in code or per-user in the UI:
 
-1. **Central Configuration (Code):** Edit `CENTRAL_URLS.MEZZANINE_JIRA_URL` in [`bitbucket-pr-extension/src/config.js`](./bitbucket-pr-extension/src/config.js) with an `https://` URL and **no trailing slash**:
+1. **Central Configuration (Code):** Edit `CENTRAL_URLS` in [`bitbucket-pr-extension/src/config.js`](./bitbucket-pr-extension/src/config.js) with `https://` URLs and **no trailing slashes**:
    ```js
    export const CENTRAL_URLS = Object.freeze({
      MEZZANINE_JIRA_URL: 'https://mezzanine.jira.example.com',
      CONFLUENCE_URL: '',
+     GITHUB_API_BASE_URL: 'https://api.github.com', // or 'https://github.company.com/api/v3' for GHES
+     GITHUB_WEB_BASE_URL: 'https://github.com',     // or 'https://github.company.com' for GHES
      ...
    });
    ```
    *(Optionally set `CENTRAL_URLS.CONFLUENCE_URL` to enable quick-open links on the Confluence tab.)*
-2. **Per-User Override (UI):** Open **Settings (⚙) → Preferences → Jira Base URL Override**, enter your `https://` Jira base URL, and save. A valid Preferences override takes precedence over `CENTRAL_URLS.MEZZANINE_JIRA_URL`.
+2. **Per-User Overrides (UI):**
+   - **Jira URL:** Open **Settings (⚙) → Preferences → Jira Base URL Override**, enter your `https://` Jira base URL, and save.
+   - **GitHub Enterprise API URL:** Open **Settings (⚙) → Account & Setup → GitHub → GitHub API Base URL**, enter your `https://.../api/v3` URL, and save.
+
+---
+
+## System One AI Triage (Jev / Clef Flash & Gemini Decision 1)
+
+System One AI Triage evaluates open PRs in a single pass per `sourceCommitHash` (title, branches, description, and file/line diffstats—never raw code diffs) and gates badges at `CONFIDENCE_THRESHOLD` (`0.75`).
+
+1. **In-App Setup (Recommended):**
+   Open **Settings (⚙) → Account & Setup → System One AI Triage**:
+   - **Jev / Clef Flash (`jev`):** Select `Jev / Clef Flash (Self-Hosted or TypeSafe)`, enter your `https://` endpoint (or `http://` for `localhost` / private RFC1918 LAN / `.local` GPU servers; `/v1/systemone` is appended automatically if omitted), keep model `clef-flash` (or custom), and optionally enter a Bearer API key (leave empty for keyless internal servers). Custom endpoints prompt cleanly for Chrome optional host permission on test/save.
+   - **Gemini Decision 1 (`gemini`):** Select `Gemini Decision 1 (Google AI Studio)`, keep the default endpoint (`https://generativelanguage.googleapis.com/v1beta/decisions`) and model (`gemini-decision-1`), and paste your Google AI Studio API key.
+   - Click **Test Model** to run a lightweight `noul` verification check, then **Save & Score** to evaluate open PRs immediately. Use **Disable** anytime to turn off AI triage and wipe cached scores.
+2. **Central Defaults (`DECISION_MODELS` in `src/config.js`):**
+   Teams can preconfigure default endpoints/providers in [`bitbucket-pr-extension/src/config.js`](./bitbucket-pr-extension/src/config.js) (never hardcode API keys in source):
+   ```js
+   export const DECISION_MODELS = Object.freeze({
+     DEFAULT_PROVIDER: 'off', // 'off' | 'jev' | 'gemini'
+     JEV_API_BASE_URL: '',    // e.g. 'https://clef.internal.example.com' or 'http://10.0.1.42:8080'
+     JEV_DEFAULT_MODEL: 'clef-flash',
+     GEMINI_DECISIONS_URL: 'https://generativelanguage.googleapis.com/v1beta/decisions',
+     GEMINI_DEFAULT_MODEL: 'gemini-decision-1',
+     CONFIDENCE_THRESHOLD: 0.75,
+     ...
+   });
+   ```
+3. **Search Tokens & Quick Wins:**
+   - Click **⚡ Quick Wins** in the PR toolbar (appears automatically when `>= 1` open PR is scored `⚡ ~2m`) to toggle `effort:quick`.
+   - Combine AI tokens in the search bar (`/`): `effort:quick`, `effort:medium`, `effort:deep`, `risk:high`, `alert:hotfix`.
 
 ---
 
@@ -53,15 +89,17 @@ Press `?` anywhere in the popup (outside text inputs) to toggle the in-app short
 
 | Key | Action |
 | :--- | :--- |
-| `/` | Focus PR search bar (supports `ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`, build names, Jira keys) |
+| `/` | Focus PR search bar (supports `ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`, `effort:quick`, `effort:medium`, `effort:deep`, `risk:high`, `alert:hotfix`, build names, Jira keys) |
+| `g` | Toggle **By Ticket** grouping (with horizontal Ticket Decks) |
 | `j` / `k` (or `↓` / `↑`) | Select next / previous PR card |
+| `h` / `l` (or `←` / `→`) | Swipe previous / next PR inside a selected Ticket Deck |
 | `Enter` | Open selected PR in a new tab |
 | `c` | Copy selected PR URL to clipboard |
 | `s` | Snooze PR for 4 hours / Unsnooze |
 | `r` | Trigger manual PR sync |
 | `1` – `4` | Switch top tabs (`Bitbucket PRs`, `Jira`, `Confluence`, `+ Add Product`) |
 | `?` | Toggle keyboard shortcuts cheat sheet |
-| `Esc` | Clear search filter or close open drawer/popover |
+| `Esc` | Clear related scope / clear search filter / close open drawer or popover |
 
 ---
 

@@ -1,11 +1,15 @@
-import { sanitizeHttpsUrl } from './config.js';
-import { filterAndSortPrs } from './pr-triage.js';
+import { DECISION_MODELS, sanitizeHttpsUrl } from './config.js';
+import { filterAndSortPrs, isPrSnoozed } from './pr-triage.js';
 
 /** @typedef {import('./pr-triage.js').EnrichedPullRequest} EnrichedPullRequest */
 /** @typedef {import('./pr-triage.js').PrFilter} PrFilter */
 /** @typedef {import('./storage.js').BuildState} BuildState */
 /** @typedef {import('./storage.js').BuildStatusSummary} BuildStatusSummary */
+/** @typedef {import('./storage.js').CachedUser} CachedUser */
+/** @typedef {import('./storage.js').DecisionTriageResult} DecisionTriageResult */
+/** @typedef {import('./storage.js').DiffstatSummary} DiffstatSummary */
 /** @typedef {import('./storage.js').SnoozedMap} SnoozedMap */
+/** @typedef {import('./storage.js').WorkspaceSummary} WorkspaceSummary */
 
 /**
  * @typedef {Object} ReviewerBreakdown
@@ -385,3 +389,566 @@ export function getCrossFilterEmptyHint(params) {
     label: `No matches in ${filterLabel} — ${matchCount} match${matchCount === 1 ? '' : 'es'} in All PRs.`
   };
 }
+
+/**
+ * @typedef {Object} HeaderConnectionDescriptor
+ * @property {'neutral' | 'connected' | 'warning' | 'error'} variant
+ * @property {string} text
+ * @property {string} title
+ * @property {string} ariaLabel
+ */
+
+/**
+ * Derive status chip variant, concise label, and multi-account tooltip for single or dual-provider connections.
+ *
+ * @param {{
+ *   bitbucketAuthenticated?: boolean,
+ *   bitbucketUser?: CachedUser | null,
+ *   bitbucketUsername?: string,
+ *   github?: { isAuthenticated?: boolean, apiBaseUrl?: string, user?: CachedUser | null } | null,
+ *   syncedWorkspaces?: readonly string[],
+ *   workspaces?: readonly WorkspaceSummary[],
+ *   error?: string | null,
+ *   rateLimitWarning?: boolean,
+ *   backoffUntil?: number | null,
+ *   now?: number
+ * }} params
+ * @returns {HeaderConnectionDescriptor}
+ */
+export function getHeaderConnectionDescriptor(params) {
+  const bbAuthed = Boolean(params?.bitbucketAuthenticated);
+  const ghAuthed = Boolean(params?.github?.isAuthenticated);
+  const now = typeof params?.now === 'number' && Number.isFinite(params.now) ? params.now : Date.now();
+
+  if (!bbAuthed && !ghAuthed) {
+    return {
+      variant: 'neutral',
+      text: 'Not connected',
+      title: 'Click to connect Bitbucket or GitHub',
+      ariaLabel: 'Connection status: Not connected. Open settings'
+    };
+  }
+
+  /** @type {string[]} */
+  const accountLines = [];
+
+  if (bbAuthed) {
+    const bbName = params?.bitbucketUser?.displayName || params?.bitbucketUsername || 'Bitbucket';
+    const synced = Array.isArray(params?.syncedWorkspaces) ? params.syncedWorkspaces.filter(Boolean) : [];
+    const fallbackWs = Array.isArray(params?.workspaces)
+      ? params.workspaces.map((ws) => ws.slug).filter(Boolean)
+      : [];
+    const wsList = synced.length > 0 ? synced : fallbackWs;
+    accountLines.push(
+      wsList.length > 0
+        ? `Bitbucket: ${bbName} (${wsList.join(', ')})`
+        : `Bitbucket: ${bbName}`
+    );
+  }
+
+  if (ghAuthed) {
+    const ghUser = params?.github?.user;
+    const ghLogin = typeof ghUser?.username === 'string' ? ghUser.username.trim() : '';
+    const ghDisplay = typeof ghUser?.displayName === 'string' ? ghUser.displayName.trim() : '';
+    const ghIdentity = ghDisplay && ghLogin && ghDisplay !== ghLogin
+      ? `${ghDisplay} (@${ghLogin})`
+      : (ghLogin ? `@${ghLogin}` : (ghDisplay || 'GitHub'));
+    const ghApi = typeof params?.github?.apiBaseUrl === 'string' && params.github.apiBaseUrl.trim()
+      ? ` [${params.github.apiBaseUrl.trim()}]`
+      : '';
+    accountLines.push(`GitHub: ${ghIdentity}${ghApi}`);
+  }
+
+  let connectedLabel;
+  if (bbAuthed && ghAuthed) {
+    connectedLabel = 'Bitbucket + GitHub';
+  } else if (ghAuthed) {
+    const ghLogin = typeof params?.github?.user?.username === 'string' ? params.github.user.username.trim() : '';
+    const ghDisplay = typeof params?.github?.user?.displayName === 'string' ? params.github.user.displayName.trim() : '';
+    connectedLabel = ghLogin ? `GitHub (@${ghLogin})` : (ghDisplay || 'GitHub');
+  } else {
+    connectedLabel = params?.bitbucketUser?.displayName || params?.bitbucketUsername || 'Connected';
+  }
+
+  if (params?.error) {
+    return {
+      variant: 'error',
+      text: 'Sync issue',
+      title: [params.error, ...accountLines].join('\n'),
+      ariaLabel: 'Connection status: Sync issue. Open settings'
+    };
+  }
+
+  const backoffUntil = typeof params?.backoffUntil === 'number' ? params.backoffUntil : null;
+  if (params?.rateLimitWarning || (backoffUntil !== null && backoffUntil > now)) {
+    const rateNote = backoffUntil !== null && backoffUntil > now
+      ? `Auto-polling paused until ${new Date(backoffUntil).toLocaleTimeString()}`
+      : 'Approaching API rate limit';
+    return {
+      variant: 'warning',
+      text: 'Rate limited',
+      title: [rateNote, ...accountLines].join('\n'),
+      ariaLabel: 'Connection status: Rate limited. Open settings'
+    };
+  }
+
+  return {
+    variant: 'connected',
+    text: connectedLabel,
+    title: [...accountLines, 'Click to open Settings'].join('\n'),
+    ariaLabel: `Connected (${connectedLabel}). Open settings`
+  };
+}
+
+/**
+ * Filter open PRs across all providers sharing a Jira ticket key or `#123` issue ref,
+ * preserving priority triage sort order.
+ *
+ * @param {readonly EnrichedPullRequest[]} prs
+ * @param {string} ticketKey
+ * @returns {EnrichedPullRequest[]}
+ */
+export function filterPrsByRelatedTicket(prs, ticketKey) {
+  if (!Array.isArray(prs) || typeof ticketKey !== 'string' || !ticketKey.trim()) {
+    return [];
+  }
+  const target = ticketKey.trim();
+  const matches = prs.filter((pr) => {
+    if (!pr || typeof pr !== 'object') {
+      return false;
+    }
+    const inJira = Array.isArray(pr.jiraKeys) && pr.jiraKeys.includes(target);
+    const inIssues = Array.isArray(pr.issueRefs) && pr.issueRefs.includes(target);
+    return inJira || inIssues;
+  });
+
+  return [...matches].sort((a, b) => {
+    if (a.isYourTurn !== b.isYourTurn) {
+      return a.isYourTurn ? -1 : 1;
+    }
+    if (a.priorityScore !== b.priorityScore) {
+      return b.priorityScore - a.priorityScore;
+    }
+    const timeA = Date.parse(a.updatedOn || a.createdOn || '') || 0;
+    const timeB = Date.parse(b.updatedOn || b.createdOn || '') || 0;
+    if (timeA !== timeB) {
+      return timeB - timeA;
+    }
+    return a.key.localeCompare(b.key);
+  });
+}
+
+/**
+ * @typedef {Object} ActionBadgeMeta
+ * @property {string} label
+ * @property {string} title
+ */
+
+/** @type {Readonly<Record<string, ActionBadgeMeta>>} */
+export const ACTION_BADGE_LABELS = Object.freeze({
+  needs_review: {
+    label: 'Needs Review',
+    title: 'Your review is pending on this pull request'
+  },
+  changes_requested: {
+    label: 'Changes Requested',
+    title: 'A reviewer requested changes on your pull request'
+  },
+  ci_failed: {
+    label: 'CI Failed',
+    title: 'Latest CI build on your pull request failed or stopped'
+  },
+  ready_to_merge: {
+    label: 'Ready to Merge',
+    title: 'Approved by reviewers with no outstanding change requests or failing builds'
+  },
+  waiting_reviewers: {
+    label: 'Waiting',
+    title: 'Waiting on reviewers or updates from others'
+  },
+  approved_by_you: {
+    label: 'Approved',
+    title: 'You have approved this pull request'
+  },
+  changes_requested_by_you: {
+    label: 'Changes Sent',
+    title: 'You requested changes; waiting on author updates'
+  },
+  draft: {
+    label: 'Draft',
+    title: 'Draft pull request (excluded from Needs Action)'
+  }
+});
+
+/**
+ * @typedef {'dot-red' | 'dot-blue' | 'dot-green' | 'dot-gray'} DeckDotColorClass
+ */
+
+/**
+ * @typedef {Object} DeckDotDescriptor
+ * @property {DeckDotColorClass} colorClass
+ * @property {string} tooltip
+ */
+
+/**
+ * @typedef {Object} OffscreenDeckAttention
+ * @property {number} totalOffscreen
+ * @property {number} leftCount
+ * @property {number} rightCount
+ * @property {number} targetIndex
+ * @property {string} label
+ */
+
+/**
+ * Sort PRs inside a Ticket Deck by Attention Set urgency so slide 1 is always most urgent:
+ * `isYourTurn` -> `priorityScore` descending -> `updatedOn` descending -> `key`.
+ *
+ * @param {readonly EnrichedPullRequest[]} prs
+ * @returns {EnrichedPullRequest[]}
+ */
+export function sortDeckPrs(prs) {
+  if (!Array.isArray(prs) || prs.length === 0) {
+    return [];
+  }
+  return [...prs].sort((a, b) => {
+    if (a.isYourTurn !== b.isYourTurn) {
+      return a.isYourTurn ? -1 : 1;
+    }
+    if (a.priorityScore !== b.priorityScore) {
+      return b.priorityScore - a.priorityScore;
+    }
+    const timeA = Date.parse(a.updatedOn || a.createdOn || '') || 0;
+    const timeB = Date.parse(b.updatedOn || b.createdOn || '') || 0;
+    if (timeA !== timeB) {
+      return timeB - timeA;
+    }
+    return a.key.localeCompare(b.key);
+  });
+}
+
+/**
+ * Derive color-coded mini-map dot class and hover tooltip for a PR slide in a Ticket Deck.
+ *
+ * @param {Pick<EnrichedPullRequest, 'actionState' | 'repoName' | 'repoFullName' | 'title'>} pr
+ * @returns {DeckDotDescriptor}
+ */
+export function getDeckDotDescriptor(pr) {
+  /** @type {DeckDotColorClass} */
+  let colorClass = 'dot-gray';
+  if (pr.actionState === 'ci_failed' || pr.actionState === 'changes_requested') {
+    colorClass = 'dot-red';
+  } else if (pr.actionState === 'needs_review') {
+    colorClass = 'dot-blue';
+  } else if (pr.actionState === 'ready_to_merge' || pr.actionState === 'approved_by_you') {
+    colorClass = 'dot-green';
+  }
+
+  const actionLabel = ACTION_BADGE_LABELS[pr.actionState]?.label ?? pr.actionState;
+  const repoLabel = pr.repoName || pr.repoFullName || 'PR';
+  return {
+    colorClass,
+    tooltip: `${repoLabel}: ${pr.title} (${actionLabel})`
+  };
+}
+
+/**
+ * Summarize off-screen PRs in a Ticket Deck that need the user's attention (`isYourTurn === true`),
+ * returning directional badge text and a jump target index, or `null` if none are off-screen.
+ *
+ * @param {readonly Pick<EnrichedPullRequest, 'key' | 'updatedOn' | 'isYourTurn'>[]} prs
+ * @param {number} activeIndex
+ * @param {SnoozedMap | null | undefined} [snoozedMap]
+ * @param {number} [now]
+ * @returns {OffscreenDeckAttention | null}
+ */
+export function getOffscreenDeckAttention(prs, activeIndex, snoozedMap = {}, now = Date.now()) {
+  if (!Array.isArray(prs) || prs.length <= 1) {
+    return null;
+  }
+  const safeActive = Math.max(0, Math.min(prs.length - 1, Math.floor(activeIndex)));
+  let leftCount = 0;
+  let rightCount = 0;
+  let firstLeftIndex = -1;
+  let firstRightIndex = -1;
+
+  for (let i = 0; i < prs.length; i += 1) {
+    if (i === safeActive) {
+      continue;
+    }
+    const pr = prs[i];
+    const effectiveYourTurn = Boolean(pr?.isYourTurn) && !isPrSnoozed(pr, snoozedMap, now);
+    if (!effectiveYourTurn) {
+      continue;
+    }
+    if (i < safeActive) {
+      leftCount += 1;
+      if (firstLeftIndex === -1) {
+        firstLeftIndex = i;
+      }
+    } else {
+      rightCount += 1;
+      if (firstRightIndex === -1) {
+        firstRightIndex = i;
+      }
+    }
+  }
+
+  const totalOffscreen = leftCount + rightCount;
+  if (totalOffscreen === 0) {
+    return null;
+  }
+
+  let label;
+  let targetIndex;
+  if (rightCount > 0 && leftCount === 0) {
+    label = `+${rightCount} needs action →`;
+    targetIndex = firstRightIndex;
+  } else if (leftCount > 0 && rightCount === 0) {
+    label = `← +${leftCount} needs action`;
+    targetIndex = firstLeftIndex;
+  } else {
+    label = `← +${totalOffscreen} needs action →`;
+    targetIndex = firstRightIndex;
+  }
+
+  return {
+    totalOffscreen,
+    leftCount,
+    rightCount,
+    targetIndex,
+    label
+  };
+}
+
+/**
+ * @typedef {Object} AiTriageBadgeDescriptor
+ * @property {string} label
+ * @property {string} cssClass
+ * @property {string} tooltip
+ */
+
+/**
+ * @typedef {Object} AiTriageBadgesResult
+ * @property {AiTriageBadgeDescriptor | null} effortBadge
+ * @property {AiTriageBadgeDescriptor | null} alertBadge
+ */
+
+/** @type {Readonly<Record<'quick' | 'medium' | 'deep', { label: string, cssClass: string, summary: string }>>} */
+const EFFORT_BADGE_META = Object.freeze({
+  quick: {
+    label: '⚡ ~2m',
+    cssClass: 'ai-effort-quick',
+    summary: 'Quick review (~2m)'
+  },
+  medium: {
+    label: '⏱ ~15m',
+    cssClass: 'ai-effort-medium',
+    summary: 'Standard review (~15m)'
+  },
+  deep: {
+    label: '🧠 Deep',
+    cssClass: 'ai-effort-deep',
+    summary: 'Deep review (30m+)'
+  }
+});
+
+/** @type {Readonly<Record<'hotfix' | 'high_risk', { label: string, cssClass: string, summary: string }>>} */
+const ALERT_BADGE_META = Object.freeze({
+  hotfix: {
+    label: '🔥 Hotfix',
+    cssClass: 'ai-alert-hotfix',
+    summary: 'Urgent production hotfix / blocker'
+  },
+  high_risk: {
+    label: '⚠ High Risk',
+    cssClass: 'ai-alert-high_risk',
+    summary: 'Elevated blast radius / sensitive change'
+  }
+});
+
+/** @type {Readonly<Record<string, string>>} */
+const CHANGE_KIND_LABELS = Object.freeze({
+  feature: 'Feature',
+  bugfix: 'Bugfix',
+  hotfix: 'Hotfix',
+  refactor: 'Refactor',
+  tests_docs: 'Tests & Docs',
+  config_deps: 'Config & Deps',
+  other: 'Other'
+});
+
+/**
+ * Format calibrated confidence as a whole percentage (e.g. `88% confidence`).
+ *
+ * @param {number} confidence
+ * @returns {string}
+ */
+function formatConfidencePct(confidence) {
+  const clamped = Math.max(0, Math.min(1, confidence));
+  return `${Math.round(clamped * 100)}% confidence`;
+}
+
+/**
+ * Format diffstat summary (`12 files · +140/-32`) when available, or `''`.
+ *
+ * @param {Partial<DiffstatSummary> | null | undefined} diffstat
+ * @returns {string}
+ */
+function formatDiffstatSummary(diffstat) {
+  if (!diffstat || typeof diffstat !== 'object') {
+    return '';
+  }
+  const files = typeof diffstat.filesChanged === 'number' && Number.isFinite(diffstat.filesChanged) && diffstat.filesChanged >= 0
+    ? Math.floor(diffstat.filesChanged)
+    : null;
+  const added = typeof diffstat.linesAdded === 'number' && Number.isFinite(diffstat.linesAdded) && diffstat.linesAdded >= 0
+    ? Math.floor(diffstat.linesAdded)
+    : null;
+  const removed = typeof diffstat.linesRemoved === 'number' && Number.isFinite(diffstat.linesRemoved) && diffstat.linesRemoved >= 0
+    ? Math.floor(diffstat.linesRemoved)
+    : null;
+  if (files === null && added === null && removed === null) {
+    return '';
+  }
+  const filesPart = `${files ?? 0} ${(files ?? 0) === 1 ? 'file' : 'files'}`;
+  const linesPart = `+${added ?? 0}/-${removed ?? 0}`;
+  return `${filesPart} · ${linesPart}`;
+}
+
+/**
+ * Build a rich multi-detail tooltip for an AI triage badge combining explanation,
+ * `changeKind`, `riskScore/5`, diffstat (`12 files · +140/-32`), model name, and calibrated confidence %.
+ *
+ * @param {{
+ *   headline: string,
+ *   aiTriage: Partial<DecisionTriageResult>,
+ *   diffstat: Partial<DiffstatSummary> | null | undefined,
+ *   confidence: number
+ * }} params
+ * @returns {string}
+ */
+function buildAiBadgeTooltip({ headline, aiTriage, diffstat, confidence }) {
+  /** @type {string[]} */
+  const parts = [headline];
+
+  if (typeof aiTriage.changeKind === 'string' && aiTriage.changeKind.trim()) {
+    const rawKind = aiTriage.changeKind.trim();
+    parts.push(`Kind: ${CHANGE_KIND_LABELS[rawKind] ?? rawKind}`);
+  }
+
+  if (typeof aiTriage.riskScore === 'number' && Number.isFinite(aiTriage.riskScore)) {
+    const clampedScore = Math.max(1, Math.min(5, aiTriage.riskScore));
+    const formattedScore = Number.isInteger(clampedScore)
+      ? String(clampedScore)
+      : clampedScore.toFixed(1).replace(/\.0$/, '');
+    parts.push(`Risk: ${formattedScore}/5`);
+  }
+
+  const diffSummary = formatDiffstatSummary(diffstat);
+  if (diffSummary) {
+    parts.push(diffSummary);
+  }
+
+  const modelName = typeof aiTriage.model === 'string' && aiTriage.model.trim()
+    ? aiTriage.model.trim()
+    : (aiTriage.provider === 'gemini' ? DECISION_MODELS.GEMINI_DEFAULT_MODEL : DECISION_MODELS.JEV_DEFAULT_MODEL);
+  parts.push(`${modelName} (${formatConfidencePct(confidence)})`);
+
+  return parts.join(' • ');
+}
+
+/**
+ * Derive strictly capped System One AI triage badges for a PR card:
+ * at most 1 effort badge + at most 1 alert badge, each gated by
+ * `confidence >= DECISION_MODELS.CONFIDENCE_THRESHOLD` (`0.75`).
+ *
+ * @param {Partial<DecisionTriageResult> | null | undefined} aiTriage
+ * @param {Partial<DiffstatSummary> | null | undefined} [diffstat]
+ * @returns {AiTriageBadgesResult}
+ */
+export function getAiTriageBadges(aiTriage, diffstat = null) {
+  if (!aiTriage || typeof aiTriage !== 'object') {
+    return { effortBadge: null, alertBadge: null };
+  }
+
+  const threshold = DECISION_MODELS.CONFIDENCE_THRESHOLD;
+
+  /** @type {AiTriageBadgeDescriptor | null} */
+  let effortBadge = null;
+  const effortKey = aiTriage.effort;
+  const effortConfidence = typeof aiTriage.effortConfidence === 'number' && Number.isFinite(aiTriage.effortConfidence)
+    ? aiTriage.effortConfidence
+    : 0;
+  if (
+    (effortKey === 'quick' || effortKey === 'medium' || effortKey === 'deep') &&
+    effortConfidence >= threshold
+  ) {
+    const meta = EFFORT_BADGE_META[effortKey];
+    effortBadge = {
+      label: meta.label,
+      cssClass: meta.cssClass,
+      tooltip: buildAiBadgeTooltip({
+        headline: meta.summary,
+        aiTriage,
+        diffstat,
+        confidence: effortConfidence
+      })
+    };
+  }
+
+  /** @type {AiTriageBadgeDescriptor | null} */
+  let alertBadge = null;
+  const alertKey = aiTriage.alert;
+  const alertConfidence = typeof aiTriage.alertConfidence === 'number' && Number.isFinite(aiTriage.alertConfidence)
+    ? aiTriage.alertConfidence
+    : 0;
+  if (
+    (alertKey === 'hotfix' || alertKey === 'high_risk') &&
+    alertConfidence >= threshold
+  ) {
+    const meta = ALERT_BADGE_META[alertKey];
+    alertBadge = {
+      label: meta.label,
+      cssClass: meta.cssClass,
+      tooltip: buildAiBadgeTooltip({
+        headline: meta.summary,
+        aiTriage,
+        diffstat,
+        confidence: alertConfidence
+      })
+    };
+  }
+
+  return { effortBadge, alertBadge };
+}
+
+/**
+ * Count open non-snoozed PRs eligible for the `#quick-wins-btn` filter chip
+ * (`aiTriage.effort === 'quick'` and `effortConfidence >= DECISION_MODELS.CONFIDENCE_THRESHOLD`).
+ *
+ * @param {readonly EnrichedPullRequest[]} prs
+ * @param {SnoozedMap | null | undefined} [snoozedMap]
+ * @param {number} [now]
+ * @returns {number}
+ */
+export function countQuickWinsPrs(prs, snoozedMap = {}, now = Date.now()) {
+  if (!Array.isArray(prs) || prs.length === 0) {
+    return 0;
+  }
+  const threshold = DECISION_MODELS.CONFIDENCE_THRESHOLD;
+  let count = 0;
+  for (const pr of prs) {
+    if (!pr || isPrSnoozed(pr, snoozedMap, now)) {
+      continue;
+    }
+    const effort = pr.aiTriage?.effort;
+    const conf = typeof pr.aiTriage?.effortConfidence === 'number' && Number.isFinite(pr.aiTriage.effortConfidence)
+      ? pr.aiTriage.effortConfidence
+      : 0;
+    if (effort === 'quick' && conf >= threshold) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
