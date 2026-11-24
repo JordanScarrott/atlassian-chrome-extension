@@ -15,10 +15,16 @@
         </svg>
         <div class="header-titles">
           <h1 id="app-title">Atlassian Hub</h1>
-          <span id="connection-status-chip" class="status-chip status-chip-neutral" aria-live="polite">
+          <button
+            id="connection-status-chip"
+            type="button"
+            class="status-chip status-chip-neutral"
+            aria-live="polite"
+            title="Checking connection status..."
+          >
             <span class="status-dot" aria-hidden="true"></span>
             <span id="connection-status-text">Checking...</span>
-          </span>
+          </button>
         </div>
       </div>
       <div class="header-actions">
@@ -93,7 +99,7 @@
     </nav>
 
     <!-- Main Content Panel -->
-    <main class="main-content">
+    <main id="main-content" class="main-content">
       <!-- Settings Drawer (Overlay/Collapsible) -->
       <section id="settings-panel" class="settings-panel hidden" aria-label="Settings">
         <div class="settings-header">
@@ -311,6 +317,7 @@
                 placeholder="e.g. acme, platform-eng"
               />
               <p class="field-help">Comma-separated workspace slugs. Leave empty to sync all accessible workspaces.</p>
+              <p id="available-workspaces-hint" class="field-help hidden"></p>
             </div>
 
             <div class="form-group">
@@ -373,6 +380,7 @@
               role="tab"
               aria-selected="false"
               data-filter="reviewing"
+              tabindex="-1"
             >
               <span>Reviewing</span>
               <span id="count-reviewing" class="pill-count">0</span>
@@ -383,6 +391,7 @@
               role="tab"
               aria-selected="false"
               data-filter="authored"
+              tabindex="-1"
             >
               <span>My PRs</span>
               <span id="count-authored" class="pill-count">0</span>
@@ -393,6 +402,7 @@
               role="tab"
               aria-selected="false"
               data-filter="all"
+              tabindex="-1"
             >
               <span>All</span>
               <span id="count-all" class="pill-count">0</span>
@@ -403,6 +413,7 @@
               role="tab"
               aria-selected="false"
               data-filter="snoozed"
+              tabindex="-1"
             >
               <span>Snoozed</span>
               <span id="count-snoozed" class="pill-count">0</span>
@@ -530,8 +541,9 @@
           <div id="jira-tickets-container" class="jira-tickets-container"></div>
 
           <div id="jira-empty-state" class="empty-state compact-empty hidden">
-            <h3>No Jira tickets found</h3>
-            <p>Reference a Jira key (e.g. <code>MEZ-123</code>) in a PR title or branch name to surface it here.</p>
+            <h3 id="jira-empty-title">No Jira tickets found</h3>
+            <p id="jira-empty-message">Reference a Jira key (e.g. <code>MEZ-123</code>) in a PR title or branch name to surface it here.</p>
+            <button id="jira-connect-btn" type="button" class="btn btn-primary btn-sm hidden">Connect Bitbucket</button>
           </div>
         </div>
       </section>

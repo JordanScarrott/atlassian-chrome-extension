@@ -3,7 +3,7 @@ import { sanitizeHttpsUrl } from './config.js';
 /**
  * @typedef {'author' | 'reviewer' | 'both'} PrRole
  * @typedef {'approved' | 'changes_requested' | 'pending' | null} ParticipantReviewState
- * @typedef {'needs_review' | 'changes_requested' | 'ready_to_merge' | 'waiting_reviewers' | 'approved_by_you' | 'changes_requested_by_you' | 'draft'} ActionState
+ * @typedef {'needs_review' | 'changes_requested' | 'ci_failed' | 'ready_to_merge' | 'waiting_reviewers' | 'approved_by_you' | 'changes_requested_by_you' | 'draft'} ActionState
  * @typedef {'action_required' | 'reviewing' | 'authored' | 'all' | 'snoozed'} PrFilter
  */
 
@@ -191,6 +191,9 @@ export function enrichPullRequest(pr, currentUserUuid, options = {}) {
   let isYourTurn = false;
   let priorityScore = 10;
 
+  const ciState = pr.buildStatus?.state ?? null;
+  const ciFailed = ciState === 'FAILED' || ciState === 'STOPPED';
+
   if (pr.draft) {
     actionState = 'draft';
     isYourTurn = false;
@@ -199,7 +202,7 @@ export function enrichPullRequest(pr, currentUserUuid, options = {}) {
     if (myParticipantState === 'pending') {
       actionState = 'needs_review';
       isYourTurn = true;
-      priorityScore = 100;
+      priorityScore = ciFailed ? 92 : 100;
     } else if (myParticipantState === 'changes_requested') {
       actionState = 'changes_requested_by_you';
       isYourTurn = false;
@@ -218,6 +221,10 @@ export function enrichPullRequest(pr, currentUserUuid, options = {}) {
       actionState = 'changes_requested';
       isYourTurn = true;
       priorityScore = 110;
+    } else if (ciFailed) {
+      actionState = 'ci_failed';
+      isYourTurn = true;
+      priorityScore = 105;
     } else if (approvalsCount > 0 && changesRequestedCount === 0) {
       actionState = 'ready_to_merge';
       isYourTurn = true;
@@ -228,11 +235,15 @@ export function enrichPullRequest(pr, currentUserUuid, options = {}) {
       priorityScore = 50;
     }
   } else {
-    // role === 'both': prioritize author blocking states first, then pending self-review, then ready/waiting
+    // role === 'both': prioritize author blocking states first, then CI failures, then pending self-review, then ready/waiting
     if (changesRequestedCount > 0) {
       actionState = 'changes_requested';
       isYourTurn = true;
       priorityScore = 110;
+    } else if (ciFailed) {
+      actionState = 'ci_failed';
+      isYourTurn = true;
+      priorityScore = 105;
     } else if (myParticipantState === 'pending') {
       actionState = 'needs_review';
       isYourTurn = true;
@@ -281,16 +292,20 @@ export function enrichPullRequest(pr, currentUserUuid, options = {}) {
 /**
  * Collect unique Jira tickets referenced across all open enriched PRs,
  * sorted by urgency (`hasYourTurn`, `highestPriority`, `prCount`, key).
+ * Snoozed PRs do not contribute `hasYourTurn: true`.
  *
  * @param {readonly EnrichedPullRequest[]} enrichedPrs
+ * @param {import('./storage.js').SnoozedMap | null | undefined} [snoozedMap]
+ * @param {number} [now]
  * @returns {ActiveJiraTicketSummary[]}
  */
-export function collectActiveJiraTickets(enrichedPrs) {
+export function collectActiveJiraTickets(enrichedPrs, snoozedMap = {}, now = Date.now()) {
   /** @type {Map<string, ActiveJiraTicketSummary>} */
   const ticketMap = new Map();
 
   for (const pr of enrichedPrs) {
     const tickets = Array.isArray(pr.jiraTickets) ? pr.jiraTickets : [];
+    const effectiveYourTurn = Boolean(pr.isYourTurn) && !isPrSnoozed(pr, snoozedMap, now);
     for (const ticket of tickets) {
       const existing = ticketMap.get(ticket.key);
       if (existing) {
@@ -301,7 +316,7 @@ export function collectActiveJiraTickets(enrichedPrs) {
         if (pr.priorityScore > existing.highestPriority) {
           existing.highestPriority = pr.priorityScore;
         }
-        if (pr.isYourTurn) {
+        if (effectiveYourTurn) {
           existing.hasYourTurn = true;
         }
         if (!existing.url && ticket.url) {
@@ -313,7 +328,7 @@ export function collectActiveJiraTickets(enrichedPrs) {
           url: ticket.url,
           prCount: 1,
           highestPriority: pr.priorityScore,
-          hasYourTurn: pr.isYourTurn,
+          hasYourTurn: effectiveYourTurn,
           prKeys: [pr.key]
         });
       }
@@ -393,8 +408,9 @@ export function pruneExpiredSnoozes(snoozedMap, prs, now = Date.now()) {
 }
 
 /**
- * Check if an enriched PR matches a case-insensitive substring query across
- * `title`, `repoName`, `repoFullName`, `authorName`, `sourceBranch`, and `jiraKeys`.
+ * Check if an enriched PR matches a case-insensitive substring query (including CI status tokens
+ * like `ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`, plus build name, `title`, `repoName`,
+ * `repoFullName`, `authorName`, `sourceBranch`, and `jiraKeys`).
  *
  * @param {EnrichedPullRequest} pr
  * @param {string} normalizedQuery
@@ -404,18 +420,60 @@ function matchesSearchQuery(pr, normalizedQuery) {
   if (!normalizedQuery) {
     return true;
   }
+
+  const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
+  const ciState = pr.buildStatus?.state ?? null;
+
+  /** @type {string[]} */
+  const textTokens = [];
+  for (const token of tokens) {
+    if (token === 'ci:failed') {
+      if (ciState !== 'FAILED' && ciState !== 'STOPPED') {
+        return false;
+      }
+      continue;
+    }
+    if (token === 'ci:passing') {
+      if (ciState !== 'SUCCESSFUL') {
+        return false;
+      }
+      continue;
+    }
+    if (token === 'ci:running') {
+      if (ciState !== 'INPROGRESS') {
+        return false;
+      }
+      continue;
+    }
+    if (token === 'ci:stopped') {
+      if (ciState !== 'STOPPED') {
+        return false;
+      }
+      continue;
+    }
+    textTokens.push(token);
+  }
+
+  if (textTokens.length === 0) {
+    return true;
+  }
+
   const haystack = [
     pr.title,
     pr.repoName,
     pr.repoFullName,
     pr.authorName,
     pr.sourceBranch,
+    pr.buildStatus?.name || '',
     ...(Array.isArray(pr.jiraKeys) ? pr.jiraKeys : [])
   ]
     .join(' ')
     .toLowerCase();
 
-  return haystack.includes(normalizedQuery);
+  if (textTokens.length === 1) {
+    return haystack.includes(textTokens[0]);
+  }
+  return haystack.includes(textTokens.join(' '));
 }
 
 /**
