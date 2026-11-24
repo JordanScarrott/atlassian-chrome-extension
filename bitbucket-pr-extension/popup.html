@@ -144,106 +144,214 @@
           role="tabpanel"
           aria-labelledby="settings-account-tab"
         >
-          <!-- Connected Account Summary (shown when authenticated and not replacing token) -->
-          <div id="account-summary-card" class="account-summary-card hidden">
-            <div class="account-summary-header">
-              <div id="account-avatar" class="account-avatar" aria-hidden="true">BB</div>
-              <div class="account-identity">
-                <div id="account-display-name" class="account-name">Bitbucket User</div>
-                <div id="account-username" class="account-meta"></div>
+          <!-- Provider 1: Bitbucket Cloud -->
+          <div class="provider-section">
+            <div class="provider-section-header">
+              <span class="provider-badge provider-bb" aria-hidden="true">BB</span>
+              <h4 class="provider-section-title">Bitbucket Cloud</h4>
+            </div>
+
+            <!-- Connected Account Summary (shown when authenticated and not replacing token) -->
+            <div id="account-summary-card" class="account-summary-card hidden">
+              <div class="account-summary-header">
+                <div id="account-avatar" class="account-avatar" aria-hidden="true">BB</div>
+                <div class="account-identity">
+                  <div id="account-display-name" class="account-name">Bitbucket User</div>
+                  <div id="account-username" class="account-meta"></div>
+                </div>
+                <span id="account-auth-type" class="pill-tag">API Token</span>
               </div>
-              <span id="account-auth-type" class="pill-tag">API Token</span>
-            </div>
 
-            <div class="account-stats-row">
-              <span id="account-workspace-count" class="account-stat">0 workspaces</span>
-              <span class="account-stat-secure">Token stored locally (hidden)</span>
-            </div>
+              <div class="account-stats-row">
+                <span id="account-workspace-count" class="account-stat">0 workspaces</span>
+                <span class="account-stat-secure">Token stored locally (hidden)</span>
+              </div>
 
-            <div class="account-summary-actions">
-              <button id="replace-token-btn" type="button" class="btn btn-secondary btn-sm">Replace Token</button>
-              <button id="sign-out-btn" type="button" class="btn btn-danger-outline btn-sm">Sign Out</button>
-            </div>
+              <div class="account-summary-actions">
+                <button id="replace-token-btn" type="button" class="btn btn-secondary btn-sm">Replace Token</button>
+                <button id="sign-out-btn" type="button" class="btn btn-danger-outline btn-sm">Sign Out</button>
+              </div>
 
-            <div id="sign-out-confirm" class="inline-confirm hidden" role="alertdialog" aria-label="Confirm sign out">
-              <p>Disconnect account and clear cached PRs?</p>
-              <div class="inline-confirm-actions">
-                <button id="confirm-sign-out-btn" type="button" class="btn btn-danger btn-sm">Confirm Sign Out</button>
-                <button id="cancel-sign-out-btn" type="button" class="btn btn-secondary btn-sm">Keep Connected</button>
+              <div id="sign-out-confirm" class="inline-confirm hidden" role="alertdialog" aria-label="Confirm Bitbucket sign out">
+                <p>Disconnect Bitbucket account and clear Bitbucket cached PRs?</p>
+                <div class="inline-confirm-actions">
+                  <button id="confirm-sign-out-btn" type="button" class="btn btn-danger btn-sm">Confirm Sign Out</button>
+                  <button id="cancel-sign-out-btn" type="button" class="btn btn-secondary btn-sm">Keep Connected</button>
+                </div>
               </div>
             </div>
+
+            <!-- Bitbucket Credentials Form -->
+            <form id="credentials-form" class="credentials-form" novalidate>
+              <div class="setup-guide-box">
+                <div class="setup-guide-row">
+                  <span class="setup-guide-title">Bitbucket Cloud Credentials</span>
+                  <a
+                    id="create-api-token-link"
+                    class="external-link"
+                    href="https://id.atlassian.com/manage-profile/security/api-tokens"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >Create API Token ↗</a>
+                </div>
+                <div class="scopes-caption">Required read scopes:</div>
+                <ul id="required-scopes-list" class="scopes-list"></ul>
+              </div>
+
+              <div class="form-group">
+                <label for="auth-type">Authentication Method</label>
+                <select id="auth-type" class="form-control">
+                  <option value="api_token">Atlassian API Token (Email + Token)</option>
+                  <option value="bearer">Access Token (Bearer)</option>
+                </select>
+              </div>
+
+              <div id="username-group" class="form-group">
+                <label for="bitbucket-username">Atlassian Account Email</label>
+                <input
+                  type="email"
+                  id="bitbucket-username"
+                  class="form-control"
+                  placeholder="you@company.com"
+                  autocomplete="username"
+                />
+                <p class="field-help">Used with your Atlassian API Token for Basic authentication.</p>
+              </div>
+
+              <div class="form-group">
+                <label id="token-label" for="bitbucket-token">Atlassian API Token</label>
+                <div class="input-password-wrapper">
+                  <input
+                    type="password"
+                    id="bitbucket-token"
+                    class="form-control"
+                    placeholder="Paste API token here"
+                    autocomplete="off"
+                  />
+                  <button
+                    id="toggle-token-visibility"
+                    type="button"
+                    class="visibility-btn"
+                    title="Show token"
+                    aria-label="Show token"
+                  >
+                    <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+                      <path fill="currentColor" d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+                    </svg>
+                  </button>
+                </div>
+                <p id="token-help" class="field-help">Create a scoped API token in Atlassian Account Security settings.</p>
+              </div>
+
+              <div id="auth-status-banner" class="inline-banner hidden" role="status" aria-live="polite"></div>
+
+              <div class="settings-actions">
+                <button id="test-connection-btn" type="button" class="btn btn-secondary">Test Connection</button>
+                <button id="save-settings-btn" type="submit" class="btn btn-primary">Save &amp; Sync</button>
+                <button id="cancel-settings-btn" type="button" class="btn btn-ghost">Cancel</button>
+              </div>
+            </form>
           </div>
 
-          <!-- Credentials Form -->
-          <form id="credentials-form" class="credentials-form" novalidate>
-            <div class="setup-guide-box">
-              <div class="setup-guide-row">
-                <span class="setup-guide-title">Bitbucket Cloud Credentials</span>
-                <a
-                  id="create-api-token-link"
-                  class="external-link"
-                  href="https://id.atlassian.com/manage-profile/security/api-tokens"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >Create API Token ↗</a>
+          <!-- Provider 2: GitHub (github.com or GitHub Enterprise Server) -->
+          <div class="provider-section">
+            <div class="provider-section-header">
+              <span class="provider-badge provider-gh" aria-hidden="true">GH</span>
+              <h4 class="provider-section-title">GitHub</h4>
+            </div>
+
+            <!-- Connected GitHub Account Summary -->
+            <div id="github-summary-card" class="account-summary-card hidden">
+              <div class="account-summary-header">
+                <div id="github-avatar" class="account-avatar account-avatar-gh" aria-hidden="true">GH</div>
+                <div class="account-identity">
+                  <div id="github-display-name" class="account-name">GitHub User</div>
+                  <div id="github-username" class="account-meta"></div>
+                </div>
+                <span class="pill-tag">PAT</span>
               </div>
-              <div class="scopes-caption">Required read scopes:</div>
-              <ul id="required-scopes-list" class="scopes-list"></ul>
+
+              <div class="account-stats-row">
+                <span id="github-api-url-display" class="account-stat">api.github.com</span>
+                <span class="account-stat-secure">Token stored locally (hidden)</span>
+              </div>
+
+              <div class="account-summary-actions">
+                <button id="github-replace-token-btn" type="button" class="btn btn-secondary btn-sm">Replace Token</button>
+                <button id="github-sign-out-btn" type="button" class="btn btn-danger-outline btn-sm">Sign Out</button>
+              </div>
+
+              <div id="github-sign-out-confirm" class="inline-confirm hidden" role="alertdialog" aria-label="Confirm GitHub sign out">
+                <p>Disconnect GitHub account and remove GitHub PRs?</p>
+                <div class="inline-confirm-actions">
+                  <button id="github-confirm-sign-out-btn" type="button" class="btn btn-danger btn-sm">Confirm Sign Out</button>
+                  <button id="github-cancel-sign-out-btn" type="button" class="btn btn-secondary btn-sm">Keep Connected</button>
+                </div>
+              </div>
             </div>
 
-            <div class="form-group">
-              <label for="auth-type">Authentication Method</label>
-              <select id="auth-type" class="form-control">
-                <option value="api_token">Atlassian API Token (Email + Token)</option>
-                <option value="bearer">Access Token (Bearer)</option>
-              </select>
-            </div>
+            <!-- GitHub Credentials Form -->
+            <form id="github-credentials-form" class="credentials-form" novalidate>
+              <div class="setup-guide-box">
+                <div class="setup-guide-row">
+                  <span class="setup-guide-title">GitHub Personal Access Token</span>
+                  <a
+                    id="create-github-token-link"
+                    class="external-link"
+                    href="https://github.com/settings/tokens"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >Create GitHub Token ↗</a>
+                </div>
+                <div class="scopes-caption">Required read scopes:</div>
+                <ul id="github-required-scopes-list" class="scopes-list"></ul>
+              </div>
 
-            <div id="username-group" class="form-group">
-              <label for="bitbucket-username">Atlassian Account Email</label>
-              <input
-                type="email"
-                id="bitbucket-username"
-                class="form-control"
-                placeholder="you@company.com"
-                autocomplete="username"
-              />
-              <p class="field-help">Used with your Atlassian API Token for Basic authentication.</p>
-            </div>
+              <div class="form-group">
+                <label for="github-token">GitHub Personal Access Token</label>
+                <div class="input-password-wrapper">
+                  <input
+                    type="password"
+                    id="github-token"
+                    class="form-control"
+                    placeholder="ghp_... or github_pat_..."
+                    autocomplete="off"
+                  />
+                  <button
+                    id="toggle-github-token-visibility"
+                    type="button"
+                    class="visibility-btn"
+                    title="Show token"
+                    aria-label="Show GitHub token"
+                  >
+                    <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+                      <path fill="currentColor" d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+                    </svg>
+                  </button>
+                </div>
+                <p class="field-help">Classic PAT (<code>repo</code>) or fine-grained token (<code>Pull requests: Read</code> + <code>Commit statuses: Read</code>).</p>
+              </div>
 
-            <div class="form-group">
-              <label id="token-label" for="bitbucket-token">Atlassian API Token</label>
-              <div class="input-password-wrapper">
+              <div class="form-group">
+                <label for="github-api-url">GitHub API Base URL (optional)</label>
                 <input
-                  type="password"
-                  id="bitbucket-token"
+                  type="url"
+                  id="github-api-url"
                   class="form-control"
-                  placeholder="Paste API token here"
-                  autocomplete="off"
+                  placeholder="https://api.github.com (or GHES /api/v3)"
                 />
-                <button
-                  id="toggle-token-visibility"
-                  type="button"
-                  class="visibility-btn"
-                  title="Show token"
-                  aria-label="Show token"
-                >
-                  <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
-                    <path fill="currentColor" d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
-                  </svg>
-                </button>
+                <p class="field-help">Leave default for github.com, or enter your GitHub Enterprise Server <code>https://.../api/v3</code> URL.</p>
               </div>
-              <p id="token-help" class="field-help">Create a scoped API token in Atlassian Account Security settings.</p>
-            </div>
 
-            <div id="auth-status-banner" class="inline-banner hidden" role="status" aria-live="polite"></div>
+              <div id="github-auth-status-banner" class="inline-banner hidden" role="status" aria-live="polite"></div>
 
-            <div class="settings-actions">
-              <button id="test-connection-btn" type="button" class="btn btn-secondary">Test Connection</button>
-              <button id="save-settings-btn" type="submit" class="btn btn-primary">Save &amp; Sync</button>
-              <button id="cancel-settings-btn" type="button" class="btn btn-ghost">Cancel</button>
-            </div>
-          </form>
+              <div class="settings-actions">
+                <button id="test-github-connection-btn" type="button" class="btn btn-secondary">Test Connection</button>
+                <button id="save-github-settings-btn" type="submit" class="btn btn-primary">Save &amp; Sync</button>
+                <button id="cancel-github-settings-btn" type="button" class="btn btn-ghost">Cancel</button>
+              </div>
+            </form>
+          </div>
         </div>
 
         <!-- Sub-panel 2: Preferences -->
@@ -420,7 +528,7 @@
             </button>
           </div>
 
-          <!-- Instant Search Bar -->
+          <!-- Instant Search Bar & By Ticket Toggle -->
           <div class="search-row">
             <div class="search-input-wrapper">
               <svg class="search-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
@@ -446,6 +554,13 @@
                 </svg>
               </button>
             </div>
+            <button
+              id="group-by-ticket-btn"
+              type="button"
+              class="group-toggle-btn"
+              aria-pressed="false"
+              title="Group PRs by ticket (g)"
+            >By Ticket</button>
             <span id="pr-count-title" class="pr-summary-caption">0 PRs</span>
           </div>
         </div>
@@ -453,7 +568,7 @@
         <!-- Non-blocking Status Banners (positioned ABOVE PR list so cached PRs remain visible) -->
         <div id="loading-indicator" class="status-alert info hidden" role="status" aria-live="polite">
           <div class="spinner" aria-hidden="true"></div>
-          <span>Syncing Bitbucket pull requests...</span>
+          <span>Syncing pull requests...</span>
         </div>
 
         <div id="error-alert" class="status-alert error hidden" role="alert">
@@ -467,7 +582,7 @@
         <div id="rate-limit-banner" class="status-alert warning hidden" role="status">
           <div class="alert-content">
             <strong>Rate Limit Notice</strong>
-            <p id="rate-limit-message">Approaching Bitbucket API rate limit. Requests are being paced automatically.</p>
+            <p id="rate-limit-message">Approaching upstream API rate limit. Requests are being paced automatically.</p>
           </div>
         </div>
 
@@ -476,6 +591,12 @@
             <strong>Polling Paused</strong>
             <p id="backoff-message">Background polling paused briefly after an upstream error.</p>
           </div>
+        </div>
+
+        <!-- Related PRs Scope Banner -->
+        <div id="related-scope-banner" class="related-scope-banner hidden" role="status" aria-live="polite">
+          <span id="related-scope-text" class="related-scope-text">Related PRs</span>
+          <button id="clear-related-scope-btn" type="button" class="btn btn-secondary btn-sm">Show all</button>
         </div>
 
         <!-- Scrollable PR List -->
@@ -501,11 +622,14 @@
           <svg viewBox="0 0 24 24" width="44" height="44" class="empty-icon" aria-hidden="true">
             <path fill="#0052CC" d="M12.65 10A5.99 5.99 0 0 0 7 6c-3.31 0-6 2.69-6 6s2.69 6 6 6a5.99 5.99 0 0 0 5.65-4H17v4h4v-4h2v-4H12.65zM7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/>
           </svg>
-          <h3>Connect your Bitbucket account</h3>
+          <h3>Connect Bitbucket or GitHub</h3>
           <p>
-            Track PRs waiting on your review, monitor approvals on your PRs, and jump straight to linked Jira tickets.
+            Track PRs waiting on your review across Bitbucket Cloud &amp; GitHub, group cross-repo work by ticket, and jump straight to Jira.
           </p>
-          <button id="setup-hint-btn" type="button" class="btn btn-primary">Connect Bitbucket</button>
+          <div class="onboarding-actions">
+            <button id="setup-hint-btn" type="button" class="btn btn-primary">Connect Bitbucket</button>
+            <button id="setup-hint-github-btn" type="button" class="btn btn-secondary">Connect GitHub</button>
+          </div>
         </div>
       </section>
 
@@ -543,7 +667,7 @@
           <div id="jira-empty-state" class="empty-state compact-empty hidden">
             <h3 id="jira-empty-title">No Jira tickets found</h3>
             <p id="jira-empty-message">Reference a Jira key (e.g. <code>MEZ-123</code>) in a PR title or branch name to surface it here.</p>
-            <button id="jira-connect-btn" type="button" class="btn btn-primary btn-sm hidden">Connect Bitbucket</button>
+            <button id="jira-connect-btn" type="button" class="btn btn-primary btn-sm hidden">Connect Account</button>
           </div>
         </div>
       </section>
@@ -655,14 +779,16 @@
       </div>
       <dl class="shortcuts-list">
         <div class="shortcut-row"><dt><kbd>/</kbd></dt><dd>Focus PR search</dd></div>
+        <div class="shortcut-row"><dt><kbd>g</kbd></dt><dd>Toggle Group by Ticket</dd></div>
         <div class="shortcut-row"><dt><kbd>j</kbd> / <kbd>↓</kbd></dt><dd>Next PR card</dd></div>
         <div class="shortcut-row"><dt><kbd>k</kbd> / <kbd>↑</kbd></dt><dd>Previous PR card</dd></div>
+        <div class="shortcut-row"><dt><kbd>h</kbd> / <kbd>l</kbd></dt><dd>Swipe Ticket Deck slide</dd></div>
         <div class="shortcut-row"><dt><kbd>Enter</kbd></dt><dd>Open selected PR</dd></div>
         <div class="shortcut-row"><dt><kbd>c</kbd></dt><dd>Copy selected PR link</dd></div>
         <div class="shortcut-row"><dt><kbd>s</kbd></dt><dd>Snooze 4h / Unsnooze PR</dd></div>
         <div class="shortcut-row"><dt><kbd>r</kbd></dt><dd>Manual refresh</dd></div>
         <div class="shortcut-row"><dt><kbd>1</kbd>–<kbd>4</kbd></dt><dd>Switch top tabs</dd></div>
-        <div class="shortcut-row"><dt><kbd>Esc</kbd></dt><dd>Clear search / close panel</dd></div>
+        <div class="shortcut-row"><dt><kbd>Esc</kbd></dt><dd>Clear scope/search / close panel</dd></div>
       </dl>
     </aside>
 

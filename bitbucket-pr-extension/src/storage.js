@@ -1,7 +1,17 @@
-import { DEFAULT_PREFERENCES, STORAGE_KEYS, THROTTLE_CONFIG, sanitizeHttpsUrl } from './config.js';
+import {
+  DEFAULT_PREFERENCES,
+  STORAGE_KEYS,
+  THROTTLE_CONFIG,
+  getEffectiveGitHubApiBaseUrl,
+  sanitizeHttpsUrl
+} from './config.js';
 
 /**
  * @typedef {'api_token' | 'bearer'} AuthType
+ */
+
+/**
+ * @typedef {'bitbucket' | 'github'} PrProvider
  */
 
 /**
@@ -35,8 +45,15 @@ import { DEFAULT_PREFERENCES, STORAGE_KEYS, THROTTLE_CONFIG, sanitizeHttpsUrl } 
  */
 
 /**
+ * @typedef {Object} GitHubCredentials
+ * @property {string} token
+ * @property {string} apiBaseUrl
+ */
+
+/**
  * @typedef {Object} CachedUser
  * @property {string} uuid
+ * @property {string} [accountId]
  * @property {string} displayName
  * @property {string} username
  * @property {string | null} avatarUrl
@@ -85,9 +102,11 @@ import { DEFAULT_PREFERENCES, STORAGE_KEYS, THROTTLE_CONFIG, sanitizeHttpsUrl } 
 
 /**
  * @typedef {Object} PullRequestRecord
+ * @property {PrProvider} [provider]
  * @property {string} key
  * @property {number} id
  * @property {string} title
+ * @property {string} [description]
  * @property {string} state
  * @property {string} url
  * @property {string} repoFullName
@@ -244,6 +263,10 @@ export function validatePreferences(raw, base = DEFAULT_PREFERENCES) {
     ? source.compactMode
     : base.compactMode;
 
+  const groupByTicket = typeof source.groupByTicket === 'boolean'
+    ? source.groupByTicket
+    : Boolean(base.groupByTicket);
+
   const workspacesFilter = source.workspacesFilter !== undefined
     ? sanitizeStringList(source.workspacesFilter)
     : [...base.workspacesFilter];
@@ -273,6 +296,7 @@ export function validatePreferences(raw, base = DEFAULT_PREFERENCES) {
     staleThresholdHours,
     defaultFilter,
     compactMode,
+    groupByTicket,
     workspacesFilter,
     reposFilter,
     jiraBaseUrlOverride
@@ -371,6 +395,110 @@ export function createStorage(area = typeof chrome !== 'undefined' ? chrome?.sto
         STORAGE_KEYS.SYNCED_WORKSPACES,
         STORAGE_KEYS.SYNC_STATE
       ]);
+    },
+
+    /**
+     * Read stored GitHub PAT credentials and effective API base URL.
+     * Returns `null` if no GitHub token is configured.
+     *
+     * @returns {Promise<GitHubCredentials | null>}
+     */
+    async getGitHubCredentials() {
+      const data = await area.get([
+        STORAGE_KEYS.GITHUB_TOKEN,
+        STORAGE_KEYS.GITHUB_API_BASE_URL
+      ]);
+      const storedToken = data[STORAGE_KEYS.GITHUB_TOKEN];
+      const token = typeof storedToken === 'string' ? storedToken.trim() : '';
+      if (!token) {
+        return null;
+      }
+
+      const rawBaseVal = data[STORAGE_KEYS.GITHUB_API_BASE_URL];
+      const rawBase = typeof rawBaseVal === 'string' ? rawBaseVal : '';
+      return {
+        token,
+        apiBaseUrl: getEffectiveGitHubApiBaseUrl(rawBase)
+      };
+    },
+
+    /**
+     * Save GitHub PAT credentials and optional normalized Enterprise API base URL.
+     *
+     * @param {Partial<GitHubCredentials>} creds
+     * @returns {Promise<GitHubCredentials>}
+     */
+    async saveGitHubCredentials(creds) {
+      const token = typeof creds?.token === 'string' ? creds.token.trim() : '';
+      const rawBase = typeof creds?.apiBaseUrl === 'string' ? creds.apiBaseUrl.trim() : '';
+      const apiBaseUrl = getEffectiveGitHubApiBaseUrl(rawBase);
+
+      await area.set({
+        [STORAGE_KEYS.GITHUB_TOKEN]: token,
+        [STORAGE_KEYS.GITHUB_API_BASE_URL]: rawBase ? apiBaseUrl : ''
+      });
+
+      return { token, apiBaseUrl };
+    },
+
+    /**
+     * Clear GitHub credentials and cached GitHub user profile while preserving
+     * Bitbucket credentials, preferences, snoozed PRs, and product feedback.
+     *
+     * @returns {Promise<void>}
+     */
+    async clearGitHubCredentialsAndCache() {
+      await area.remove([
+        STORAGE_KEYS.GITHUB_TOKEN,
+        STORAGE_KEYS.GITHUB_API_BASE_URL,
+        STORAGE_KEYS.CACHED_GITHUB_USER
+      ]);
+    },
+
+    /**
+     * Read cached GitHub user profile.
+     *
+     * @returns {Promise<CachedUser | null>}
+     */
+    async getCachedGitHubUser() {
+      const data = await area.get([STORAGE_KEYS.CACHED_GITHUB_USER]);
+      const raw = data[STORAGE_KEYS.CACHED_GITHUB_USER];
+      if (!raw || typeof raw !== 'object') {
+        return null;
+      }
+      const entry = /** @type {Record<string, unknown>} */ (raw);
+      if (typeof entry.uuid !== 'string' || typeof entry.cachedAt !== 'number') {
+        return null;
+      }
+      const avatarUrl = typeof entry.avatarUrl === 'string' ? sanitizeHttpsUrl(entry.avatarUrl) : null;
+      return {
+        uuid: entry.uuid,
+        ...(typeof entry.accountId === 'string' ? { accountId: entry.accountId } : {}),
+        displayName: typeof entry.displayName === 'string' ? entry.displayName : 'GitHub User',
+        username: typeof entry.username === 'string' ? entry.username : '',
+        avatarUrl,
+        cachedAt: entry.cachedAt
+      };
+    },
+
+    /**
+     * Persist cached GitHub user profile.
+     *
+     * @param {CachedUser} user
+     * @returns {Promise<void>}
+     */
+    async setCachedGitHubUser(user) {
+      const avatarUrl = typeof user.avatarUrl === 'string' ? sanitizeHttpsUrl(user.avatarUrl) : null;
+      await area.set({
+        [STORAGE_KEYS.CACHED_GITHUB_USER]: {
+          uuid: user.uuid,
+          ...(typeof user.accountId === 'string' ? { accountId: user.accountId } : {}),
+          displayName: user.displayName,
+          username: user.username,
+          avatarUrl,
+          cachedAt: user.cachedAt
+        }
+      });
     },
 
     /**

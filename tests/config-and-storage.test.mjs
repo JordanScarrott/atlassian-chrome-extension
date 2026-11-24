@@ -8,6 +8,7 @@ import {
   DEFAULT_PREFERENCES,
   STORAGE_KEYS,
   THROTTLE_CONFIG,
+  getEffectiveGitHubApiBaseUrl,
   getEffectiveJiraBaseUrl,
   sanitizeHttpsUrl
 } from '../bitbucket-pr-extension/src/config.js';
@@ -329,3 +330,62 @@ test('storage getCachedBuildStatuses and setCachedBuildStatuses sanitize URLs an
   assert.equal(loaded[`acme/repo:commit-${total - 1}`]?.url, null);
   assert.equal(loaded['acme/repo:commit-50']?.url, 'https://ci.example.com/builds/50');
 });
+
+test('GitHub config constants, getEffectiveGitHubApiBaseUrl, groupByTicket, and storage GitHub helpers work cleanly', async () => {
+  assert.equal(CENTRAL_URLS.GITHUB_API_BASE_URL, 'https://api.github.com');
+  assert.equal(CENTRAL_URLS.GITHUB_WEB_BASE_URL, 'https://github.com');
+  assert.equal(AUTH_SETUP_LINKS.githubTokens, 'https://github.com/settings/tokens');
+  assert.equal(
+    AUTH_SETUP_LINKS.githubFineGrainedDocs,
+    'https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens'
+  );
+  assert.deepEqual(AUTH_SETUP_LINKS.githubRequiredScopes, [
+    'repo (or fine-grained Pull requests: Read + Commit statuses: Read)'
+  ]);
+  assert.equal(STORAGE_KEYS.GITHUB_TOKEN, 'githubToken');
+  assert.equal(STORAGE_KEYS.GITHUB_API_BASE_URL, 'githubApiBaseUrl');
+  assert.equal(STORAGE_KEYS.CACHED_GITHUB_USER, 'cachedGitHubUser');
+  assert.equal(DEFAULT_PREFERENCES.groupByTicket, false);
+
+  assert.equal(getEffectiveGitHubApiBaseUrl(), 'https://api.github.com');
+  assert.equal(
+    getEffectiveGitHubApiBaseUrl('https://github.company.com/api/v3///'),
+    'https://github.company.com/api/v3'
+  );
+  assert.equal(getEffectiveGitHubApiBaseUrl('http://insecure.example.com'), 'https://api.github.com');
+
+  const prefs = validatePreferences({ groupByTicket: true });
+  assert.equal(prefs.groupByTicket, true);
+  assert.equal(validatePreferences({ groupByTicket: 'yes' }).groupByTicket, false);
+
+  const area = createMemoryStorageArea();
+  const storage = createStorage(area);
+  await storage.saveCredentials({ authType: 'bearer', username: '', token: 'bb-tok' });
+  await storage.savePreferences({ groupByTicket: true });
+  await storage.saveGitHubCredentials({
+    token: '  ghp_tok  ',
+    apiBaseUrl: 'https://github.corp.example.com/api/v3/'
+  });
+  await storage.setCachedGitHubUser({
+    uuid: 'gh:7',
+    accountId: '7',
+    displayName: 'Octo',
+    username: 'octo',
+    avatarUrl: 'https://avatars.githubusercontent.com/u/7',
+    cachedAt: 5000
+  });
+
+  assert.deepEqual(await storage.getGitHubCredentials(), {
+    token: 'ghp_tok',
+    apiBaseUrl: 'https://github.corp.example.com/api/v3'
+  });
+  assert.equal((await storage.getCachedGitHubUser())?.uuid, 'gh:7');
+
+  // clearGitHubCredentialsAndCache removes GitHub state while preserving Bitbucket credentials and preferences
+  await storage.clearGitHubCredentialsAndCache();
+  assert.equal(await storage.getGitHubCredentials(), null);
+  assert.equal(await storage.getCachedGitHubUser(), null);
+  assert.equal((await storage.getCredentials())?.token, 'bb-tok');
+  assert.equal((await storage.getPreferences()).groupByTicket, true);
+});
+

@@ -24,6 +24,7 @@
  * @property {24 | 48 | 72} staleThresholdHours
  * @property {'action_required' | 'reviewing' | 'authored' | 'all'} defaultFilter
  * @property {boolean} compactMode
+ * @property {boolean} groupByTicket
  * @property {readonly string[]} workspacesFilter
  * @property {readonly string[]} reposFilter
  * @property {string} jiraBaseUrlOverride
@@ -40,7 +41,22 @@ export const CENTRAL_URLS = Object.freeze({
   CONFLUENCE_URL: '',
 
   BITBUCKET_API_BASE_URL: 'https://api.bitbucket.org/2.0',
-  BITBUCKET_WEB_BASE_URL: 'https://bitbucket.org'
+  BITBUCKET_WEB_BASE_URL: 'https://bitbucket.org',
+
+  /**
+   * ==========================================================================
+   * GITHUB & GITHUB ENTERPRISE SERVER URLS
+   * ==========================================================================
+   * For github.com, keep the defaults below.
+   * For GitHub Enterprise Server (GHES), hardcode your company URLs ONCE below
+   * (with `https://` and NO trailing slash), for example:
+   *   GITHUB_API_BASE_URL: 'https://github.company.com/api/v3',
+   *   GITHUB_WEB_BASE_URL: 'https://github.company.com',
+   * Users can also override the API Base URL in Settings without code edits.
+   * ==========================================================================
+   */
+  GITHUB_API_BASE_URL: 'https://api.github.com',
+  GITHUB_WEB_BASE_URL: 'https://github.com'
 });
 
 export const AUTH_SETUP_LINKS = Object.freeze({
@@ -51,6 +67,11 @@ export const AUTH_SETUP_LINKS = Object.freeze({
     'read:workspace:bitbucket',
     'read:repository:bitbucket',
     'read:pullrequest:bitbucket'
+  ]),
+  githubTokens: 'https://github.com/settings/tokens',
+  githubFineGrainedDocs: 'https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens',
+  githubRequiredScopes: Object.freeze([
+    'repo (or fine-grained Pull requests: Read + Commit statuses: Read)'
   ])
 });
 
@@ -84,6 +105,7 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   staleThresholdHours: 48,
   defaultFilter: 'action_required',
   compactMode: false,
+  groupByTicket: false,
   workspacesFilter: Object.freeze(/** @type {string[]} */ ([])),
   reposFilter: Object.freeze(/** @type {string[]} */ ([])),
   jiraBaseUrlOverride: ''
@@ -93,6 +115,9 @@ export const STORAGE_KEYS = Object.freeze({
   AUTH_TYPE: 'authType',
   BITBUCKET_USERNAME: 'bitbucketUsername',
   BITBUCKET_TOKEN: 'bitbucketToken',
+  GITHUB_TOKEN: 'githubToken',
+  GITHUB_API_BASE_URL: 'githubApiBaseUrl',
+  CACHED_GITHUB_USER: 'cachedGitHubUser',
   PREFERENCES: 'preferences',
   CACHED_USER: 'cachedUser',
   CACHED_WORKSPACES: 'cachedWorkspaces',
@@ -159,6 +184,23 @@ export function getEffectiveJiraBaseUrl(preferences) {
     return '';
   }
 
+  const parsed = new URL(safeUrl);
+  const cleanPath = parsed.pathname.replace(/\/+$/, '');
+  return `${parsed.origin}${cleanPath}`;
+}
+
+/**
+ * Resolve the effective GitHub API base URL (normalized `https://...` with no trailing slash).
+ * Uses `overrideUrl` when valid `https:`, otherwise falls back to `CENTRAL_URLS.GITHUB_API_BASE_URL`.
+ *
+ * @param {string | null | undefined} [overrideUrl]
+ * @returns {string}
+ */
+export function getEffectiveGitHubApiBaseUrl(overrideUrl) {
+  const overrideRaw = typeof overrideUrl === 'string' ? overrideUrl.trim() : '';
+  const fallbackRaw = CENTRAL_URLS.GITHUB_API_BASE_URL.trim() || 'https://api.github.com';
+  const candidate = overrideRaw || fallbackRaw;
+  const safeUrl = sanitizeHttpsUrl(candidate) || sanitizeHttpsUrl(fallbackRaw) || 'https://api.github.com';
   const parsed = new URL(safeUrl);
   const cleanPath = parsed.pathname.replace(/\/+$/, '');
   return `${parsed.origin}${cleanPath}`;

@@ -4,11 +4,16 @@ import assert from 'node:assert/strict';
 import {
   buildReviewerBreakdown,
   buildReviewerBreakdownTooltip,
+  filterPrsByRelatedTicket,
   formatFooterUpdated,
   formatRelativeAge,
   formatRemainingSnooze,
   getCiBadgeDescriptor,
-  getCrossFilterEmptyHint
+  getCrossFilterEmptyHint,
+  getDeckDotDescriptor,
+  getHeaderConnectionDescriptor,
+  getOffscreenDeckAttention,
+  sortDeckPrs
 } from '../bitbucket-pr-extension/src/popup-helpers.js';
 import { enrichPullRequest } from '../bitbucket-pr-extension/src/pr-triage.js';
 
@@ -387,4 +392,160 @@ test('getCrossFilterEmptyHint detects cross-filter search hits while respecting 
     getCrossFilterEmptyHint({ activeFilter: 'invalid_filter', searchQuery: 'billing', allPrs, snoozedMap, now: NOW }),
     null
   );
+});
+
+test('getHeaderConnectionDescriptor handles none, single BB, single GH, dual BB+GH, error, and rate-limit states', () => {
+  const none = getHeaderConnectionDescriptor({
+    bitbucketAuthenticated: false,
+    github: { isAuthenticated: false, apiBaseUrl: 'https://api.github.com', user: null }
+  });
+  assert.equal(none.variant, 'neutral');
+  assert.equal(none.text, 'Not connected');
+
+  const bbOnly = getHeaderConnectionDescriptor({
+    bitbucketAuthenticated: true,
+    bitbucketUser: { uuid: '{me}', displayName: 'Jordan S', username: 'jscarrott', avatarUrl: null, cachedAt: NOW },
+    workspaces: [{ slug: 'acme', name: 'Acme' }],
+    github: { isAuthenticated: false, apiBaseUrl: 'https://api.github.com', user: null }
+  });
+  assert.equal(bbOnly.variant, 'connected');
+  assert.equal(bbOnly.text, 'Jordan S');
+  assert.match(bbOnly.title, /Bitbucket: Jordan S \(acme\)/);
+
+  const ghOnly = getHeaderConnectionDescriptor({
+    bitbucketAuthenticated: false,
+    github: {
+      isAuthenticated: true,
+      apiBaseUrl: 'https://github.corp.example.com/api/v3',
+      user: { uuid: 'gh:1', displayName: 'Jordan GH', username: 'jscarrott', avatarUrl: null, cachedAt: NOW }
+    }
+  });
+  assert.equal(ghOnly.variant, 'connected');
+  assert.equal(ghOnly.text, 'GitHub (@jscarrott)');
+  assert.match(ghOnly.title, /https:\/\/github\.corp\.example\.com\/api\/v3/);
+
+  const dual = getHeaderConnectionDescriptor({
+    bitbucketAuthenticated: true,
+    bitbucketUser: { uuid: '{me}', displayName: 'Jordan S', username: 'jscarrott', avatarUrl: null, cachedAt: NOW },
+    syncedWorkspaces: ['acme'],
+    github: {
+      isAuthenticated: true,
+      apiBaseUrl: 'https://api.github.com',
+      user: { uuid: 'gh:1', displayName: 'Jordan GH', username: 'jscarrott', avatarUrl: null, cachedAt: NOW }
+    }
+  });
+  assert.equal(dual.variant, 'connected');
+  assert.equal(dual.text, 'Bitbucket + GitHub');
+  assert.match(dual.title, /Bitbucket: Jordan S \(acme\)/);
+  assert.match(dual.title, /GitHub: Jordan GH \(@jscarrott\)/);
+
+  const errored = getHeaderConnectionDescriptor({
+    bitbucketAuthenticated: true,
+    bitbucketUsername: 'jordan@acme.com',
+    error: 'GitHub: 401',
+    github: { isAuthenticated: true, apiBaseUrl: 'https://api.github.com', user: null }
+  });
+  assert.equal(errored.variant, 'error');
+  assert.equal(errored.text, 'Sync issue');
+  assert.match(errored.title, /GitHub: 401/);
+
+  const limited = getHeaderConnectionDescriptor({
+    bitbucketAuthenticated: false,
+    github: { isAuthenticated: true, apiBaseUrl: 'https://api.github.com', user: null },
+    rateLimitWarning: true,
+    now: NOW
+  });
+  assert.equal(limited.variant, 'warning');
+  assert.equal(limited.text, 'Rate limited');
+});
+
+test('filterPrsByRelatedTicket, sortDeckPrs, getDeckDotDescriptor, and getOffscreenDeckAttention work across BB+GH', () => {
+  const waitingPr = makeEnrichedPr({
+    provider: 'bitbucket',
+    key: 'acme/api#1',
+    id: 1,
+    title: 'MEZ-700 API schema',
+    authorUuid: ME,
+    reviewers: [{ uuid: '{rev}', displayName: 'Rev' }],
+    participants: []
+  });
+
+  const needsReviewPr = makeEnrichedPr({
+    provider: 'github',
+    key: 'gh:acme/web#2',
+    id: 2,
+    title: 'MEZ-700 Web UI',
+    authorUuid: 'gh:other',
+    reviewers: [{ uuid: ME, displayName: 'Me' }],
+    participants: []
+  });
+
+  const ciFailedAuthoredPr = makeEnrichedPr({
+    provider: 'github',
+    key: 'gh:acme/worker#3',
+    id: 3,
+    title: 'MEZ-700 Worker job (#44)',
+    authorUuid: ME,
+    buildStatus: {
+      state: 'FAILED',
+      totalCount: 1,
+      passedCount: 0,
+      failedCount: 1,
+      inProgressCount: 0,
+      stoppedCount: 0,
+      url: 'https://ci.example.com/3',
+      name: 'CI',
+      updatedOn: '2026-11-23T11:50:00Z',
+      commitHash: 'abc',
+      cachedAt: NOW
+    }
+  });
+
+  const unrelatedPr = makeEnrichedPr({
+    key: 'acme/docs#9',
+    id: 9,
+    title: 'MEZ-999 Unrelated docs'
+  });
+
+  const scoped = filterPrsByRelatedTicket([waitingPr, unrelatedPr, needsReviewPr, ciFailedAuthoredPr], 'MEZ-700');
+  assert.deepEqual(scoped.map((p) => p.key), ['gh:acme/worker#3', 'gh:acme/web#2', 'acme/api#1']);
+  assert.deepEqual(
+    filterPrsByRelatedTicket([waitingPr, ciFailedAuthoredPr], '#44').map((p) => p.key),
+    ['gh:acme/worker#3']
+  );
+
+  const deck = sortDeckPrs([waitingPr, needsReviewPr, ciFailedAuthoredPr]);
+  assert.deepEqual(deck.map((p) => p.key), ['gh:acme/worker#3', 'gh:acme/web#2', 'acme/api#1']);
+
+  assert.equal(getDeckDotDescriptor(ciFailedAuthoredPr).colorClass, 'dot-red');
+  assert.match(getDeckDotDescriptor(ciFailedAuthoredPr).tooltip, /CI Failed/);
+  assert.equal(getDeckDotDescriptor(needsReviewPr).colorClass, 'dot-blue');
+  assert.equal(getDeckDotDescriptor(waitingPr).colorClass, 'dot-gray');
+
+  const readyPr = makeEnrichedPr({
+    key: 'acme/ready#4',
+    id: 4,
+    authorUuid: ME,
+    participants: [{ uuid: '{r1}', displayName: 'R1', role: 'REVIEWER', approved: true, state: 'approved' }]
+  });
+  assert.equal(getDeckDotDescriptor(readyPr).colorClass, 'dot-green');
+
+  // On slide 0 (ciFailedAuthoredPr): slide 1 (needsReviewPr) is off-screen right -> '+1 needs action →'
+  const off0 = getOffscreenDeckAttention(deck, 0, {}, NOW);
+  assert.equal(off0?.rightCount, 1);
+  assert.equal(off0?.leftCount, 0);
+  assert.equal(off0?.targetIndex, 1);
+  assert.equal(off0?.label, '+1 needs action →');
+
+  // On slide 2 (waitingPr): slides 0 and 1 are off-screen left -> '← +2 needs action'
+  const off2 = getOffscreenDeckAttention(deck, 2, {}, NOW);
+  assert.equal(off2?.leftCount, 2);
+  assert.equal(off2?.targetIndex, 0);
+  assert.equal(off2?.label, '← +2 needs action');
+
+  // If slide 1 is snoozed, sliding onto slide 0 leaves 0 off-screen actionable PRs
+  const snoozed = {
+    [needsReviewPr.key]: { until: NOW + 60_000, prUpdatedOn: needsReviewPr.updatedOn }
+  };
+  assert.equal(getOffscreenDeckAttention(deck, 0, snoozed, NOW), null);
 });

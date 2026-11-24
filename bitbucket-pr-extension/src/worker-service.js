@@ -1,9 +1,11 @@
 import {
   DEFAULT_PREFERENCES,
+  getEffectiveGitHubApiBaseUrl,
   getEffectiveJiraBaseUrl,
   sanitizeHttpsUrl
 } from './config.js';
 import { BitbucketApiError, createBitbucketClient } from './bitbucket-client.js';
+import { GitHubApiError, createGitHubClient } from './github-client.js';
 import { findNewlyActionablePrs } from './notifications.js';
 import {
   computeCounts,
@@ -72,19 +74,38 @@ const MAX_NOTIFICATION_URL_ENTRIES = 100;
  */
 
 /**
- * Build a shallow, deterministic array of enriched PRs from stored/raw PR records.
+ * Resolve the appropriate current-user UUID for a PR based on its provider.
+ *
+ * @param {import('./storage.js').PullRequestRecord} pr
+ * @param {string} bitbucketUserUuid
+ * @param {string} githubUserUuid
+ * @returns {string}
+ */
+function resolveProviderUserUuid(pr, bitbucketUserUuid, githubUserUuid) {
+  if (pr.provider === 'github' || (typeof pr.key === 'string' && pr.key.startsWith('gh:'))) {
+    return githubUserUuid;
+  }
+  return bitbucketUserUuid;
+}
+
+/**
+ * Build a shallow, deterministic array of enriched PRs from stored/raw PR records,
+ * matching each PR with its provider's current user UUID.
  *
  * @param {readonly import('./storage.js').PullRequestRecord[]} prs
- * @param {string} currentUserUuid
+ * @param {string | { bitbucket?: string, github?: string }} userUuids
  * @param {import('./config.js').Preferences} preferences
  * @param {number} now
  * @returns {import('./pr-triage.js').EnrichedPullRequest[]}
  */
-function enrichPrList(prs, currentUserUuid, preferences, now) {
+function enrichPrList(prs, userUuids, preferences, now) {
   const jiraBaseUrl = getEffectiveJiraBaseUrl(preferences);
   const staleThresholdHours = preferences.staleThresholdHours || DEFAULT_PREFERENCES.staleThresholdHours;
+  const bitbucketUserUuid = typeof userUuids === 'string' ? userUuids : (userUuids?.bitbucket ?? '');
+  const githubUserUuid = typeof userUuids === 'string' ? '' : (userUuids?.github ?? '');
+
   return prs.map((pr) =>
-    enrichPullRequest(pr, currentUserUuid, {
+    enrichPullRequest(pr, resolveProviderUserUuid(pr, bitbucketUserUuid, githubUserUuid), {
       staleThresholdHours,
       jiraBaseUrl,
       now
@@ -151,6 +172,7 @@ export function computeBadgeState({
  * @param {{
  *   storage?: ReturnType<typeof createStorage>,
  *   client?: ReturnType<typeof createBitbucketClient>,
+ *   githubClient?: ReturnType<typeof createGitHubClient>,
  *   chromeApi?: ChromeApiLike,
  *   notificationStore?: import('./storage.js').StorageAreaLike,
  *   nowFn?: () => number,
@@ -163,6 +185,7 @@ export function createWorkerService(deps = {}) {
   const nowFn = deps.nowFn ?? Date.now;
   const randomFn = deps.randomFn ?? Math.random;
   const client = deps.client ?? createBitbucketClient({ nowFn });
+  const githubClient = deps.githubClient ?? createGitHubClient({ nowFn });
   const notificationStore = deps.notificationStore ?? chromeApi.storage?.session ?? chromeApi.storage?.local;
 
   /** @type {Map<string, string>} */
@@ -306,8 +329,40 @@ export function createWorkerService(deps = {}) {
       /Authentication failed/i.test(errorMessage) ||
       /Access denied/i.test(errorMessage) ||
       /API token/i.test(errorMessage) ||
+      /Personal Access Token/i.test(errorMessage) ||
       /account email is required/i.test(errorMessage)
     );
+  }
+
+  /**
+   * Extract normalized API error metadata across `BitbucketApiError`, `GitHubApiError`, and plain Error objects.
+   *
+   * @param {unknown} err
+   * @param {string} fallbackMessage
+   * @returns {{ status: number | null, isRateLimited: boolean, isAuthError: boolean, isTransient: boolean, retryAfter: number | null, message: string }}
+   */
+  function extractApiErrorInfo(err, fallbackMessage) {
+    const isKnownApiError = err instanceof BitbucketApiError || err instanceof GitHubApiError;
+    const errObj = err && typeof err === 'object' ? /** @type {Record<string, unknown>} */ (err) : null;
+    const status = isKnownApiError
+      ? err.status
+      : (errObj && typeof errObj.status === 'number' ? errObj.status : null);
+    const code = isKnownApiError
+      ? err.code
+      : (errObj && typeof errObj.code === 'string' ? errObj.code : null);
+    const isRateLimited = status === 429 || code === 'RATE_LIMITED';
+    const isAuthError = isKnownApiError
+      ? err.isAuthError
+      : Boolean(errObj && errObj.isAuthError);
+    const isTransient = isKnownApiError
+      ? err.isTransient
+      : Boolean(errObj && errObj.isTransient);
+    const retryAfter = isKnownApiError
+      ? err.retryAfter
+      : (errObj && typeof errObj.retryAfter === 'number' ? errObj.retryAfter : null);
+    const message = err instanceof Error && err.message ? err.message : fallbackMessage;
+
+    return { status, isRateLimited, isAuthError, isTransient, retryAfter, message };
   }
 
   /**
@@ -363,25 +418,32 @@ export function createWorkerService(deps = {}) {
    */
   async function refreshBadgeFromStorage() {
     const now = nowFn();
-    const [creds, preferences, snapshot, cachedUser, snoozedMap] = await Promise.all([
+    const [bbCreds, ghCreds, preferences, snapshot, cachedBbUser, cachedGhUser, snoozedMap] = await Promise.all([
       storage.getCredentials(),
+      storage.getGitHubCredentials(),
       storage.getPreferences(),
       storage.getPrSnapshot(),
       storage.getCachedUser(),
+      storage.getCachedGitHubUser(),
       storage.getSnoozedMap()
     ]);
 
-    const currentUserUuid = cachedUser?.uuid ?? '';
-    const enriched = enrichPrList(snapshot.prList, currentUserUuid, preferences, now);
+    const enriched = enrichPrList(
+      snapshot.prList,
+      { bitbucket: cachedBbUser?.uuid ?? '', github: cachedGhUser?.uuid ?? '' },
+      preferences,
+      now
+    );
     const counts = computeCounts(enriched, snoozedMap, now);
-    const isAuthenticated = Boolean(creds && creds.token);
+    const isAuthenticated = Boolean((bbCreds && bbCreds.token) || (ghCreds && ghCreds.token));
 
     await updateBadge({ isAuthenticated, preferences, counts, snapshot });
     return { isAuthenticated, counts, snapshot, preferences };
   }
 
   /**
-   * Execute a gated PR sync (in-flight lock, cooldown, backoff, stale-while-revalidate error handling).
+   * Execute a gated PR sync across connected providers (Bitbucket, GitHub, or both),
+   * enforcing in-flight lock, cooldown, backoff, and stale-while-revalidate error isolation.
    *
    * @param {{ forceManual?: boolean, forceRefreshCache?: boolean, bypassCooldown?: boolean }} [options]
    * @returns {Promise<SyncResponse>}
@@ -392,16 +454,30 @@ export function createWorkerService(deps = {}) {
     const bypassCooldown = Boolean(options.bypassCooldown);
     const now = nowFn();
 
-    const [creds, preferences, prevSnapshot, prevSyncState, prevCachedUser, prevSnoozedMap] = await Promise.all([
+    const [
+      bbCreds,
+      ghCreds,
+      preferences,
+      prevSnapshot,
+      prevSyncState,
+      prevCachedBbUser,
+      prevCachedGhUser,
+      prevSnoozedMap
+    ] = await Promise.all([
       storage.getCredentials(),
+      storage.getGitHubCredentials(),
       storage.getPreferences(),
       storage.getPrSnapshot(),
       storage.getSyncState(),
       storage.getCachedUser(),
+      storage.getCachedGitHubUser(),
       storage.getSnoozedMap()
     ]);
 
-    if (!creds || !creds.token) {
+    const bbAuthed = Boolean(bbCreds && bbCreds.token);
+    const ghAuthed = Boolean(ghCreds && ghCreds.token);
+
+    if (!bbAuthed && !ghAuthed) {
       await updateBadge({
         isAuthenticated: false,
         preferences,
@@ -419,7 +495,12 @@ export function createWorkerService(deps = {}) {
 
     const gate = checkSyncGate(prevSyncState, { forceManual, bypassCooldown, now });
     if (!gate.allowed) {
-      const prevEnriched = enrichPrList(prevSnapshot.prList, prevCachedUser?.uuid ?? '', preferences, now);
+      const prevEnriched = enrichPrList(
+        prevSnapshot.prList,
+        { bitbucket: prevCachedBbUser?.uuid ?? '', github: prevCachedGhUser?.uuid ?? '' },
+        preferences,
+        now
+      );
       return {
         ok: true,
         skipped: true,
@@ -436,17 +517,95 @@ export function createWorkerService(deps = {}) {
     });
 
     try {
-      const fetchResult = await client.fetchPullRequests({
-        creds,
-        storage,
-        preferences,
-        forceRefreshCache
-      });
+      const [bbSettled, ghSettled] = await Promise.all([
+        bbAuthed
+          ? client.fetchPullRequests({
+            creds: /** @type {import('./storage.js').Credentials} */ (bbCreds),
+            storage,
+            preferences,
+            forceRefreshCache
+          }).then(
+            (value) => ({ status: /** @type {const} */ ('fulfilled'), value }),
+            (reason) => ({ status: /** @type {const} */ ('rejected'), reason })
+          )
+          : Promise.resolve(null),
+        ghAuthed
+          ? githubClient.fetchPullRequests({
+            creds: /** @type {import('./storage.js').GitHubCredentials} */ (ghCreds),
+            storage,
+            preferences,
+            forceRefreshCache
+          }).then(
+            (value) => ({ status: /** @type {const} */ ('fulfilled'), value }),
+            (reason) => ({ status: /** @type {const} */ ('rejected'), reason })
+          )
+          : Promise.resolve(null)
+      ]);
+
+      const bbSucceeded = Boolean(bbSettled && bbSettled.status === 'fulfilled');
+      const ghSucceeded = Boolean(ghSettled && ghSettled.status === 'fulfilled');
+      const bbFailed = Boolean(bbSettled && bbSettled.status === 'rejected');
+      const ghFailed = Boolean(ghSettled && ghSettled.status === 'rejected');
+
+      // If every connected provider failed, delegate to the full error/backoff handler
+      if (!bbSucceeded && !ghSucceeded) {
+        const firstErr = (bbSettled && bbSettled.status === 'rejected' ? bbSettled.reason : null) ??
+          (ghSettled && ghSettled.status === 'rejected' ? ghSettled.reason : null);
+        throw firstErr ?? new Error('An unexpected error occurred while syncing pull requests.');
+      }
 
       const finishedAt = nowFn();
-      const userUuid = fetchResult.user.uuid;
-      const previousEnriched = enrichPrList(prevSnapshot.prList, prevCachedUser?.uuid ?? userUuid, preferences, finishedAt);
-      const currentEnriched = enrichPrList(fetchResult.prs, userUuid, preferences, finishedAt);
+      const bbUserUuid = bbSettled && bbSettled.status === 'fulfilled'
+        ? bbSettled.value.user.uuid
+        : (prevCachedBbUser?.uuid ?? '');
+      const ghUserUuid = ghSettled && ghSettled.status === 'fulfilled'
+        ? ghSettled.value.user.uuid
+        : (prevCachedGhUser?.uuid ?? '');
+
+      const previousEnriched = enrichPrList(
+        prevSnapshot.prList,
+        {
+          bitbucket: prevCachedBbUser?.uuid ?? bbUserUuid,
+          github: prevCachedGhUser?.uuid ?? ghUserUuid
+        },
+        preferences,
+        finishedAt
+      );
+
+      // Build unified PR list: fresh results for succeeded providers; preserve cached PRs for a partially failed provider
+      /** @type {import('./storage.js').PullRequestRecord[]} */
+      const combinedRawPrs = [];
+
+      if (bbSettled && bbSettled.status === 'fulfilled') {
+        for (const pr of bbSettled.value.prs) {
+          combinedRawPrs.push({ ...pr, provider: 'bitbucket' });
+        }
+      } else if (bbFailed) {
+        for (const prevPr of prevSnapshot.prList) {
+          if (prevPr.provider !== 'github' && !(typeof prevPr.key === 'string' && prevPr.key.startsWith('gh:'))) {
+            combinedRawPrs.push(prevPr);
+          }
+        }
+      }
+
+      if (ghSettled && ghSettled.status === 'fulfilled') {
+        for (const pr of ghSettled.value.prs) {
+          combinedRawPrs.push({ ...pr, provider: 'github' });
+        }
+      } else if (ghFailed) {
+        for (const prevPr of prevSnapshot.prList) {
+          if (prevPr.provider === 'github' || (typeof prevPr.key === 'string' && prevPr.key.startsWith('gh:'))) {
+            combinedRawPrs.push(prevPr);
+          }
+        }
+      }
+
+      const currentEnriched = enrichPrList(
+        combinedRawPrs,
+        { bitbucket: bbUserUuid, github: ghUserUuid },
+        preferences,
+        finishedAt
+      );
 
       const prunedSnoozes = pruneExpiredSnoozes(prevSnoozedMap, currentEnriched, finishedAt);
       if (Object.keys(prunedSnoozes).length !== Object.keys(prevSnoozedMap).length) {
@@ -463,13 +622,38 @@ export function createWorkerService(deps = {}) {
         await dispatchNotifications(newlyActionable, finishedAt);
       }
 
-      const syncedWorkspaces = fetchResult.workspaces.map((w) => w.slug);
+      const syncedWorkspaces = bbSettled && bbSettled.status === 'fulfilled'
+        ? bbSettled.value.workspaces.map((w) => w.slug)
+        : (bbAuthed ? prevSnapshot.syncedWorkspaces : []);
+
+      // Surface non-blocking partial banner if one provider failed while the other succeeded
+      let partialBannerError = null;
+      let partialIsRateLimited = false;
+      let partialIsAuthError = false;
+      if (bbFailed && bbSettled && bbSettled.status === 'rejected') {
+        const info = extractApiErrorInfo(bbSettled.reason, 'Bitbucket sync failed.');
+        partialBannerError = `Bitbucket: ${info.message}`;
+        partialIsRateLimited = info.isRateLimited;
+        partialIsAuthError = info.isAuthError;
+      } else if (ghFailed && ghSettled && ghSettled.status === 'rejected') {
+        const info = extractApiErrorInfo(ghSettled.reason, 'GitHub sync failed.');
+        partialBannerError = `GitHub: ${info.message}`;
+        partialIsRateLimited = info.isRateLimited;
+        partialIsAuthError = info.isAuthError;
+      }
+
+      const nearLimit = Boolean(
+        (bbSettled && bbSettled.status === 'fulfilled' && bbSettled.value.nearLimit) ||
+        (ghSettled && ghSettled.status === 'fulfilled' && ghSettled.value.nearLimit) ||
+        partialIsRateLimited
+      );
+
       /** @type {import('./storage.js').PrSnapshot} */
       const nextSnapshot = {
         prList: currentEnriched,
         lastUpdated: finishedAt,
-        error: null,
-        rateLimitWarning: fetchResult.nearLimit,
+        error: partialBannerError,
+        rateLimitWarning: nearLimit,
         syncedWorkspaces
       };
 
@@ -491,34 +675,16 @@ export function createWorkerService(deps = {}) {
       return {
         ok: true,
         snapshot: nextSnapshot,
-        counts
+        counts,
+        ...(partialBannerError ? { error: partialBannerError, isAuthError: partialIsAuthError } : {})
       };
     } catch (err) {
       const failedAt = nowFn();
-      const status = err instanceof BitbucketApiError
-        ? err.status
-        : (err && typeof err === 'object' && typeof /** @type {{ status?: unknown }} */ (err).status === 'number'
-          ? /** @type {{ status: number }} */ (err).status
-          : null);
-      const isRateLimited = status === 429;
-      const isAuthError = err instanceof BitbucketApiError
-        ? err.isAuthError
-        : Boolean(err && typeof err === 'object' && /** @type {{ isAuthError?: unknown }} */ (err).isAuthError);
-      const isTransient = err instanceof BitbucketApiError
-        ? err.isTransient
-        : Boolean(err && typeof err === 'object' && /** @type {{ isTransient?: unknown }} */ (err).isTransient);
-      const retryAfter = err instanceof BitbucketApiError
-        ? err.retryAfter
-        : (err && typeof err === 'object' && typeof /** @type {{ retryAfter?: unknown }} */ (err).retryAfter === 'number'
-          ? /** @type {{ retryAfter: number }} */ (err).retryAfter
-          : null);
-      const errorMessage = err instanceof Error && err.message
-        ? err.message
-        : 'An unexpected error occurred while syncing pull requests.';
+      const info = extractApiErrorInfo(err, 'An unexpected error occurred while syncing pull requests.');
 
       const nextFailures = prevSyncState.consecutiveFailures + 1;
-      const retryAfterSeconds = retryAfter !== null ? Math.ceil(retryAfter / 1000) : null;
-      const backoffMs = isTransient || retryAfterSeconds !== null
+      const retryAfterSeconds = info.retryAfter !== null ? Math.ceil(info.retryAfter / 1000) : null;
+      const backoffMs = info.isTransient || retryAfterSeconds !== null
         ? computeBackoffMs(nextFailures, retryAfterSeconds, randomFn, failedAt)
         : null;
 
@@ -528,23 +694,28 @@ export function createWorkerService(deps = {}) {
         backoffUntil: backoffMs !== null ? failedAt + backoffMs : null
       });
 
-      const nextRateLimitWarning = isRateLimited ? true : prevSnapshot.rateLimitWarning;
+      const nextRateLimitWarning = info.isRateLimited ? true : prevSnapshot.rateLimitWarning;
 
       // Preserve existing prList for stale-while-revalidate display
       /** @type {import('./storage.js').PrSnapshot} */
       const errorSnapshot = {
         prList: prevSnapshot.prList,
         lastUpdated: prevSnapshot.lastUpdated,
-        error: errorMessage,
+        error: info.message,
         rateLimitWarning: nextRateLimitWarning,
         syncedWorkspaces: prevSnapshot.syncedWorkspaces
       };
       await storage.savePrSnapshot({
-        error: errorMessage,
-        ...(isRateLimited ? { rateLimitWarning: true } : {})
+        error: info.message,
+        ...(info.isRateLimited ? { rateLimitWarning: true } : {})
       });
 
-      const enrichedCached = enrichPrList(prevSnapshot.prList, prevCachedUser?.uuid ?? '', preferences, failedAt);
+      const enrichedCached = enrichPrList(
+        prevSnapshot.prList,
+        { bitbucket: prevCachedBbUser?.uuid ?? '', github: prevCachedGhUser?.uuid ?? '' },
+        preferences,
+        failedAt
+      );
       const counts = computeCounts(enrichedCached, prevSnoozedMap, failedAt);
       await updateBadge({
         isAuthenticated: true,
@@ -555,8 +726,8 @@ export function createWorkerService(deps = {}) {
 
       return {
         ok: false,
-        error: errorMessage,
-        isAuthError,
+        error: info.message,
+        isAuthError: info.isAuthError,
         snapshot: errorSnapshot,
         counts
       };
@@ -583,22 +754,17 @@ export function createWorkerService(deps = {}) {
         nearLimit: result.nearLimit
       };
     } catch (err) {
-      const isAuthError = err instanceof BitbucketApiError
-        ? err.isAuthError
-        : Boolean(err && typeof err === 'object' && /** @type {{ isAuthError?: unknown }} */ (err).isAuthError);
-      const errorMessage = err instanceof Error && err.message
-        ? err.message
-        : 'Failed to verify Bitbucket credentials.';
+      const info = extractApiErrorInfo(err, 'Failed to verify Bitbucket credentials.');
       return {
         ok: false,
-        error: errorMessage,
-        isAuthError
+        error: info.message,
+        isAuthError: info.isAuthError
       };
     }
   }
 
   /**
-   * Verify, save credentials, cache verified profile/workspaces, and trigger immediate sync.
+   * Verify, save Bitbucket credentials, cache verified profile/workspaces, and trigger immediate sync.
    *
    * @param {Partial<import('./storage.js').Credentials>} creds
    */
@@ -610,16 +776,11 @@ export function createWorkerService(deps = {}) {
     try {
       verification = await client.verifyCredentials(creds);
     } catch (err) {
-      const isAuthError = err instanceof BitbucketApiError
-        ? err.isAuthError
-        : Boolean(err && typeof err === 'object' && /** @type {{ isAuthError?: unknown }} */ (err).isAuthError);
-      const errorMessage = err instanceof Error && err.message
-        ? err.message
-        : 'Failed to verify Bitbucket credentials.';
+      const info = extractApiErrorInfo(err, 'Failed to verify Bitbucket credentials.');
       return {
         ok: false,
-        error: errorMessage,
-        isAuthError
+        error: info.message,
+        isAuthError: info.isAuthError
       };
     }
 
@@ -671,13 +832,163 @@ export function createWorkerService(deps = {}) {
   }
 
   /**
-   * Sign out by clearing credentials & cached data (preserving preferences) and clearing badge.
+   * Sign out of Bitbucket: clears Bitbucket credentials & caches; preserves GitHub session if still connected.
    */
   async function signOut() {
+    const [ghCreds, prevSnapshot] = await Promise.all([
+      storage.getGitHubCredentials(),
+      storage.getPrSnapshot()
+    ]);
+
     await storage.clearCredentialsAndCache();
+
+    if (ghCreds && ghCreds.token) {
+      const remainingGhPrs = prevSnapshot.prList.filter(
+        (pr) => pr.provider === 'github' || (typeof pr.key === 'string' && pr.key.startsWith('gh:'))
+      );
+      await storage.savePrSnapshot({
+        prList: remainingGhPrs,
+        error: null,
+        rateLimitWarning: false,
+        syncedWorkspaces: []
+      });
+      await syncNow({ forceManual: true, bypassCooldown: true });
+      return { ok: true };
+    }
+
     if (chromeApi.action && typeof chromeApi.action.setBadgeText === 'function') {
       await chromeApi.action.setBadgeText({ text: '' });
     }
+    return { ok: true };
+  }
+
+  /**
+   * Verify GitHub PAT credentials without persisting them.
+   *
+   * @param {Partial<import('./storage.js').GitHubCredentials>} creds
+   */
+  async function testGitHubConnection(creds) {
+    try {
+      const result = await githubClient.verifyCredentials(creds);
+      return {
+        ok: true,
+        user: result.user,
+        nearLimit: result.nearLimit
+      };
+    } catch (err) {
+      const info = extractApiErrorInfo(err, 'Failed to verify GitHub credentials.');
+      return {
+        ok: false,
+        error: info.message,
+        isAuthError: info.isAuthError
+      };
+    }
+  }
+
+  /**
+   * Verify, cache GitHub user, save GitHub credentials, and trigger immediate sync.
+   *
+   * @param {Partial<import('./storage.js').GitHubCredentials>} creds
+   */
+  async function saveGitHubCredentials(creds) {
+    const prevCachedGhUser = await storage.getCachedGitHubUser();
+
+    let verification;
+    try {
+      verification = await githubClient.verifyCredentials(creds);
+    } catch (err) {
+      const info = extractApiErrorInfo(err, 'Failed to verify GitHub credentials.');
+      return {
+        ok: false,
+        error: info.message,
+        isAuthError: info.isAuthError
+      };
+    }
+
+    if (prevCachedGhUser && prevCachedGhUser.uuid !== verification.user.uuid) {
+      await storage.clearGitHubCredentialsAndCache();
+    }
+
+    const saved = await storage.saveGitHubCredentials(creds);
+    const now = nowFn();
+    await storage.setCachedGitHubUser({
+      ...verification.user,
+      cachedAt: now
+    });
+    await storage.saveSyncState({
+      inFlightSince: null,
+      backoffUntil: null,
+      consecutiveFailures: 0,
+      lastManualSyncAt: null
+    });
+
+    const syncRes = await syncNow({ forceManual: true, bypassCooldown: true });
+    if (!syncRes.ok) {
+      return {
+        ok: false,
+        error: syncRes.error ?? 'GitHub credentials verified, but initial PR sync failed.',
+        isAuthError: Boolean(syncRes.isAuthError)
+      };
+    }
+
+    return {
+      ok: true,
+      user: verification.user,
+      apiBaseUrl: saved.apiBaseUrl,
+      snapshot: syncRes.snapshot,
+      counts: syncRes.counts
+    };
+  }
+
+  /**
+   * Sign out of GitHub: clears GitHub creds & cache, drops GitHub PRs from snapshot
+   * (or re-syncs if Bitbucket is still connected), and updates badge.
+   */
+  async function signOutGitHub() {
+    const [bbCreds, preferences, prevSnapshot, cachedBbUser, snoozedMap] = await Promise.all([
+      storage.getCredentials(),
+      storage.getPreferences(),
+      storage.getPrSnapshot(),
+      storage.getCachedUser(),
+      storage.getSnoozedMap()
+    ]);
+
+    await storage.clearGitHubCredentialsAndCache();
+
+    const remainingPrs = prevSnapshot.prList.filter(
+      (pr) => pr.provider !== 'github' && !(typeof pr.key === 'string' && pr.key.startsWith('gh:'))
+    );
+    const now = nowFn();
+    const enrichedRemaining = enrichPrList(
+      remainingPrs,
+      { bitbucket: cachedBbUser?.uuid ?? '', github: '' },
+      preferences,
+      now
+    );
+
+    const bbAuthed = Boolean(bbCreds && bbCreds.token);
+    /** @type {import('./storage.js').PrSnapshot} */
+    const nextSnapshot = {
+      prList: bbAuthed ? enrichedRemaining : [],
+      lastUpdated: bbAuthed ? prevSnapshot.lastUpdated : null,
+      error: null,
+      rateLimitWarning: bbAuthed ? prevSnapshot.rateLimitWarning : false,
+      syncedWorkspaces: bbAuthed ? prevSnapshot.syncedWorkspaces : []
+    };
+    await storage.savePrSnapshot(nextSnapshot);
+
+    const counts = computeCounts(bbAuthed ? enrichedRemaining : [], snoozedMap, now);
+    await updateBadge({
+      isAuthenticated: bbAuthed,
+      preferences,
+      counts,
+      snapshot: nextSnapshot
+    });
+
+    if (bbAuthed) {
+      await syncNow({ forceManual: true, bypassCooldown: true });
+    }
+
     return { ok: true };
   }
 
@@ -695,26 +1006,34 @@ export function createWorkerService(deps = {}) {
       stringListChanged(prevPrefs.reposFilter, savedPrefs.reposFilter);
 
     const now = nowFn();
-    const [creds, snapshot, cachedUser, snoozedMap] = await Promise.all([
+    const [bbCreds, ghCreds, snapshot, cachedBbUser, cachedGhUser, snoozedMap] = await Promise.all([
       storage.getCredentials(),
+      storage.getGitHubCredentials(),
       storage.getPrSnapshot(),
       storage.getCachedUser(),
+      storage.getCachedGitHubUser(),
       storage.getSnoozedMap()
     ]);
 
-    const enrichedPrs = enrichPrList(snapshot.prList, cachedUser?.uuid ?? '', savedPrefs, now);
+    const enrichedPrs = enrichPrList(
+      snapshot.prList,
+      { bitbucket: cachedBbUser?.uuid ?? '', github: cachedGhUser?.uuid ?? '' },
+      savedPrefs,
+      now
+    );
     await storage.savePrSnapshot({ prList: enrichedPrs });
 
     const counts = computeCounts(enrichedPrs, snoozedMap, now);
     await ensurePollingAlarm(savedPrefs);
+    const isAuthenticated = Boolean((bbCreds && bbCreds.token) || (ghCreds && ghCreds.token));
     await updateBadge({
-      isAuthenticated: Boolean(creds && creds.token),
+      isAuthenticated,
       preferences: savedPrefs,
       counts,
       snapshot: { ...snapshot, prList: enrichedPrs }
     });
 
-    if (scopeChanged && creds && creds.token) {
+    if (scopeChanged && bbCreds && bbCreds.token) {
       const syncResult = await syncNow({
         forceManual: true,
         forceRefreshCache: true,
@@ -757,11 +1076,13 @@ export function createWorkerService(deps = {}) {
     }
 
     const now = nowFn();
-    const [creds, preferences, snapshot, cachedUser, snoozedMap] = await Promise.all([
+    const [bbCreds, ghCreds, preferences, snapshot, cachedBbUser, cachedGhUser, snoozedMap] = await Promise.all([
       storage.getCredentials(),
+      storage.getGitHubCredentials(),
       storage.getPreferences(),
       storage.getPrSnapshot(),
       storage.getCachedUser(),
+      storage.getCachedGitHubUser(),
       storage.getSnoozedMap()
     ]);
 
@@ -782,10 +1103,15 @@ export function createWorkerService(deps = {}) {
 
     await storage.saveSnoozedMap(nextSnoozedMap);
 
-    const enriched = enrichPrList(snapshot.prList, cachedUser?.uuid ?? '', preferences, now);
+    const enriched = enrichPrList(
+      snapshot.prList,
+      { bitbucket: cachedBbUser?.uuid ?? '', github: cachedGhUser?.uuid ?? '' },
+      preferences,
+      now
+    );
     const counts = computeCounts(enriched, nextSnoozedMap, now);
     await updateBadge({
-      isAuthenticated: Boolean(creds && creds.token),
+      isAuthenticated: Boolean((bbCreds && bbCreds.token) || (ghCreds && ghCreds.token)),
       preferences,
       counts,
       snapshot
@@ -809,11 +1135,13 @@ export function createWorkerService(deps = {}) {
     }
 
     const now = nowFn();
-    const [creds, preferences, snapshot, cachedUser, snoozedMap] = await Promise.all([
+    const [bbCreds, ghCreds, preferences, snapshot, cachedBbUser, cachedGhUser, snoozedMap] = await Promise.all([
       storage.getCredentials(),
+      storage.getGitHubCredentials(),
       storage.getPreferences(),
       storage.getPrSnapshot(),
       storage.getCachedUser(),
+      storage.getCachedGitHubUser(),
       storage.getSnoozedMap()
     ]);
 
@@ -821,10 +1149,15 @@ export function createWorkerService(deps = {}) {
     delete nextSnoozedMap[prKey];
     await storage.saveSnoozedMap(nextSnoozedMap);
 
-    const enriched = enrichPrList(snapshot.prList, cachedUser?.uuid ?? '', preferences, now);
+    const enriched = enrichPrList(
+      snapshot.prList,
+      { bitbucket: cachedBbUser?.uuid ?? '', github: cachedGhUser?.uuid ?? '' },
+      preferences,
+      now
+    );
     const counts = computeCounts(enriched, nextSnoozedMap, now);
     await updateBadge({
-      isAuthenticated: Boolean(creds && creds.token),
+      isAuthenticated: Boolean((bbCreds && bbCreds.token) || (ghCreds && ghCreds.token)),
       preferences,
       counts,
       snapshot
@@ -838,31 +1171,56 @@ export function createWorkerService(deps = {}) {
   }
 
   /**
-   * Return sanitized bootstrap state for the popup UI. NEVER exposes the raw `token`.
+   * Return sanitized bootstrap state for the popup UI. NEVER exposes raw Bitbucket or GitHub tokens.
    */
   async function getState() {
     const now = nowFn();
-    const [creds, cachedUser, cachedWorkspaces, snapshot, preferences, syncState, snoozedMap, productFeedback] =
-      await Promise.all([
-        storage.getCredentials(),
-        storage.getCachedUser(),
-        storage.getCachedWorkspaces(),
-        storage.getPrSnapshot(),
-        storage.getPreferences(),
-        storage.getSyncState(),
-        storage.getSnoozedMap(),
-        storage.getProductFeedback()
-      ]);
+    const [
+      bbCreds,
+      ghCreds,
+      cachedBbUser,
+      cachedGhUser,
+      cachedWorkspaces,
+      snapshot,
+      preferences,
+      syncState,
+      snoozedMap,
+      productFeedback
+    ] = await Promise.all([
+      storage.getCredentials(),
+      storage.getGitHubCredentials(),
+      storage.getCachedUser(),
+      storage.getCachedGitHubUser(),
+      storage.getCachedWorkspaces(),
+      storage.getPrSnapshot(),
+      storage.getPreferences(),
+      storage.getSyncState(),
+      storage.getSnoozedMap(),
+      storage.getProductFeedback()
+    ]);
 
-    const enrichedPrs = enrichPrList(snapshot.prList, cachedUser?.uuid ?? '', preferences, now);
+    const enrichedPrs = enrichPrList(
+      snapshot.prList,
+      { bitbucket: cachedBbUser?.uuid ?? '', github: cachedGhUser?.uuid ?? '' },
+      preferences,
+      now
+    );
     const counts = computeCounts(enrichedPrs, snoozedMap, now);
     const isAuthError = deriveIsAuthError(snapshot.error);
+    const bitbucketAuthenticated = Boolean(bbCreds && bbCreds.token);
+    const githubAuthenticated = Boolean(ghCreds && ghCreds.token);
 
     return {
-      isAuthenticated: Boolean(creds && creds.token),
-      authType: creds ? creds.authType : 'api_token',
-      username: creds ? creds.username : '',
-      user: cachedUser,
+      isAuthenticated: bitbucketAuthenticated || githubAuthenticated,
+      bitbucketAuthenticated,
+      authType: bbCreds ? bbCreds.authType : 'api_token',
+      username: bbCreds ? bbCreds.username : '',
+      user: cachedBbUser,
+      github: {
+        isAuthenticated: githubAuthenticated,
+        apiBaseUrl: ghCreds ? ghCreds.apiBaseUrl : getEffectiveGitHubApiBaseUrl(),
+        user: cachedGhUser
+      },
       workspaces: cachedWorkspaces ? cachedWorkspaces.items : [],
       isAuthError,
       snapshot: {
@@ -928,6 +1286,20 @@ export function createWorkerService(deps = {}) {
         );
       case 'SIGN_OUT':
         return signOut();
+      case 'TEST_GITHUB_CONNECTION':
+        return testGitHubConnection(
+          payload.creds && typeof payload.creds === 'object'
+            ? /** @type {Partial<import('./storage.js').GitHubCredentials>} */ (payload.creds)
+            : {}
+        );
+      case 'SAVE_GITHUB_CREDENTIALS':
+        return saveGitHubCredentials(
+          payload.creds && typeof payload.creds === 'object'
+            ? /** @type {Partial<import('./storage.js').GitHubCredentials>} */ (payload.creds)
+            : {}
+        );
+      case 'SIGN_OUT_GITHUB':
+        return signOutGitHub();
       case 'UPDATE_PREFERENCES':
         return updatePreferences(
           payload.preferences && typeof payload.preferences === 'object'
@@ -960,6 +1332,9 @@ export function createWorkerService(deps = {}) {
     testConnection,
     saveCredentials,
     signOut,
+    testGitHubConnection,
+    saveGitHubCredentials,
+    signOutGitHub,
     updatePreferences,
     snoozePr,
     unsnoozePr,

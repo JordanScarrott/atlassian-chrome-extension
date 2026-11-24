@@ -3,11 +3,15 @@ import assert from 'node:assert/strict';
 
 import {
   buildJiraTicketLinks,
+  buildRelatedPrMap,
   collectActiveJiraTickets,
   computeCounts,
   enrichPullRequest,
+  extractGitHubIssueRefs,
   extractJiraKeys,
   filterAndSortPrs,
+  getPrimaryTicketKey,
+  groupPrsByTicket,
   isPrSnoozed,
   pruneExpiredSnoozes
 } from '../bitbucket-pr-extension/src/pr-triage.js';
@@ -522,3 +526,146 @@ test('filterAndSortPrs supports ci:* search tokens and build name, and collectAc
   const ticketsWithoutSnooze = collectActiveJiraTickets(all);
   assert.equal(ticketsWithoutSnooze.find((t) => t.key === 'MEZ-200')?.hasYourTurn, true);
 });
+
+test('extractJiraKeys scans PR description & /browse URLs, and extractGitHubIssueRefs extracts #123 references', () => {
+  const keys = extractJiraKeys(
+    'Refactor payment service',
+    'feat/payments-cleanup',
+    'Related to https://jira.example.com/browse/pay-404 and OPS-12 (also PAY-404).'
+  );
+  assert.deepEqual(keys, ['OPS-12', 'PAY-404']);
+
+  const refs = extractGitHubIssueRefs(
+    'Fix crash on startup (#42)',
+    'fix/42-crash',
+    'Closes #108, refs #42 and resolves: #99'
+  );
+  assert.deepEqual(refs, ['#42', '#108', '#99']);
+
+  assert.equal(getPrimaryTicketKey({ jiraKeys: ['PAY-404'], issueRefs: ['#42'] }), 'PAY-404');
+  assert.equal(getPrimaryTicketKey({ jiraKeys: [], issueRefs: ['#42'] }), '#42');
+  assert.equal(getPrimaryTicketKey({ jiraKeys: [], issueRefs: [] }), null);
+});
+
+test('buildRelatedPrMap links PRs across Bitbucket + GitHub and groupPrsByTicket orders linked & unlinked groups', () => {
+  const bbAuth = enrichPullRequest(
+    makePr({
+      provider: 'bitbucket',
+      key: 'acme/backend#10',
+      id: 10,
+      title: 'MEZ-500 Backend API',
+      authorUuid: ME,
+      participants: [
+        { uuid: '{rev}', displayName: 'Rev', role: 'REVIEWER', approved: true, state: 'approved' }
+      ],
+      buildStatus: {
+        state: 'FAILED',
+        totalCount: 1,
+        passedCount: 0,
+        failedCount: 1,
+        inProgressCount: 0,
+        stoppedCount: 0,
+        url: 'https://ci.example.com/10',
+        name: 'CI',
+        updatedOn: '2026-11-22T11:00:00Z',
+        commitHash: 'abc',
+        cachedAt: NOW
+      }
+    }),
+    ME,
+    { jiraBaseUrl: 'https://jira.example.com', now: NOW }
+  );
+
+  const ghFrontend = enrichPullRequest(
+    makePr({
+      provider: 'github',
+      key: 'gh:acme/frontend#22',
+      id: 22,
+      title: 'Frontend UI changes',
+      description: 'Implements https://jira.example.com/browse/MEZ-500 and Fixes #77',
+      authorUuid: 'gh:other',
+      reviewers: [{ uuid: 'gh:99', displayName: 'Me GH' }],
+      participants: []
+    }),
+    'gh:99',
+    { jiraBaseUrl: 'https://jira.example.com', now: NOW }
+  );
+
+  const ghIssueOnlyWaiting = enrichPullRequest(
+    makePr({
+      provider: 'github',
+      key: 'gh:acme/docs#5',
+      id: 5,
+      title: 'Update docs',
+      description: 'Closes #77',
+      authorUuid: 'gh:99',
+      reviewers: [{ uuid: 'gh:100', displayName: 'Reviewer' }],
+      participants: []
+    }),
+    'gh:99',
+    { jiraBaseUrl: 'https://jira.example.com', now: NOW }
+  );
+
+  const unlinkedPr = enrichPullRequest(
+    makePr({
+      key: 'acme/infra#99',
+      id: 99,
+      title: 'Bump dependencies',
+      sourceBranch: 'chore/deps',
+      reviewers: [{ uuid: ME, displayName: 'Me' }],
+      participants: []
+    }),
+    ME,
+    { jiraBaseUrl: 'https://jira.example.com', now: NOW }
+  );
+
+  assert.equal(ghFrontend.provider, 'github');
+  assert.deepEqual(ghFrontend.jiraKeys, ['MEZ-500']);
+  assert.deepEqual(ghFrontend.issueRefs, ['#77']);
+  assert.equal(ghFrontend.primaryTicketKey, 'MEZ-500');
+  assert.equal(bbAuth.provider, 'bitbucket');
+
+  const allPrs = [unlinkedPr, ghIssueOnlyWaiting, ghFrontend, bbAuth];
+  const relatedMap = buildRelatedPrMap(allPrs);
+
+  // MEZ-500 links Bitbucket acme/backend#10 <-> GitHub gh:acme/frontend#22, plus #77 links gh:acme/frontend#22 <-> gh:acme/docs#5
+  assert.deepEqual(relatedMap['acme/backend#10'], {
+    ticketKey: 'MEZ-500',
+    relatedKeys: ['gh:acme/frontend#22']
+  });
+  assert.deepEqual(relatedMap['gh:acme/frontend#22'], {
+    ticketKey: 'MEZ-500',
+    relatedKeys: ['acme/backend#10', 'gh:acme/docs#5']
+  });
+  assert.deepEqual(relatedMap['gh:acme/docs#5'], {
+    ticketKey: '#77',
+    relatedKeys: ['gh:acme/frontend#22']
+  });
+  assert.equal(relatedMap['acme/infra#99'], undefined);
+
+  const groups = groupPrsByTicket(allPrs, {}, NOW);
+  assert.equal(groups.length, 3);
+
+  // Group 0: MEZ-500 (yourTurnCount = 2, cross-provider bitbucket + github)
+  assert.equal(groups[0].groupKey, 'MEZ-500');
+  assert.equal(groups[0].label, 'MEZ-500');
+  assert.equal(groups[0].ticketUrl, 'https://jira.example.com/browse/MEZ-500');
+  assert.equal(groups[0].isUnlinked, false);
+  assert.equal(groups[0].prs.length, 2);
+  assert.equal(groups[0].yourTurnCount, 2);
+  assert.equal(groups[0].approvedCount, 1);
+  assert.equal(groups[0].ciFailedCount, 1);
+  assert.deepEqual(groups[0].providers.sort(), ['bitbucket', 'github']);
+
+  // Group 1: #77 (linked, waiting_reviewers -> yourTurnCount = 0)
+  assert.equal(groups[1].groupKey, '#77');
+  assert.equal(groups[1].ticketUrl, null);
+  assert.equal(groups[1].yourTurnCount, 0);
+
+  // Group 2: UNLINKED always sorted last even if its PR is yourTurn
+  assert.equal(groups[2].groupKey, 'UNLINKED');
+  assert.equal(groups[2].label, 'No Linked Ticket');
+  assert.equal(groups[2].isUnlinked, true);
+  assert.equal(groups[2].yourTurnCount, 1);
+});
+

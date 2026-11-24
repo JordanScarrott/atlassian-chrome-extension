@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { BitbucketApiError } from '../bitbucket-pr-extension/src/bitbucket-client.js';
+import { GitHubApiError } from '../bitbucket-pr-extension/src/github-client.js';
 import { THROTTLE_CONFIG } from '../bitbucket-pr-extension/src/config.js';
 import { createStorage } from '../bitbucket-pr-extension/src/storage.js';
 import {
@@ -751,3 +752,208 @@ test('ci_failed triggers explicit CI notification label, updatePreferences surfa
   assert.equal(stateAfter401.isAuthError, true);
   assert.equal(stateAfter401.snapshot.isAuthError, true);
 });
+
+test('TEST_GITHUB_CONNECTION, SAVE_GITHUB_CREDENTIALS, dual-provider sync merging, partial error isolation, GET_STATE (no token leak), and SIGN_OUT_GITHUB', async () => {
+  let now = Date.UTC(2026, 10, 23, 14, 0, 0);
+  const mock = createMockChromeApi();
+  const storage = createStorage(mock.localArea);
+
+  const GH_USER = {
+    uuid: 'gh:42',
+    accountId: '42',
+    displayName: 'Jordan GH',
+    username: 'jscarrott',
+    avatarUrl: 'https://avatars.githubusercontent.com/u/42',
+    cachedAt: now
+  };
+
+  const bbMode = 'ok';
+  let ghMode = 'ok';
+
+  const bbClient = {
+    async verifyCredentials() {
+      return { user: { ...SAMPLE_USER, cachedAt: now }, workspaces: SAMPLE_WORKSPACES, nearLimit: false };
+    },
+    async fetchPullRequests() {
+      if (bbMode === 'fail') {
+        throw new BitbucketApiError({
+          status: 503,
+          code: 'SERVER_ERROR',
+          message: 'Bitbucket temporarily unavailable (503).',
+          retryAfter: null,
+          isTransient: true,
+          isAuthError: false
+        });
+      }
+      return {
+        prs: [
+          makePr({
+            key: 'acme/api#101',
+            id: 101,
+            title: 'MEZ-101 Bitbucket backend PR',
+            authorUuid: '{me}',
+            authorName: 'Jordan Scarrott',
+            reviewers: [],
+            participants: [
+              { uuid: '{bob}', displayName: 'Bob', role: 'REVIEWER', approved: true, state: 'approved' }
+            ]
+          })
+        ],
+        user: { ...SAMPLE_USER, cachedAt: now },
+        workspaces: SAMPLE_WORKSPACES,
+        nearLimit: false,
+        partialErrors: []
+      };
+    }
+  };
+
+  const ghClient = {
+    async verifyCredentials(creds) {
+      if (creds.token === 'bad-gh') {
+        throw new GitHubApiError({
+          status: 401,
+          code: 'UNAUTHORIZED',
+          message: 'GitHub authentication failed (401).',
+          retryAfter: null,
+          isTransient: false,
+          isAuthError: true
+        });
+      }
+      return { user: { ...GH_USER, cachedAt: now }, nearLimit: false };
+    },
+    async fetchPullRequests() {
+      if (ghMode === 'fail') {
+        throw new GitHubApiError({
+          status: 401,
+          code: 'UNAUTHORIZED',
+          message: 'GitHub authentication failed (401). Check your Personal Access Token in Settings.',
+          retryAfter: null,
+          isTransient: false,
+          isAuthError: true
+        });
+      }
+      return {
+        prs: [
+          {
+            provider: 'github',
+            key: 'gh:acme/web#88',
+            id: 88,
+            title: 'MEZ-101 GitHub frontend PR',
+            description: 'Connects to MEZ-101',
+            state: 'OPEN',
+            url: 'https://github.enterprise.local/acme/web/pull/88',
+            repoFullName: 'acme/web',
+            repoName: 'web',
+            workspace: 'acme',
+            authorUuid: 'gh:99',
+            authorName: 'Alice',
+            sourceBranch: 'feat/mez-101',
+            destinationBranch: 'main',
+            createdOn: '2026-11-23T10:00:00Z',
+            updatedOn: '2026-11-23T12:00:00Z',
+            commentCount: 2,
+            taskCount: 0,
+            draft: false,
+            reviewers: [{ uuid: 'gh:42', displayName: 'Jordan GH' }],
+            participants: [],
+            buildStatus: null
+          }
+        ],
+        user: { ...GH_USER, cachedAt: now },
+        nearLimit: false,
+        partialErrors: []
+      };
+    }
+  };
+
+  const worker = createWorkerService({
+    storage,
+    client: bbClient,
+    githubClient: ghClient,
+    chromeApi: mock.chromeApi,
+    nowFn: () => now
+  });
+
+  // 1. TEST_GITHUB_CONNECTION handles invalid & valid tokens
+  const badTest = await worker.handleMessage({
+    action: 'TEST_GITHUB_CONNECTION',
+    creds: { token: 'bad-gh', apiBaseUrl: 'https://github.enterprise.local/api/v3' }
+  });
+  assert.equal(badTest.ok, false);
+  assert.equal(badTest.isAuthError, true);
+
+  const goodTest = await worker.handleMessage({
+    action: 'TEST_GITHUB_CONNECTION',
+    creds: { token: 'ghp_super_secret', apiBaseUrl: 'https://github.enterprise.local/api/v3' }
+  });
+  assert.equal(goodTest.ok, true);
+  assert.equal(goodTest.user.uuid, 'gh:42');
+
+  // 2. SAVE_GITHUB_CREDENTIALS works standalone (GitHub-only mode)
+  const saveGh = await worker.handleMessage({
+    action: 'SAVE_GITHUB_CREDENTIALS',
+    creds: { token: 'ghp_super_secret', apiBaseUrl: 'https://github.enterprise.local/api/v3/' }
+  });
+  assert.equal(saveGh.ok, true);
+  assert.equal(saveGh.apiBaseUrl, 'https://github.enterprise.local/api/v3');
+  assert.equal(saveGh.snapshot.prList.length, 1);
+  assert.equal(saveGh.snapshot.prList[0].provider, 'github');
+  assert.equal(saveGh.snapshot.prList[0].isYourTurn, true);
+  assert.equal(saveGh.counts.actionRequired, 1);
+
+  // 3. Connect Bitbucket too -> dual-provider unified PR list enriched with each provider's user UUID
+  const saveBb = await worker.handleMessage({
+    action: 'SAVE_CREDENTIALS',
+    creds: { authType: 'bearer', token: 'bb_super_secret' }
+  });
+  assert.equal(saveBb.ok, true);
+  assert.equal(saveBb.snapshot.prList.length, 2);
+  assert.equal(saveBb.counts.actionRequired, 2);
+
+  const bbPr = saveBb.snapshot.prList.find((p) => p.key === 'acme/api#101');
+  const ghPr = saveBb.snapshot.prList.find((p) => p.key === 'gh:acme/web#88');
+  assert.equal(bbPr?.provider, 'bitbucket');
+  assert.equal(bbPr?.actionState, 'ready_to_merge');
+  assert.equal(ghPr?.provider, 'github');
+  assert.equal(ghPr?.actionState, 'needs_review');
+
+  // 4. GET_STATE reports both providers and NEVER leaks githubToken or bitbucketToken
+  const state = await worker.handleMessage({ action: 'GET_STATE' });
+  assert.equal(state.isAuthenticated, true);
+  assert.equal(state.bitbucketAuthenticated, true);
+  assert.equal(state.github.isAuthenticated, true);
+  assert.equal(state.github.apiBaseUrl, 'https://github.enterprise.local/api/v3');
+  assert.equal(state.github.user.uuid, 'gh:42');
+  const serialized = JSON.stringify(state);
+  assert.equal(serialized.includes('ghp_super_secret'), false);
+  assert.equal(serialized.includes('bb_super_secret'), false);
+
+  // 5. Partial provider failure isolates error: Bitbucket stays live while GitHub error banner is surfaced
+  now += 60_000;
+  ghMode = 'fail';
+  const partialRes = await worker.syncNow({ forceManual: true, bypassCooldown: true });
+  assert.equal(partialRes.ok, true);
+  assert.equal(partialRes.snapshot?.prList.length, 2); // preserves cached GH PR + fresh BB PR
+  assert.match(partialRes.snapshot?.error ?? '', /^GitHub:/);
+  assert.equal(partialRes.isAuthError, true);
+  ghMode = 'ok';
+
+  // 6. SIGN_OUT_GITHUB clears GitHub creds & removes GitHub PRs while preserving Bitbucket PRs
+  const signOutGh = await worker.handleMessage({ action: 'SIGN_OUT_GITHUB' });
+  assert.equal(signOutGh.ok, true);
+  assert.equal(await storage.getGitHubCredentials(), null);
+  assert.equal(await storage.getCachedGitHubUser(), null);
+  assert.equal((await storage.getCredentials())?.token, 'bb_super_secret');
+
+  const stateAfterGhSignOut = await worker.handleMessage({ action: 'GET_STATE' });
+  assert.equal(stateAfterGhSignOut.isAuthenticated, true);
+  assert.equal(stateAfterGhSignOut.bitbucketAuthenticated, true);
+  assert.equal(stateAfterGhSignOut.github.isAuthenticated, false);
+  assert.deepEqual(stateAfterGhSignOut.snapshot.prList.map((p) => p.key), ['acme/api#101']);
+  assert.equal(stateAfterGhSignOut.counts.actionRequired, 1);
+  assert.deepEqual(mock.badgeHistory.slice(-2), [
+    { type: 'text', text: '1' },
+    { type: 'color', color: '#0052CC' }
+  ]);
+});
+

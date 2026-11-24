@@ -3,21 +3,30 @@ import {
   CENTRAL_URLS,
   DEFAULT_PREFERENCES,
   STORAGE_KEYS,
+  getEffectiveGitHubApiBaseUrl,
   getEffectiveJiraBaseUrl,
   sanitizeHttpsUrl
 } from './src/config.js';
 import {
+  ACTION_BADGE_LABELS,
   buildReviewerBreakdown,
+  filterPrsByRelatedTicket,
   formatFooterUpdated,
   formatRelativeAge,
   formatRemainingSnooze,
   getCiBadgeDescriptor,
-  getCrossFilterEmptyHint
+  getCrossFilterEmptyHint,
+  getDeckDotDescriptor,
+  getHeaderConnectionDescriptor,
+  getOffscreenDeckAttention,
+  sortDeckPrs
 } from './src/popup-helpers.js';
 import {
+  buildRelatedPrMap,
   collectActiveJiraTickets,
   computeCounts,
   filterAndSortPrs,
+  groupPrsByTicket,
   isPrSnoozed
 } from './src/pr-triage.js';
 import { normalizeAuthType } from './src/storage.js';
@@ -26,6 +35,8 @@ import { normalizeAuthType } from './src/storage.js';
 /** @typedef {import('./src/pr-triage.js').EnrichedPullRequest} EnrichedPullRequest */
 /** @typedef {import('./src/pr-triage.js').PrCounts} PrCounts */
 /** @typedef {import('./src/pr-triage.js').PrFilter} PrFilter */
+/** @typedef {import('./src/pr-triage.js').RelatedPrSummary} RelatedPrSummary */
+/** @typedef {import('./src/pr-triage.js').TicketPrGroup} TicketPrGroup */
 /** @typedef {import('./src/storage.js').AuthType} AuthType */
 /** @typedef {import('./src/storage.js').CachedUser} CachedUser */
 /** @typedef {import('./src/storage.js').PrSnapshot} PrSnapshot */
@@ -35,11 +46,20 @@ import { normalizeAuthType } from './src/storage.js';
 /** @typedef {import('./src/storage.js').WorkspaceSummary} WorkspaceSummary */
 
 /**
+ * @typedef {Object} GitHubBootstrapState
+ * @property {boolean} isAuthenticated
+ * @property {string} apiBaseUrl
+ * @property {CachedUser | null} user
+ */
+
+/**
  * @typedef {Object} WorkerBootstrapState
  * @property {boolean} isAuthenticated
+ * @property {boolean} [bitbucketAuthenticated]
  * @property {AuthType} authType
  * @property {string} username
  * @property {CachedUser | null} user
+ * @property {GitHubBootstrapState} [github]
  * @property {WorkspaceSummary[]} workspaces
  * @property {boolean} [isAuthError]
  * @property {Omit<PrSnapshot, 'prList'> & { prList: EnrichedPullRequest[], isAuthError?: boolean }} snapshot
@@ -50,56 +70,17 @@ import { normalizeAuthType } from './src/storage.js';
  * @property {ProductFeedbackState} productFeedback
  */
 
-/**
- * @typedef {Object} ActionBadgeMeta
- * @property {string} label
- * @property {string} title
- */
-
 const SNOOZE_FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 const TOP_TABS = ['bitbucket-tab', 'jira-tab', 'confluence-tab', 'add-product-tab'];
-
-/** @type {Readonly<Record<string, ActionBadgeMeta>>} */
-const ACTION_BADGE_LABELS = Object.freeze({
-  needs_review: {
-    label: 'Needs Review',
-    title: 'Your review is pending on this pull request'
-  },
-  changes_requested: {
-    label: 'Changes Requested',
-    title: 'A reviewer requested changes on your pull request'
-  },
-  ci_failed: {
-    label: 'CI Failed',
-    title: 'Latest CI build on your pull request failed or stopped'
-  },
-  ready_to_merge: {
-    label: 'Ready to Merge',
-    title: 'Approved by reviewers with no outstanding change requests or failing builds'
-  },
-  waiting_reviewers: {
-    label: 'Waiting',
-    title: 'Waiting on reviewers or updates from others'
-  },
-  approved_by_you: {
-    label: 'Approved',
-    title: 'You have approved this pull request'
-  },
-  changes_requested_by_you: {
-    label: 'Changes Sent',
-    title: 'You requested changes; waiting on author updates'
-  },
-  draft: {
-    label: 'Draft',
-    title: 'Draft pull request (excluded from Needs Action)'
-  }
-});
 
 /** @type {ReadonlySet<string>} */
 const WATCHED_STORAGE_KEYS = new Set([
   STORAGE_KEYS.AUTH_TYPE,
   STORAGE_KEYS.BITBUCKET_USERNAME,
   STORAGE_KEYS.BITBUCKET_TOKEN,
+  STORAGE_KEYS.GITHUB_TOKEN,
+  STORAGE_KEYS.GITHUB_API_BASE_URL,
+  STORAGE_KEYS.CACHED_GITHUB_USER,
   STORAGE_KEYS.PREFERENCES,
   STORAGE_KEYS.CACHED_USER,
   STORAGE_KEYS.CACHED_WORKSPACES,
@@ -172,12 +153,13 @@ function parseCsvList(rawText) {
  * Extract 1-2 uppercase avatar initials from a display name or username.
  *
  * @param {string} name
+ * @param {string} [fallback]
  * @returns {string}
  */
-function getInitials(name) {
+function getInitials(name, fallback = 'BB') {
   const cleaned = name.trim();
   if (!cleaned) {
-    return 'BB';
+    return fallback;
   }
   const parts = cleaned.split(/\s+/).filter(Boolean);
   if (parts.length >= 2) {
@@ -194,9 +176,15 @@ function getInitials(name) {
 function createEmptyState() {
   return {
     isAuthenticated: false,
+    bitbucketAuthenticated: false,
     authType: 'api_token',
     username: '',
     user: null,
+    github: {
+      isAuthenticated: false,
+      apiBaseUrl: getEffectiveGitHubApiBaseUrl(),
+      user: null
+    },
     workspaces: [],
     snapshot: {
       prList: [],
@@ -253,7 +241,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const settingsAccountPanel = getEl('settings-account-panel', HTMLDivElement);
   const settingsPreferencesPanel = getEl('settings-preferences-panel', HTMLDivElement);
 
-  // Account Summary
+  // Bitbucket Account Summary
   const accountSummaryCard = getEl('account-summary-card', HTMLDivElement);
   const accountAvatar = getEl('account-avatar', HTMLDivElement);
   const accountDisplayName = getEl('account-display-name', HTMLDivElement);
@@ -266,7 +254,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const confirmSignOutBtn = getEl('confirm-sign-out-btn', HTMLButtonElement);
   const cancelSignOutBtn = getEl('cancel-sign-out-btn', HTMLButtonElement);
 
-  // Credentials Form
+  // Bitbucket Credentials Form
   const credentialsForm = getEl('credentials-form', HTMLFormElement);
   const createApiTokenLink = getEl('create-api-token-link', HTMLAnchorElement);
   const requiredScopesList = getEl('required-scopes-list', HTMLUListElement);
@@ -281,6 +269,29 @@ document.addEventListener('DOMContentLoaded', async () => {
   const testConnectionBtn = getEl('test-connection-btn', HTMLButtonElement);
   const saveSettingsBtn = getEl('save-settings-btn', HTMLButtonElement);
   const cancelSettingsBtn = getEl('cancel-settings-btn', HTMLButtonElement);
+
+  // GitHub Account Summary & Credentials Form
+  const githubSummaryCard = getEl('github-summary-card', HTMLDivElement);
+  const githubAvatar = getEl('github-avatar', HTMLDivElement);
+  const githubDisplayName = getEl('github-display-name', HTMLDivElement);
+  const githubUsername = getEl('github-username', HTMLDivElement);
+  const githubApiUrlDisplay = getEl('github-api-url-display', HTMLSpanElement);
+  const githubReplaceTokenBtn = getEl('github-replace-token-btn', HTMLButtonElement);
+  const githubSignOutBtn = getEl('github-sign-out-btn', HTMLButtonElement);
+  const githubSignOutConfirm = getEl('github-sign-out-confirm', HTMLDivElement);
+  const githubConfirmSignOutBtn = getEl('github-confirm-sign-out-btn', HTMLButtonElement);
+  const githubCancelSignOutBtn = getEl('github-cancel-sign-out-btn', HTMLButtonElement);
+
+  const githubCredentialsForm = getEl('github-credentials-form', HTMLFormElement);
+  const createGitHubTokenLink = getEl('create-github-token-link', HTMLAnchorElement);
+  const githubRequiredScopesList = getEl('github-required-scopes-list', HTMLUListElement);
+  const githubTokenInput = getEl('github-token', HTMLInputElement);
+  const toggleGitHubTokenVisibilityBtn = getEl('toggle-github-token-visibility', HTMLButtonElement);
+  const githubApiUrlInput = getEl('github-api-url', HTMLInputElement);
+  const githubAuthStatusBanner = getEl('github-auth-status-banner', HTMLDivElement);
+  const testGitHubConnectionBtn = getEl('test-github-connection-btn', HTMLButtonElement);
+  const saveGitHubSettingsBtn = getEl('save-github-settings-btn', HTMLButtonElement);
+  const cancelGitHubSettingsBtn = getEl('cancel-github-settings-btn', HTMLButtonElement);
 
   // Preferences Form
   const preferencesForm = getEl('preferences-form', HTMLFormElement);
@@ -310,6 +321,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const countSnoozed = getEl('count-snoozed', HTMLSpanElement);
   const prSearchInput = getEl('pr-search-input', HTMLInputElement);
   const prSearchClearBtn = getEl('pr-search-clear-btn', HTMLButtonElement);
+  const groupByTicketBtn = getEl('group-by-ticket-btn', HTMLButtonElement);
   const prCountTitle = getEl('pr-count-title', HTMLSpanElement);
 
   const loadingIndicator = getEl('loading-indicator', HTMLDivElement);
@@ -321,6 +333,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   const backoffBanner = getEl('backoff-banner', HTMLDivElement);
   const backoffMessage = getEl('backoff-message', HTMLParagraphElement);
 
+  const relatedScopeBanner = getEl('related-scope-banner', HTMLDivElement);
+  const relatedScopeText = getEl('related-scope-text', HTMLSpanElement);
+  const clearRelatedScopeBtn = getEl('clear-related-scope-btn', HTMLButtonElement);
+
   const prItemsContainer = getEl('pr-items-container', HTMLDivElement);
   const emptyState = getEl('empty-state', HTMLDivElement);
   const emptyStateTitle = getEl('empty-state-title', HTMLHeadingElement);
@@ -328,6 +344,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const emptyStateActionBtn = getEl('empty-state-action-btn', HTMLButtonElement);
   const setupHint = getEl('setup-hint', HTMLDivElement);
   const setupHintBtn = getEl('setup-hint-btn', HTMLButtonElement);
+  const setupHintGitHubBtn = getEl('setup-hint-github-btn', HTMLButtonElement);
 
   // Jira Tab
   const openJiraBtn = getEl('open-jira-btn', HTMLButtonElement);
@@ -368,13 +385,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   /** @type {string} */
   let searchQuery = '';
   /** @type {string | null} */
+  let activeRelatedTicketKey = null;
+  /** @type {string | null} */
   let selectedPrKey = null;
   /** @type {EnrichedPullRequest[]} */
   let visiblePrs = [];
+  /** @type {EnrichedPullRequest[]} */
+  let navigablePrs = [];
+  /** @type {Set<string>} */
+  const collapsedGroups = new Set();
+  /** @type {Set<string>} */
+  const expandedStackGroups = new Set();
+  /** @type {Map<string, number>} */
+  const deckActiveSlideMap = new Map();
   /** @type {boolean} */
   let isReplacingToken = false;
   /** @type {boolean} */
+  let isReplacingGitHubToken = false;
+  /** @type {boolean} */
   let isSyncing = false;
+  /** @type {boolean} */
+  let isGroupByTicketUpdating = false;
   /** @type {number | null} */
   let storageRefreshTimer = null;
   /** @type {number | null} */
@@ -387,6 +418,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   let stateRequestSeq = 0;
 
   // --- Helper Utilities ---
+
+  /**
+   * Determine whether Bitbucket Cloud is currently authenticated.
+   *
+   * @returns {boolean}
+   */
+  function isBitbucketAuthenticated() {
+    if (typeof state.bitbucketAuthenticated === 'boolean') {
+      return state.bitbucketAuthenticated;
+    }
+    return Boolean(state.isAuthenticated && !state.github?.isAuthenticated);
+  }
+
+  /**
+   * Determine whether GitHub is currently authenticated.
+   *
+   * @returns {boolean}
+   */
+  function isGitHubAuthenticated() {
+    return Boolean(state.github?.isAuthenticated);
+  }
 
   /**
    * Show a non-blocking toast message that auto-dismisses, with an optional inline action button.
@@ -496,6 +548,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       return li;
     });
     requiredScopesList.replaceChildren(...scopeNodes);
+
+    const safeGitHubTokenDocs = sanitizeHttpsUrl(AUTH_SETUP_LINKS.githubTokens);
+    if (safeGitHubTokenDocs) {
+      createGitHubTokenLink.href = safeGitHubTokenDocs;
+    }
+
+    const githubScopeNodes = AUTH_SETUP_LINKS.githubRequiredScopes.map((scope) => {
+      const li = document.createElement('li');
+      li.textContent = scope;
+      return li;
+    });
+    githubRequiredScopesList.replaceChildren(...githubScopeNodes);
   }
 
   /**
@@ -571,20 +635,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Populate Settings -> Account & Setup UI from current `state` without ever injecting stored token plaintext.
+   * Populate Settings -> Account & Setup UI (Bitbucket Cloud + GitHub) without ever injecting stored token plaintext.
    */
   function populateAccountSection() {
-    const showSummary = state.isAuthenticated && !isReplacingToken;
-    accountSummaryCard.classList.toggle('hidden', !showSummary);
-    credentialsForm.classList.toggle('hidden', showSummary);
+    const bbAuthed = isBitbucketAuthenticated();
+    const showBbSummary = bbAuthed && !isReplacingToken;
+    accountSummaryCard.classList.toggle('hidden', !showBbSummary);
+    credentialsForm.classList.toggle('hidden', showBbSummary);
     signOutConfirm.classList.add('hidden');
 
-    if (showSummary) {
+    if (showBbSummary) {
       const displayName = state.user?.displayName || state.username || 'Bitbucket User';
       const secondaryIdentity = state.username || (state.user?.username ? `@${state.user.username}` : 'Authenticated');
       const wsCount = state.workspaces.length || state.snapshot.syncedWorkspaces.length;
 
-      accountAvatar.textContent = getInitials(displayName);
+      accountAvatar.textContent = getInitials(displayName, 'BB');
       accountDisplayName.textContent = displayName;
       accountUsername.textContent = secondaryIdentity;
       accountAuthType.textContent = state.authType === 'bearer' ? 'Bearer' : 'API Token';
@@ -600,6 +665,38 @@ document.addEventListener('DOMContentLoaded', async () => {
     toggleTokenVisibilityBtn.title = 'Show token';
     syncAuthMethodFields();
     hideInlineBanner(authStatusBanner);
+
+    // GitHub Account & Setup section
+    const ghAuthed = isGitHubAuthenticated();
+    const showGhSummary = ghAuthed && !isReplacingGitHubToken;
+    githubSummaryCard.classList.toggle('hidden', !showGhSummary);
+    githubCredentialsForm.classList.toggle('hidden', showGhSummary);
+    githubSignOutConfirm.classList.add('hidden');
+
+    const defaultGhApi = getEffectiveGitHubApiBaseUrl();
+    const currentGhApi = state.github?.apiBaseUrl || '';
+
+    if (showGhSummary) {
+      const ghUser = state.github?.user;
+      const ghName = ghUser?.displayName || ghUser?.username || 'GitHub User';
+      const ghHandle = ghUser?.username ? `@${ghUser.username}` : 'Authenticated';
+      const effectiveApi = currentGhApi || defaultGhApi;
+      const isCustomApi = effectiveApi !== defaultGhApi;
+
+      githubAvatar.textContent = getInitials(ghName, 'GH');
+      githubDisplayName.textContent = ghName;
+      githubUsername.textContent = ghHandle;
+      githubApiUrlDisplay.textContent = isCustomApi ? effectiveApi : 'github.com';
+      githubApiUrlDisplay.title = `GitHub API: ${effectiveApi}`;
+    }
+
+    // Security invariant: never populate stored GitHub token plaintext into the DOM
+    githubTokenInput.value = '';
+    githubTokenInput.type = 'password';
+    toggleGitHubTokenVisibilityBtn.setAttribute('aria-label', 'Show GitHub token');
+    toggleGitHubTokenVisibilityBtn.title = 'Show token';
+    githubApiUrlInput.value = currentGhApi;
+    hideInlineBanner(githubAuthStatusBanner);
   }
 
   /**
@@ -640,12 +737,20 @@ document.addEventListener('DOMContentLoaded', async () => {
    * Open the Settings drawer to a chosen sub-tab (`account` or `preferences`).
    *
    * @param {'account' | 'preferences'} [subtab]
-   * @param {boolean} [forceReplace]
+   * @param {boolean | { forceReplaceBitbucket?: boolean, forceReplaceGitHub?: boolean, focusTarget?: 'bitbucket' | 'github' }} [optionsOrForceReplace]
    */
-  function openSettingsPanel(subtab = 'account', forceReplace = false) {
-    if (forceReplace) {
+  function openSettingsPanel(subtab = 'account', optionsOrForceReplace = false) {
+    const opts = typeof optionsOrForceReplace === 'boolean'
+      ? { forceReplaceBitbucket: optionsOrForceReplace }
+      : optionsOrForceReplace;
+
+    if (opts.forceReplaceBitbucket) {
       isReplacingToken = true;
     }
+    if (opts.forceReplaceGitHub) {
+      isReplacingGitHubToken = true;
+    }
+
     populateAccountSection();
     populatePreferencesForm(state.preferences);
     switchSettingsSubtab(subtab);
@@ -654,7 +759,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     closeShortcutsPopover();
 
     if (subtab === 'account') {
-      if (!credentialsForm.classList.contains('hidden')) {
+      if (opts.focusTarget === 'github') {
+        if (!githubCredentialsForm.classList.contains('hidden')) {
+          githubTokenInput.focus();
+          githubTokenInput.scrollIntoView({ block: 'nearest' });
+        } else {
+          githubReplaceTokenBtn.focus();
+          githubReplaceTokenBtn.scrollIntoView({ block: 'nearest' });
+        }
+      } else if (!credentialsForm.classList.contains('hidden')) {
         if (authTypeSelect.value === 'api_token' && !bitbucketUsernameInput.value.trim()) {
           bitbucketUsernameInput.focus();
         } else {
@@ -674,6 +787,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   function closeSettingsPanel() {
     const focusWasInside = settingsPanel.contains(document.activeElement);
     isReplacingToken = false;
+    isReplacingGitHubToken = false;
     populateAccountSection();
     populatePreferencesForm(state.preferences);
     settingsPanel.classList.add('hidden');
@@ -716,51 +830,26 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Update header connection chip based on auth, error, and rate-limit state, with a rich tooltip.
+   * Update header connection chip based on single/dual provider auth, error, and rate-limit state.
    */
   function renderHeaderStatusChip() {
-    connectionStatusChip.className = 'status-chip';
-    const now = Date.now();
-    const syncedSlugs = state.snapshot.syncedWorkspaces.length > 0
-      ? state.snapshot.syncedWorkspaces
-      : state.workspaces.map((ws) => ws.slug).filter(Boolean);
-    const wsText = syncedSlugs.length > 0
-      ? `Workspaces: ${syncedSlugs.join(', ')}`
-      : 'No workspaces synced yet';
+    const descriptor = getHeaderConnectionDescriptor({
+      bitbucketAuthenticated: isBitbucketAuthenticated(),
+      bitbucketUser: state.user,
+      bitbucketUsername: state.username,
+      github: state.github,
+      syncedWorkspaces: state.snapshot.syncedWorkspaces,
+      workspaces: state.workspaces,
+      error: state.snapshot.error,
+      rateLimitWarning: state.snapshot.rateLimitWarning,
+      backoffUntil: state.syncState.backoffUntil,
+      now: Date.now()
+    });
 
-    if (!state.isAuthenticated) {
-      connectionStatusChip.classList.add('status-chip-neutral');
-      connectionStatusText.textContent = 'Not connected';
-      connectionStatusChip.title = 'Click to connect your Bitbucket account';
-      connectionStatusChip.setAttribute('aria-label', 'Connection status: Not connected. Open settings');
-      return;
-    }
-
-    const displayLabel = state.user?.displayName || state.username || 'Connected';
-
-    if (state.snapshot.error) {
-      connectionStatusChip.classList.add('status-chip-error');
-      connectionStatusText.textContent = 'Sync issue';
-      connectionStatusChip.title = `${displayLabel} — ${state.snapshot.error}\n${wsText}`;
-      connectionStatusChip.setAttribute('aria-label', `Connection status: Sync issue. Open settings`);
-      return;
-    }
-
-    if (state.snapshot.rateLimitWarning || (state.syncState.backoffUntil && state.syncState.backoffUntil > now)) {
-      connectionStatusChip.classList.add('status-chip-warning');
-      connectionStatusText.textContent = 'Rate limited';
-      const backoffNote = state.syncState.backoffUntil && state.syncState.backoffUntil > now
-        ? `Auto-polling paused until ${new Date(state.syncState.backoffUntil).toLocaleTimeString()}`
-        : 'Approaching Bitbucket API rate limit';
-      connectionStatusChip.title = `${displayLabel} — ${backoffNote}\n${wsText}`;
-      connectionStatusChip.setAttribute('aria-label', 'Connection status: Rate limited. Open settings');
-      return;
-    }
-
-    connectionStatusChip.classList.add('status-chip-connected');
-    connectionStatusText.textContent = displayLabel;
-    connectionStatusChip.title = `Connected as ${displayLabel}\n${wsText}\nClick to open Settings`;
-    connectionStatusChip.setAttribute('aria-label', `Connected as ${displayLabel}. Open settings`);
+    connectionStatusChip.className = `status-chip status-chip-${descriptor.variant}`;
+    connectionStatusText.textContent = descriptor.text;
+    connectionStatusChip.title = descriptor.title;
+    connectionStatusChip.setAttribute('aria-label', descriptor.ariaLabel);
   }
 
   /**
@@ -810,15 +899,35 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
+   * Build a subtle provider micro-badge (`BB` or `GH`) element.
+   *
+   * @param {'bitbucket' | 'github'} provider
+   * @returns {HTMLSpanElement}
+   */
+  function buildProviderBadgeElement(provider) {
+    const badge = document.createElement('span');
+    badge.className = provider === 'github'
+      ? 'provider-badge provider-gh'
+      : 'provider-badge provider-bb';
+    badge.textContent = provider === 'github' ? 'GH' : 'BB';
+    badge.title = provider === 'github' ? 'GitHub pull request' : 'Bitbucket Cloud pull request';
+    return badge;
+  }
+
+  /**
    * Build a single accessible PR card DOM element without `innerHTML`.
    *
    * @param {EnrichedPullRequest} pr
    * @param {boolean} isSelected
    * @param {boolean} isSnoozed
    * @param {number} now
+   * @param {{
+   *   showProviderBadge?: boolean,
+   *   relatedSummary?: RelatedPrSummary | null
+   * }} [options]
    * @returns {HTMLDivElement}
    */
-  function buildPrCardElement(pr, isSelected, isSnoozed, now) {
+  function buildPrCardElement(pr, isSelected, isSnoozed, now, options = {}) {
     const card = document.createElement('div');
     card.className = 'pr-card';
     if (pr.isYourTurn) {
@@ -832,12 +941,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     card.dataset.prKey = pr.key;
     card.tabIndex = 0;
 
-    // Top row: repo + PR ID + action/CI/stale badges
+    // Top row: provider badge + repo + PR ID + action/CI/stale/related badges
     const topRow = document.createElement('div');
     topRow.className = 'pr-card-top';
 
     const repoRow = document.createElement('div');
     repoRow.className = 'pr-repo-row';
+
+    if (options.showProviderBadge) {
+      repoRow.appendChild(buildProviderBadgeElement(pr.provider));
+    }
 
     const repoEl = document.createElement('span');
     repoEl.className = 'pr-repo';
@@ -851,6 +964,26 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const badgesRow = document.createElement('div');
     badgesRow.className = 'pr-badges-row';
+
+    if (options.relatedSummary && !activeRelatedTicketKey) {
+      const relatedCount = options.relatedSummary.relatedKeys.length;
+      const ticketKey = options.relatedSummary.ticketKey;
+      if (relatedCount > 0 && ticketKey) {
+        const relatedBtn = document.createElement('button');
+        relatedBtn.type = 'button';
+        relatedBtn.className = 'related-pr-pill';
+        relatedBtn.textContent = `🔗 +${relatedCount} ${ticketKey}`;
+        relatedBtn.title = `Show ${relatedCount + 1} related PRs for ${ticketKey}`;
+        relatedBtn.setAttribute('aria-label', `Show ${relatedCount + 1} related PRs for ${ticketKey}`);
+        relatedBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          activeRelatedTicketKey = ticketKey;
+          selectedPrKey = null;
+          renderBitbucketTab();
+        });
+        badgesRow.appendChild(relatedBtn);
+      }
+    }
 
     if (pr.buildStatus) {
       const ciBadgeEl = buildCiBadgeElement(pr.buildStatus);
@@ -1064,8 +1197,370 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
+   * Build a collapsible Ticket Group element. Multi-PR linked tickets render as a
+   * horizontal swipeable Ticket Deck (with color-coded mini-map dots, off-screen attention badge,
+   * prev/next buttons, and optional `⊞` vertical stack toggle); `UNLINKED` stays a vertical list.
+   *
+   * @param {TicketPrGroup} group
+   * @param {SnoozedMap} snoozedMap
+   * @param {number} now
+   * @param {boolean} showProviderBadge
+   * @returns {{ element: HTMLDivElement, orderedPrs: EnrichedPullRequest[], trackEl: HTMLDivElement | null }}
+   */
+  function buildTicketGroupElement(group, snoozedMap, now, showProviderBadge) {
+    const groupEl = document.createElement('div');
+    const isCollapsed = collapsedGroups.has(group.groupKey);
+    const isExpandedStack = expandedStackGroups.has(group.groupKey);
+    groupEl.className = 'ticket-group';
+    groupEl.dataset.groupKey = group.groupKey;
+    if (isCollapsed) {
+      groupEl.classList.add('is-collapsed');
+    }
+    if (isExpandedStack) {
+      groupEl.classList.add('is-expanded-stack');
+    }
+
+    const orderedPrs = sortDeckPrs(group.prs);
+    const isDeck = !group.isUnlinked && orderedPrs.length > 1;
+
+    // Header row
+    const headerRow = document.createElement('div');
+    headerRow.className = 'ticket-group-header-row';
+
+    const headerBtn = document.createElement('button');
+    headerBtn.type = 'button';
+    headerBtn.className = 'ticket-group-header';
+    headerBtn.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+    headerBtn.setAttribute('aria-label', `${group.label} (${orderedPrs.length} pull requests)`);
+
+    const chevron = document.createElement('span');
+    chevron.className = 'ticket-group-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
+    chevron.textContent = '▾';
+    headerBtn.appendChild(chevron);
+
+    const safeTicketUrl = sanitizeHttpsUrl(group.ticketUrl);
+    if (!safeTicketUrl) {
+      const labelSpan = document.createElement('span');
+      labelSpan.className = 'ticket-group-key';
+      labelSpan.textContent = group.label;
+      headerBtn.appendChild(labelSpan);
+    }
+
+    const countBadge = document.createElement('span');
+    countBadge.className = 'ticket-group-count';
+    countBadge.textContent = String(orderedPrs.length);
+    countBadge.title = `${orderedPrs.length} pull request${orderedPrs.length === 1 ? '' : 's'}`;
+    headerBtn.appendChild(countBadge);
+
+    if (group.yourTurnCount > 0) {
+      const turnPill = document.createElement('span');
+      turnPill.className = 'ticket-group-meta-pill is-action';
+      turnPill.textContent = `${group.yourTurnCount} Your Turn`;
+      headerBtn.appendChild(turnPill);
+    }
+
+    const approvedPill = document.createElement('span');
+    approvedPill.className = group.approvedCount > 0
+      ? 'ticket-group-meta-pill is-approved'
+      : 'ticket-group-meta-pill';
+    approvedPill.textContent = `${group.approvedCount}/${orderedPrs.length} Approved`;
+    headerBtn.appendChild(approvedPill);
+
+    if (group.ciFailedCount > 0) {
+      const ciPill = document.createElement('span');
+      ciPill.className = 'ticket-group-meta-pill is-ci-failed';
+      ciPill.textContent = `${group.ciFailedCount} CI Failed`;
+      headerBtn.appendChild(ciPill);
+    }
+
+    if (group.providers.length > 1) {
+      for (const prov of group.providers) {
+        headerBtn.appendChild(buildProviderBadgeElement(prov));
+      }
+    }
+
+    headerBtn.addEventListener('click', () => {
+      const nextCollapsed = !collapsedGroups.has(group.groupKey);
+      if (nextCollapsed) {
+        collapsedGroups.add(group.groupKey);
+      } else {
+        collapsedGroups.delete(group.groupKey);
+      }
+      groupEl.classList.toggle('is-collapsed', nextCollapsed);
+      headerBtn.setAttribute('aria-expanded', nextCollapsed ? 'false' : 'true');
+    });
+
+    if (safeTicketUrl) {
+      const keyLink = document.createElement('a');
+      keyLink.className = 'ticket-group-key-link';
+      keyLink.href = safeTicketUrl;
+      keyLink.target = '_blank';
+      keyLink.rel = 'noopener noreferrer';
+      keyLink.textContent = `${group.label} ↗`;
+      keyLink.title = `Open ${group.label} in Jira`;
+      keyLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void openSafeExternalUrl(safeTicketUrl);
+      });
+      headerRow.append(keyLink, headerBtn);
+    } else {
+      headerRow.appendChild(headerBtn);
+    }
+
+    const bodyEl = document.createElement('div');
+    bodyEl.className = 'ticket-group-body';
+
+    if (!isDeck) {
+      for (const pr of orderedPrs) {
+        const card = buildPrCardElement(
+          pr,
+          Boolean(selectedPrKey && pr.key === selectedPrKey),
+          isPrSnoozed(pr, snoozedMap, now),
+          now,
+          { showProviderBadge }
+        );
+        bodyEl.appendChild(card);
+      }
+      groupEl.append(headerRow, bodyEl);
+      return { element: groupEl, orderedPrs, trackEl: null };
+    }
+
+    // Horizontal Ticket Deck for multi-PR linked tickets
+    let activeSlideIndex = deckActiveSlideMap.get(group.groupKey) ?? 0;
+    const selectedIndexInDeck = selectedPrKey
+      ? orderedPrs.findIndex((p) => p.key === selectedPrKey)
+      : -1;
+    if (selectedIndexInDeck >= 0) {
+      activeSlideIndex = selectedIndexInDeck;
+    }
+    activeSlideIndex = Math.max(0, Math.min(orderedPrs.length - 1, activeSlideIndex));
+    deckActiveSlideMap.set(group.groupKey, activeSlideIndex);
+
+    const deckBar = document.createElement('div');
+    deckBar.className = 'ticket-deck-bar';
+
+    const deckLeft = document.createElement('div');
+    deckLeft.className = 'ticket-deck-left';
+
+    const counterEl = document.createElement('span');
+    counterEl.className = 'ticket-deck-counter';
+    deckLeft.appendChild(counterEl);
+
+    const dotsWrap = document.createElement('div');
+    dotsWrap.className = 'ticket-deck-dots';
+    dotsWrap.setAttribute('role', 'tablist');
+    dotsWrap.setAttribute('aria-label', `PR slides for ${group.label}`);
+
+    /** @type {HTMLButtonElement[]} */
+    const dotButtons = orderedPrs.map((pr, idx) => {
+      const dotDesc = getDeckDotDescriptor(pr);
+      const dotBtn = document.createElement('button');
+      dotBtn.type = 'button';
+      dotBtn.className = `ticket-deck-dot ${dotDesc.colorClass}`;
+      dotBtn.title = dotDesc.tooltip;
+      dotBtn.setAttribute('aria-label', `Slide ${idx + 1} of ${orderedPrs.length}: ${dotDesc.tooltip}`);
+      dotBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        goToSlide(idx, true);
+      });
+      dotsWrap.appendChild(dotBtn);
+      return dotBtn;
+    });
+    deckLeft.appendChild(dotsWrap);
+
+    const offscreenBtn = document.createElement('button');
+    offscreenBtn.type = 'button';
+    offscreenBtn.className = 'deck-offscreen-badge hidden';
+    deckLeft.appendChild(offscreenBtn);
+
+    const navWrap = document.createElement('div');
+    navWrap.className = 'ticket-deck-nav';
+
+    const prevBtn = document.createElement('button');
+    prevBtn.type = 'button';
+    prevBtn.className = 'deck-nav-btn';
+    prevBtn.textContent = '‹';
+    prevBtn.title = 'Previous PR in deck (h / ←)';
+    prevBtn.setAttribute('aria-label', `Previous PR in ${group.label}`);
+
+    const nextBtn = document.createElement('button');
+    nextBtn.type = 'button';
+    nextBtn.className = 'deck-nav-btn';
+    nextBtn.textContent = '›';
+    nextBtn.title = 'Next PR in deck (l / →)';
+    nextBtn.setAttribute('aria-label', `Next PR in ${group.label}`);
+
+    const expandStackBtn = document.createElement('button');
+    expandStackBtn.type = 'button';
+    expandStackBtn.className = 'deck-expand-btn';
+    expandStackBtn.textContent = '⊞';
+    expandStackBtn.setAttribute('aria-pressed', isExpandedStack ? 'true' : 'false');
+    expandStackBtn.title = isExpandedStack ? 'Collapse to horizontal deck' : 'Stack all PRs vertically';
+    expandStackBtn.setAttribute('aria-label', `Toggle vertical stack for ${group.label}`);
+
+    navWrap.append(prevBtn, nextBtn, expandStackBtn);
+    deckBar.append(deckLeft, navWrap);
+
+    const trackEl = document.createElement('div');
+    trackEl.className = 'ticket-deck-track';
+    trackEl.dataset.groupKey = group.groupKey;
+
+    /** @type {HTMLDivElement[]} */
+    const slideElements = orderedPrs.map((pr) => {
+      const slide = document.createElement('div');
+      slide.className = 'ticket-deck-slide';
+      slide.dataset.prKey = pr.key;
+      const card = buildPrCardElement(
+        pr,
+        Boolean(selectedPrKey && pr.key === selectedPrKey),
+        isPrSnoozed(pr, snoozedMap, now),
+        now,
+        { showProviderBadge }
+      );
+      slide.appendChild(card);
+      trackEl.appendChild(slide);
+      return slide;
+    });
+
+    /**
+     * Synchronize deck counter, mini-map dots, prev/next disabled states, and off-screen attention badge.
+     *
+     * @param {number} idx
+     */
+    function syncDeckChrome(idx) {
+      const clamped = Math.max(0, Math.min(orderedPrs.length - 1, idx));
+      activeSlideIndex = clamped;
+      deckActiveSlideMap.set(group.groupKey, clamped);
+      counterEl.textContent = `${clamped + 1} / ${orderedPrs.length}`;
+
+      dotButtons.forEach((dot, dotIdx) => {
+        const active = dotIdx === clamped;
+        dot.classList.toggle('is-active', active);
+        dot.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+
+      const stacked = expandedStackGroups.has(group.groupKey);
+      prevBtn.disabled = stacked || clamped <= 0;
+      nextBtn.disabled = stacked || clamped >= orderedPrs.length - 1;
+      prevBtn.classList.toggle('hidden', stacked);
+      nextBtn.classList.toggle('hidden', stacked);
+      dotsWrap.classList.toggle('hidden', stacked);
+      counterEl.classList.toggle('hidden', stacked);
+
+      const offscreen = stacked
+        ? null
+        : getOffscreenDeckAttention(orderedPrs, clamped, snoozedMap, Date.now());
+      if (offscreen) {
+        offscreenBtn.textContent = offscreen.label;
+        offscreenBtn.title = `Jump to off-screen PR needing action`;
+        offscreenBtn.dataset.targetIndex = String(offscreen.targetIndex);
+        offscreenBtn.classList.remove('hidden');
+      } else {
+        offscreenBtn.classList.add('hidden');
+      }
+    }
+
+    /**
+     * Scroll deck smoothly to `targetIndex` and optionally select the PR card.
+     *
+     * @param {number} targetIndex
+     * @param {boolean} [selectTarget]
+     * @param {'auto' | 'smooth'} [behavior]
+     */
+    function goToSlide(targetIndex, selectTarget = false, behavior = 'smooth') {
+      const clamped = Math.max(0, Math.min(orderedPrs.length - 1, targetIndex));
+      syncDeckChrome(clamped);
+      const slideEl = slideElements[clamped];
+      if (slideEl) {
+        const slideWidth = trackEl.clientWidth || slideEl.offsetWidth;
+        if (slideWidth > 0 && typeof trackEl.scrollTo === 'function') {
+          trackEl.scrollTo({
+            left: clamped * (slideWidth + 6),
+            behavior
+          });
+        } else if (typeof slideEl.scrollIntoView === 'function') {
+          slideEl.scrollIntoView({ inline: 'start', block: 'nearest', behavior });
+        }
+      }
+      if (selectTarget) {
+        const targetPr = orderedPrs[clamped];
+        if (targetPr) {
+          selectPrCard(targetPr.key, false);
+        }
+      }
+    }
+
+    offscreenBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const targetIdx = Number.parseInt(offscreenBtn.dataset.targetIndex || '0', 10);
+      if (Number.isFinite(targetIdx)) {
+        goToSlide(targetIdx, true);
+      }
+    });
+
+    prevBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      goToSlide(activeSlideIndex - 1, true);
+    });
+
+    nextBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      goToSlide(activeSlideIndex + 1, true);
+    });
+
+    expandStackBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const nextStacked = !expandedStackGroups.has(group.groupKey);
+      if (nextStacked) {
+        expandedStackGroups.add(group.groupKey);
+      } else {
+        expandedStackGroups.delete(group.groupKey);
+      }
+      groupEl.classList.toggle('is-expanded-stack', nextStacked);
+      expandStackBtn.setAttribute('aria-pressed', nextStacked ? 'true' : 'false');
+      expandStackBtn.title = nextStacked ? 'Collapse to horizontal deck' : 'Stack all PRs vertically';
+      syncDeckChrome(activeSlideIndex);
+      if (!nextStacked) {
+        goToSlide(activeSlideIndex, false, 'auto');
+      }
+    });
+
+    let scrollSyncTimer = /** @type {number | null} */ (null);
+    trackEl.addEventListener('scroll', () => {
+      if (expandedStackGroups.has(group.groupKey)) {
+        return;
+      }
+      if (scrollSyncTimer !== null) {
+        window.clearTimeout(scrollSyncTimer);
+      }
+      scrollSyncTimer = window.setTimeout(() => {
+        scrollSyncTimer = null;
+        const width = trackEl.clientWidth;
+        if (width <= 0) {
+          return;
+        }
+        const inferredIdx = Math.round(trackEl.scrollLeft / (width + 6));
+        if (inferredIdx !== activeSlideIndex && inferredIdx >= 0 && inferredIdx < orderedPrs.length) {
+          syncDeckChrome(inferredIdx);
+        }
+      }, 60);
+    }, { passive: true });
+
+    syncDeckChrome(activeSlideIndex);
+    if (!isExpandedStack && activeSlideIndex > 0) {
+      window.requestAnimationFrame(() => goToSlide(activeSlideIndex, false, 'auto'));
+    }
+
+    bodyEl.append(deckBar, trackEl);
+    groupEl.append(headerRow, bodyEl);
+    return { element: groupEl, orderedPrs, trackEl };
+  }
+
+  /**
    * Highlight a PR card as keyboard-selected, sync focus out of any previously focused PR card,
-   * and smoothly scroll the selected card into view.
+   * smoothly scroll the selected card into view (and align its Ticket Deck slide if needed).
    *
    * @param {string | null} prKey
    * @param {boolean} [scrollIntoView]
@@ -1089,7 +1584,19 @@ document.addEventListener('DOMContentLoaded', async () => {
       node.classList.toggle('is-selected', match);
       node.setAttribute('aria-selected', match ? 'true' : 'false');
       if (match && scrollIntoView) {
-        node.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        const parentGroup = node.closest('.ticket-group');
+        if (parentGroup instanceof HTMLElement && parentGroup.classList.contains('is-collapsed')) {
+          const groupKey = parentGroup.dataset.groupKey;
+          if (groupKey) {
+            collapsedGroups.delete(groupKey);
+            parentGroup.classList.remove('is-collapsed');
+            const hdr = parentGroup.querySelector('.ticket-group-header');
+            if (hdr) {
+              hdr.setAttribute('aria-expanded', 'true');
+            }
+          }
+        }
+        node.scrollIntoView({ block: 'nearest', inline: 'start', behavior: 'smooth' });
       }
     }
   }
@@ -1128,7 +1635,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Render the Bitbucket PRs tab: filter pills, counts, search, banners, PR cards, or empty/onboarding state.
+   * Sync the `#group-by-ticket-btn` visual toggle state from `state.preferences.groupByTicket`.
+   */
+  function renderGroupByTicketToggle() {
+    const enabled = Boolean(state.preferences.groupByTicket);
+    groupByTicketBtn.classList.toggle('active', enabled);
+    groupByTicketBtn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+    groupByTicketBtn.disabled = isGroupByTicketUpdating;
+  }
+
+  /**
+   * Render the PR list tab: filter pills, counts, search, By Ticket toggle, Related scope banner,
+   * Flat or Ticket-Deck grouped PR cards, or empty/onboarding state.
    */
   function renderBitbucketTab() {
     const prevScrollTop = mainContent.scrollTop;
@@ -1136,6 +1654,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     extensionContainer.classList.toggle('compact-mode', Boolean(state.preferences.compactMode));
 
     if (!state.isAuthenticated) {
+      activeRelatedTicketKey = null;
+      relatedScopeBanner.classList.add('hidden');
       triageControls.classList.add('hidden');
       prItemsContainer.replaceChildren();
       emptyState.classList.add('hidden');
@@ -1151,6 +1671,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         errorAlert.classList.add('hidden');
       }
       visiblePrs = [];
+      navigablePrs = [];
       selectedPrKey = null;
       return;
     }
@@ -1158,10 +1679,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupHint.classList.add('hidden');
     triageControls.classList.remove('hidden');
     renderStatusBanners(now);
+    renderGroupByTicketToggle();
 
     const prs = state.snapshot.prList;
     const snoozedMap = state.snoozedMap;
     const counts = computeCounts(prs, snoozedMap, now);
+    const showProviderBadge = (isBitbucketAuthenticated() && isGitHubAuthenticated()) ||
+      prs.some((pr) => pr.provider === 'github');
 
     countActionRequired.textContent = String(counts.actionRequired);
     countReviewing.textContent = String(counts.reviewing);
@@ -1179,19 +1703,36 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     prSearchClearBtn.classList.toggle('hidden', searchQuery.trim().length === 0);
 
-    visiblePrs = filterAndSortPrs(prs, {
-      filter: activeFilter,
-      query: searchQuery,
-      snoozedMap,
-      now
-    });
+    if (activeRelatedTicketKey) {
+      visiblePrs = filterPrsByRelatedTicket(prs, activeRelatedTicketKey);
+      relatedScopeText.textContent = `Related PRs for ${activeRelatedTicketKey} (${visiblePrs.length})`;
+      relatedScopeBanner.classList.remove('hidden');
+    } else {
+      relatedScopeBanner.classList.add('hidden');
+      visiblePrs = filterAndSortPrs(prs, {
+        filter: activeFilter,
+        query: searchQuery,
+        snoozedMap,
+        now
+      });
+    }
 
     prCountTitle.textContent = `${visiblePrs.length} PR${visiblePrs.length === 1 ? '' : 's'}`;
 
     if (visiblePrs.length === 0) {
       prItemsContainer.replaceChildren();
+      navigablePrs = [];
       selectedPrKey = null;
       emptyState.classList.remove('hidden');
+
+      if (activeRelatedTicketKey) {
+        emptyStateTitle.textContent = 'No related PRs open';
+        emptyStateMessage.textContent = `No open pull requests reference ${activeRelatedTicketKey}.`;
+        emptyStateActionBtn.textContent = 'Show All PRs';
+        emptyStateActionBtn.dataset.emptyAction = 'clear_related';
+        emptyStateActionBtn.classList.remove('hidden');
+        return;
+      }
 
       const trimmedQuery = searchQuery.trim();
       if (trimmedQuery) {
@@ -1242,15 +1783,36 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     const fragment = document.createDocumentFragment();
-    for (const pr of visiblePrs) {
-      const card = buildPrCardElement(
-        pr,
-        Boolean(selectedPrKey && pr.key === selectedPrKey),
-        isPrSnoozed(pr, snoozedMap, now),
-        now
-      );
-      fragment.appendChild(card);
+    const shouldGroup = Boolean(state.preferences.groupByTicket) && !activeRelatedTicketKey;
+
+    if (shouldGroup) {
+      const groups = groupPrsByTicket(visiblePrs, snoozedMap, now);
+      /** @type {EnrichedPullRequest[]} */
+      const nextNavigable = [];
+      for (const group of groups) {
+        const rendered = buildTicketGroupElement(group, snoozedMap, now, showProviderBadge);
+        fragment.appendChild(rendered.element);
+        nextNavigable.push(...rendered.orderedPrs);
+      }
+      navigablePrs = nextNavigable;
+    } else {
+      const relatedMap = buildRelatedPrMap(prs);
+      navigablePrs = visiblePrs;
+      for (const pr of visiblePrs) {
+        const card = buildPrCardElement(
+          pr,
+          Boolean(selectedPrKey && pr.key === selectedPrKey),
+          isPrSnoozed(pr, snoozedMap, now),
+          now,
+          {
+            showProviderBadge,
+            relatedSummary: relatedMap[pr.key] ?? null
+          }
+        );
+        fragment.appendChild(card);
+      }
     }
+
     prItemsContainer.replaceChildren(fragment);
 
     if (prevScrollTop > 0) {
@@ -1282,8 +1844,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!state.isAuthenticated) {
       jiraTicketsCount.textContent = 'Not connected';
       jiraTicketsContainer.replaceChildren();
-      jiraEmptyTitle.textContent = 'Connect Bitbucket first';
-      jiraEmptyMessage.textContent = 'Sign in with your Bitbucket credentials to surface Jira keys referenced in your open pull requests.';
+      jiraEmptyTitle.textContent = 'Connect an account first';
+      jiraEmptyMessage.textContent = 'Connect Bitbucket or GitHub in Settings to surface Jira keys referenced in your open pull requests.';
       jiraConnectBtn.classList.remove('hidden');
       jiraEmptyState.classList.remove('hidden');
       return;
@@ -1342,9 +1904,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       filterBtn.type = 'button';
       filterBtn.className = 'btn btn-ghost btn-sm';
       filterBtn.textContent = 'Filter PRs';
-      filterBtn.title = `Filter Bitbucket PRs matching ${ticket.key}`;
+      filterBtn.title = `Filter PRs matching ${ticket.key}`;
       filterBtn.setAttribute('aria-label', `Filter pull requests for ${ticket.key}`);
       filterBtn.addEventListener('click', () => {
+        activeRelatedTicketKey = null;
         activeFilter = 'all';
         selectedPrKey = null;
         searchQuery = ticket.key;
@@ -1488,7 +2051,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     if (!state.isAuthenticated) {
       openSettingsPanel('account');
-      showToast('Connect Bitbucket first to sync PRs.');
+      showToast('Connect Bitbucket or GitHub first to sync PRs.');
       return;
     }
 
@@ -1517,6 +2080,47 @@ document.addEventListener('DOMContentLoaded', async () => {
       showToast(msg, 'error');
     } finally {
       setSyncLoading(false);
+    }
+  }
+
+  /**
+   * Toggle `preferences.groupByTicket` and persist via `UPDATE_PREFERENCES`.
+   */
+  async function toggleGroupByTicket() {
+    if (isGroupByTicketUpdating || !state.isAuthenticated) {
+      return;
+    }
+    const nextGroupByTicket = !Boolean(state.preferences.groupByTicket);
+    activeRelatedTicketKey = null;
+    selectedPrKey = null;
+
+    state.preferences = {
+      ...state.preferences,
+      groupByTicket: nextGroupByTicket
+    };
+    renderBitbucketTab();
+
+    isGroupByTicketUpdating = true;
+    renderGroupByTicketToggle();
+    try {
+      markLocalStateMutation();
+      const res = await sendWorkerMessage({
+        action: 'UPDATE_PREFERENCES',
+        preferences: { ...state.preferences, groupByTicket: nextGroupByTicket }
+      });
+      if (res.ok === false) {
+        showToast(String(res.error || 'Could not update grouping preference.'), 'error');
+        await refreshStateFromWorker();
+        return;
+      }
+      await refreshStateFromWorker();
+      markLocalStateMutation();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to update grouping preference.', 'error');
+      await refreshStateFromWorker();
+    } finally {
+      isGroupByTicketUpdating = false;
+      renderGroupByTicketToggle();
     }
   }
 
@@ -1600,7 +2204,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Collect and validate credential inputs from the Account & Setup form.
+   * Collect and validate credential inputs from the Bitbucket Account & Setup form.
    *
    * @returns {{ authType: AuthType, username: string, token: string } | null}
    */
@@ -1623,7 +2227,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Disable/enable Account form controls during async verification or saving.
+   * Disable/enable Bitbucket Account form controls during async verification or saving.
    *
    * @param {boolean} busy
    */
@@ -1669,7 +2273,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Verify, save credentials, trigger immediate sync, and close Settings on success.
+   * Verify, save Bitbucket credentials, trigger immediate sync, and close Settings on success.
    *
    * @param {SubmitEvent} e
    */
@@ -1704,6 +2308,116 @@ document.addEventListener('DOMContentLoaded', async () => {
       );
     } finally {
       setCredentialsFormBusy(false);
+    }
+  }
+
+  /**
+   * Collect and validate GitHub PAT & optional Enterprise API URL from the GitHub form.
+   *
+   * @returns {{ token: string, apiBaseUrl: string } | null}
+   */
+  function readValidatedGitHubInputs() {
+    const token = githubTokenInput.value.trim();
+    const apiBaseUrl = githubApiUrlInput.value.trim();
+
+    if (!token) {
+      showInlineBanner(githubAuthStatusBanner, 'Paste your GitHub Personal Access Token before continuing.', 'error');
+      githubTokenInput.focus();
+      return null;
+    }
+
+    if (apiBaseUrl && !sanitizeHttpsUrl(apiBaseUrl)) {
+      showInlineBanner(
+        githubAuthStatusBanner,
+        'GitHub API Base URL must be a valid https:// URL (e.g. https://api.github.com or https://github.company.com/api/v3).',
+        'error'
+      );
+      githubApiUrlInput.focus();
+      return null;
+    }
+
+    return { token, apiBaseUrl };
+  }
+
+  /**
+   * Disable/enable GitHub Account form controls during async verification or saving.
+   *
+   * @param {boolean} busy
+   */
+  function setGitHubFormBusy(busy) {
+    testGitHubConnectionBtn.disabled = busy;
+    saveGitHubSettingsBtn.disabled = busy;
+    cancelGitHubSettingsBtn.disabled = busy;
+  }
+
+  /**
+   * Test entered GitHub PAT credentials without persisting them.
+   */
+  async function handleTestGitHubConnection() {
+    const creds = readValidatedGitHubInputs();
+    if (!creds) {
+      return;
+    }
+
+    setGitHubFormBusy(true);
+    showInlineBanner(githubAuthStatusBanner, 'Testing GitHub connection...', 'info');
+    try {
+      const res = await sendWorkerMessage({ action: 'TEST_GITHUB_CONNECTION', creds });
+      if (res.ok) {
+        const display = res.user?.displayName || 'GitHub User';
+        const login = res.user?.username ? `@${res.user.username}` : '';
+        const identity = login && display !== res.user?.username ? `${display} (${login})` : (login || display);
+        showInlineBanner(githubAuthStatusBanner, `Verified as ${identity}.`, 'success');
+      } else {
+        showInlineBanner(githubAuthStatusBanner, String(res.error || 'GitHub verification failed.'), 'error');
+      }
+    } catch (err) {
+      showInlineBanner(
+        githubAuthStatusBanner,
+        err instanceof Error ? err.message : 'Failed to test GitHub connection.',
+        'error'
+      );
+    } finally {
+      setGitHubFormBusy(false);
+    }
+  }
+
+  /**
+   * Verify, save GitHub credentials, trigger immediate sync, and close Settings on success.
+   *
+   * @param {SubmitEvent} e
+   */
+  async function handleSaveGitHubCredentials(e) {
+    e.preventDefault();
+    const creds = readValidatedGitHubInputs();
+    if (!creds) {
+      return;
+    }
+
+    setGitHubFormBusy(true);
+    showInlineBanner(githubAuthStatusBanner, 'Verifying and syncing GitHub pull requests...', 'info');
+    try {
+      markLocalStateMutation();
+      const res = await sendWorkerMessage({ action: 'SAVE_GITHUB_CREDENTIALS', creds });
+      if (!res.ok) {
+        showInlineBanner(githubAuthStatusBanner, String(res.error || 'Could not save GitHub credentials.'), 'error');
+        return;
+      }
+
+      githubTokenInput.value = '';
+      isReplacingGitHubToken = false;
+      await refreshStateFromWorker({ applyDefaultFilter: true });
+      markLocalStateMutation();
+      closeSettingsPanel();
+      showToast('GitHub connected & synced!', 'success');
+    } catch (err) {
+      showInlineBanner(
+        githubAuthStatusBanner,
+        err instanceof Error ? err.message : 'Failed to save GitHub credentials.',
+        'error'
+      );
+    } finally {
+      setGitHubFormBusy(false);
     }
   }
 
@@ -1780,6 +2494,55 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
+   * Navigate to the previous or next slide inside the Ticket Deck containing `selectedPrKey`.
+   *
+   * @param {-1 | 1} delta
+   * @returns {boolean}
+   */
+  function navigateDeckSlideForSelectedPr(delta) {
+    if (!selectedPrKey) {
+      return false;
+    }
+    const cards = Array.from(prItemsContainer.querySelectorAll('.pr-card'));
+    const selectedCard = cards.find(
+      (node) => node instanceof HTMLElement && node.dataset.prKey === selectedPrKey
+    );
+    if (!(selectedCard instanceof HTMLElement)) {
+      return false;
+    }
+    const groupEl = selectedCard.closest('.ticket-group');
+    if (!(groupEl instanceof HTMLElement) || groupEl.classList.contains('is-expanded-stack')) {
+      return false;
+    }
+    const slides = Array.from(groupEl.querySelectorAll('.ticket-deck-slide'));
+    if (slides.length <= 1) {
+      return false;
+    }
+    const slideIdx = slides.findIndex(
+      (s) => s instanceof HTMLElement && s.dataset.prKey === selectedPrKey
+    );
+    if (slideIdx < 0) {
+      return false;
+    }
+    const nextIdx = Math.max(0, Math.min(slides.length - 1, slideIdx + delta));
+    if (nextIdx === slideIdx) {
+      return true;
+    }
+    const navBtn = groupEl.querySelector(delta < 0 ? '.deck-nav-btn:first-of-type' : '.deck-nav-btn:nth-of-type(2)');
+    if (navBtn instanceof HTMLButtonElement && !navBtn.disabled) {
+      navBtn.click();
+      return true;
+    }
+    const nextSlide = slides[nextIdx];
+    const nextKey = nextSlide instanceof HTMLElement ? nextSlide.dataset.prKey : null;
+    if (nextKey) {
+      selectPrCard(nextKey, true);
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Wire `ArrowLeft` / `ArrowRight` roving keyboard navigation for an ARIA `tablist`.
    *
    * @param {readonly HTMLButtonElement[]} buttons
@@ -1830,7 +2593,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   connectionStatusChip.addEventListener('click', () => {
-    openSettingsPanel(state.isAuthenticated ? 'account' : 'account');
+    openSettingsPanel('account');
   });
 
   toggleSettingsBtn.addEventListener('click', () => {
@@ -1842,6 +2605,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   closeSettingsBtn.addEventListener('click', closeSettingsPanel);
   cancelSettingsBtn.addEventListener('click', closeSettingsPanel);
+  cancelGitHubSettingsBtn.addEventListener('click', closeSettingsPanel);
   cancelPreferencesBtn.addEventListener('click', closeSettingsPanel);
 
   settingsAccountTab.addEventListener('click', () => switchSettingsSubtab('account'));
@@ -1876,6 +2640,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       markLocalStateMutation();
       await sendWorkerMessage({ action: 'SIGN_OUT' });
       isReplacingToken = false;
+      activeRelatedTicketKey = null;
       activeFilter = state.preferences.defaultFilter || DEFAULT_PREFERENCES.defaultFilter;
       searchQuery = '';
       selectedPrKey = null;
@@ -1891,9 +2656,49 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
+  githubReplaceTokenBtn.addEventListener('click', () => {
+    isReplacingGitHubToken = true;
+    populateAccountSection();
+    githubTokenInput.focus();
+  });
+
+  githubSignOutBtn.addEventListener('click', () => {
+    githubSignOutConfirm.classList.remove('hidden');
+    githubConfirmSignOutBtn.focus();
+  });
+
+  githubCancelSignOutBtn.addEventListener('click', () => {
+    githubSignOutConfirm.classList.add('hidden');
+    githubSignOutBtn.focus();
+  });
+
+  githubConfirmSignOutBtn.addEventListener('click', async () => {
+    githubConfirmSignOutBtn.disabled = true;
+    try {
+      markLocalStateMutation();
+      await sendWorkerMessage({ action: 'SIGN_OUT_GITHUB' });
+      isReplacingGitHubToken = false;
+      activeRelatedTicketKey = null;
+      selectedPrKey = null;
+      await refreshStateFromWorker();
+      markLocalStateMutation();
+      populateAccountSection();
+      showToast('Signed out of GitHub.');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to sign out of GitHub.', 'error');
+    } finally {
+      githubConfirmSignOutBtn.disabled = false;
+    }
+  });
+
   createApiTokenLink.addEventListener('click', (e) => {
     e.preventDefault();
     void openSafeExternalUrl(AUTH_SETUP_LINKS.atlassianApiTokens);
+  });
+
+  createGitHubTokenLink.addEventListener('click', (e) => {
+    e.preventDefault();
+    void openSafeExternalUrl(AUTH_SETUP_LINKS.githubTokens);
   });
 
   authTypeSelect.addEventListener('change', syncAuthMethodFields);
@@ -1905,11 +2710,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     toggleTokenVisibilityBtn.title = nextLabel;
   });
 
+  toggleGitHubTokenVisibilityBtn.addEventListener('click', () => {
+    const showing = githubTokenInput.type === 'text';
+    githubTokenInput.type = showing ? 'password' : 'text';
+    const nextLabel = showing ? 'Show GitHub token' : 'Hide GitHub token';
+    toggleGitHubTokenVisibilityBtn.setAttribute('aria-label', nextLabel);
+    toggleGitHubTokenVisibilityBtn.title = nextLabel;
+  });
+
   testConnectionBtn.addEventListener('click', () => {
     void handleTestConnection();
   });
   credentialsForm.addEventListener('submit', (e) => {
     void handleSaveCredentials(e);
+  });
+  testGitHubConnectionBtn.addEventListener('click', () => {
+    void handleTestGitHubConnection();
+  });
+  githubCredentialsForm.addEventListener('submit', (e) => {
+    void handleSaveGitHubCredentials(e);
   });
   preferencesForm.addEventListener('submit', (e) => {
     void handleSavePreferences(e);
@@ -1921,12 +2740,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   errorSetupBtn.addEventListener('click', () => {
     const isAuthErr = Boolean(state.snapshot.isAuthError || state.isAuthError || !state.isAuthenticated);
     if (isAuthErr) {
-      openSettingsPanel('account', true);
+      const errMsg = state.snapshot.error || '';
+      const isGhErr = /^GitHub:/i.test(errMsg) || /GitHub/i.test(errMsg);
+      openSettingsPanel('account', isGhErr
+        ? { forceReplaceGitHub: true, focusTarget: 'github' }
+        : { forceReplaceBitbucket: true, focusTarget: 'bitbucket' });
     } else {
       openSettingsPanel('preferences');
     }
   });
-  setupHintBtn.addEventListener('click', () => openSettingsPanel('account'));
+  setupHintBtn.addEventListener('click', () => openSettingsPanel('account', { focusTarget: 'bitbucket' }));
+  setupHintGitHubBtn.addEventListener('click', () => openSettingsPanel('account', { focusTarget: 'github' }));
   jiraConnectBtn.addEventListener('click', () => openSettingsPanel('account'));
 
   for (const pill of filterPillButtons) {
@@ -1935,6 +2759,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (!nextFilter) {
         return;
       }
+      activeRelatedTicketKey = null;
       activeFilter = nextFilter;
       selectedPrKey = null;
       renderBitbucketTab();
@@ -1946,18 +2771,31 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!nextFilter) {
       return;
     }
+    activeRelatedTicketKey = null;
     activeFilter = nextFilter;
     selectedPrKey = null;
     renderBitbucketTab();
   });
 
+  groupByTicketBtn.addEventListener('click', () => {
+    void toggleGroupByTicket();
+  });
+
+  clearRelatedScopeBtn.addEventListener('click', () => {
+    activeRelatedTicketKey = null;
+    selectedPrKey = null;
+    renderBitbucketTab();
+  });
+
   prSearchInput.addEventListener('input', () => {
+    activeRelatedTicketKey = null;
     searchQuery = prSearchInput.value;
     selectedPrKey = null;
     renderBitbucketTab();
   });
 
   prSearchClearBtn.addEventListener('click', () => {
+    activeRelatedTicketKey = null;
     searchQuery = '';
     prSearchInput.value = '';
     selectedPrKey = null;
@@ -1968,10 +2806,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   emptyStateActionBtn.addEventListener('click', () => {
     const action = emptyStateActionBtn.dataset.emptyAction;
     selectedPrKey = null;
-    if (action === 'clear_search') {
+    if (action === 'clear_related') {
+      activeRelatedTicketKey = null;
+    } else if (action === 'clear_search') {
       searchQuery = '';
       prSearchInput.value = '';
     } else {
+      activeRelatedTicketKey = null;
       activeFilter = 'all';
     }
     renderBitbucketTab();
@@ -2100,6 +2941,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         closeSettingsPanel();
         return;
       }
+      if (activeRelatedTicketKey) {
+        e.preventDefault();
+        activeRelatedTicketKey = null;
+        selectedPrKey = null;
+        renderBitbucketTab();
+        return;
+      }
       if (searchQuery) {
         e.preventDefault();
         searchQuery = '';
@@ -2146,26 +2994,50 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
+    if (e.key === 'g') {
+      e.preventDefault();
+      switchTopTab('bitbucket-tab');
+      if (state.isAuthenticated) {
+        void toggleGroupByTicket();
+      }
+      return;
+    }
+
     if (e.key === 'r') {
       e.preventDefault();
       void triggerManualSync();
       return;
     }
 
-    if (activeTabId !== 'bitbucket-tab' || visiblePrs.length === 0) {
+    const activeList = navigablePrs.length > 0 ? navigablePrs : visiblePrs;
+    if (activeTabId !== 'bitbucket-tab' || activeList.length === 0) {
       return;
     }
 
+    if (e.key === 'h' || e.key === 'ArrowLeft') {
+      if (navigateDeckSlideForSelectedPr(-1)) {
+        e.preventDefault();
+        return;
+      }
+    }
+
+    if (e.key === 'l' || e.key === 'ArrowRight') {
+      if (navigateDeckSlideForSelectedPr(1)) {
+        e.preventDefault();
+        return;
+      }
+    }
+
     const currentIndex = selectedPrKey
-      ? visiblePrs.findIndex((pr) => pr.key === selectedPrKey)
+      ? activeList.findIndex((pr) => pr.key === selectedPrKey)
       : -1;
 
     if (e.key === 'j' || e.key === 'ArrowDown') {
       e.preventDefault();
       const nextIndex = currentIndex < 0
         ? 0
-        : Math.min(visiblePrs.length - 1, currentIndex + 1);
-      selectPrCard(visiblePrs[nextIndex].key, true);
+        : Math.min(activeList.length - 1, currentIndex + 1);
+      selectPrCard(activeList[nextIndex].key, true);
       return;
     }
 
@@ -2174,14 +3046,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       const prevIndex = currentIndex < 0
         ? 0
         : Math.max(0, currentIndex - 1);
-      selectPrCard(visiblePrs[prevIndex].key, true);
+      selectPrCard(activeList[prevIndex].key, true);
       return;
     }
 
     if (currentIndex < 0) {
       return;
     }
-    const selectedPr = visiblePrs[currentIndex];
+    const selectedPr = activeList[currentIndex];
     if (!selectedPr) {
       return;
     }
