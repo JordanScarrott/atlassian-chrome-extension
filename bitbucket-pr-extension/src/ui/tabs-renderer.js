@@ -5,6 +5,7 @@ import {
   sanitizeHttpsUrl
 } from '../config.js';
 import {
+  countQuickWinsPrs,
   filterPrsByRelatedTicket,
   formatFooterUpdated,
   formatRelativeAge,
@@ -70,6 +71,7 @@ export function resolveBitbucketTabElements() {
     countAll: getEl('count-all', HTMLSpanElement),
     countSnoozed: getEl('count-snoozed', HTMLSpanElement),
     prSearchClearBtn: getEl('pr-search-clear-btn', HTMLButtonElement),
+    quickWinsBtn: getEl('quick-wins-btn', HTMLButtonElement),
     groupByTicketBtn: getEl('group-by-ticket-btn', HTMLButtonElement),
     prCountTitle: getEl('pr-count-title', HTMLSpanElement),
     errorAlert: getEl('error-alert', HTMLDivElement),
@@ -333,6 +335,7 @@ export function renderSyncLoadingState(loadingIndicator, manualRefreshBtn, loadi
  * @property {HTMLSpanElement} countAll
  * @property {HTMLSpanElement} countSnoozed
  * @property {HTMLButtonElement} prSearchClearBtn
+ * @property {HTMLButtonElement} quickWinsBtn
  * @property {HTMLButtonElement} groupByTicketBtn
  * @property {HTMLSpanElement} prCountTitle
  * @property {HTMLDivElement} errorAlert
@@ -554,6 +557,45 @@ export function renderGroupByTicketToggle(groupByTicketBtn, enabled, isUpdating)
 }
 
 /**
+ * Check whether the search query currently contains the `effort:quick` token.
+ *
+ * @param {string} searchQuery
+ * @returns {boolean}
+ */
+export function hasQuickWinsFilterToken(searchQuery) {
+  return searchQuery
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .includes('effort:quick');
+}
+
+/**
+ * Show `#quick-wins-btn` only when `>= 1` non-snoozed open PR qualifies as a Quick Win
+ * (`effort === 'quick'` and `effortConfidence >= 0.75`) or when the filter is currently active,
+ * and synchronize its active pressed state with `searchQuery`.
+ *
+ * @param {HTMLButtonElement} quickWinsBtn
+ * @param {readonly EnrichedPullRequest[]} prs
+ * @param {SnoozedMap} snoozedMap
+ * @param {string} searchQuery
+ * @param {number} now
+ */
+export function renderQuickWinsToggle(quickWinsBtn, prs, snoozedMap, searchQuery, now) {
+  const quickWinsCount = countQuickWinsPrs(prs, snoozedMap, now);
+  const isActive = hasQuickWinsFilterToken(searchQuery);
+  const shouldShow = quickWinsCount >= 1 || isActive;
+
+  quickWinsBtn.classList.toggle('hidden', !shouldShow);
+  quickWinsBtn.classList.toggle('active', isActive);
+  quickWinsBtn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+  quickWinsBtn.textContent = quickWinsCount > 0 ? `⚡ Quick Wins (${quickWinsCount})` : '⚡ Quick Wins';
+  quickWinsBtn.title = isActive
+    ? 'Clear quick-review filter (effort:quick)'
+    : `Show ${quickWinsCount} quick <5m review${quickWinsCount === 1 ? '' : 's'} (effort:quick)`;
+}
+
+/**
  * Render the PR list tab: filter pills, counts, search, By Ticket toggle, Related scope banner,
  * Flat or Ticket-Deck grouped PR cards, or empty/onboarding state.
  *
@@ -579,6 +621,7 @@ export function renderBitbucketTab(elements, viewState, callbacks) {
     countAll,
     countSnoozed,
     prSearchClearBtn,
+    quickWinsBtn,
     groupByTicketBtn,
     prCountTitle,
     errorAlert,
@@ -605,6 +648,7 @@ export function renderBitbucketTab(elements, viewState, callbacks) {
   if (!viewState.isAuthenticated) {
     relatedScopeBanner.classList.add('hidden');
     triageControls.classList.add('hidden');
+    quickWinsBtn.classList.add('hidden');
     prItemsContainer.replaceChildren();
     emptyState.classList.add('hidden');
     setupHint.classList.remove('hidden');
@@ -659,6 +703,8 @@ export function renderBitbucketTab(elements, viewState, callbacks) {
   const counts = computeCounts(prs, snoozedMap, now);
   const showProviderBadge = (viewState.bitbucketAuthenticated && viewState.githubAuthenticated) ||
     prs.some((pr) => pr.provider === 'github');
+
+  renderQuickWinsToggle(quickWinsBtn, prs, snoozedMap, viewState.searchQuery, now);
 
   countActionRequired.textContent = String(counts.actionRequired);
   countReviewing.textContent = String(counts.reviewing);

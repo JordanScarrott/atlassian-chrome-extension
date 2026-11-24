@@ -10,7 +10,12 @@
   ],
   "host_permissions": [
     "https://api.bitbucket.org/*",
-    "https://api.github.com/*"
+    "https://api.github.com/*",
+    "https://generativelanguage.googleapis.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
   ],
   "background": {
     "service_worker": "background.js",

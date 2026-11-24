@@ -1,10 +1,15 @@
 import {
+  CACHE_TTL_MS,
+  DECISION_MODELS,
   DEFAULT_PREFERENCES,
+  THROTTLE_CONFIG,
   getEffectiveGitHubApiBaseUrl,
   getEffectiveJiraBaseUrl,
+  sanitizeDecisionEndpointUrl,
   sanitizeHttpsUrl
 } from './config.js';
 import { BitbucketApiError, createBitbucketClient } from './bitbucket-client.js';
+import { createDecisionClient } from './decision-client.js';
 import { GitHubApiError, createGitHubClient } from './github-client.js';
 import { findNewlyActionablePrs } from './notifications.js';
 import {
@@ -13,7 +18,7 @@ import {
   pruneExpiredSnoozes
 } from './pr-triage.js';
 import { createStorage, normalizeAuthType } from './storage.js';
-import { checkSyncGate, computeBackoffMs } from './throttler.js';
+import { checkSyncGate, computeBackoffMs, runWithConcurrency } from './throttler.js';
 
 export const POLL_ALARM_NAME = 'pollPRs';
 export const NOTIFICATION_URL_MAP_KEY = 'notificationPrUrlMap';
@@ -167,12 +172,51 @@ export function computeBadgeState({
 }
 
 /**
+ * Check whether a persisted `DecisionConfig` has a valid active provider and endpoint/key.
+ *
+ * @param {import('./storage.js').DecisionConfig | null | undefined} config
+ * @returns {boolean}
+ */
+function isDecisionConfigReady(config) {
+  if (!config || (config.provider !== 'jev' && config.provider !== 'gemini')) {
+    return false;
+  }
+  const safeBase = sanitizeDecisionEndpointUrl(
+    config.baseUrl || (config.provider === 'gemini' ? DECISION_MODELS.GEMINI_DECISIONS_URL : DECISION_MODELS.JEV_API_BASE_URL)
+  );
+  if (!safeBase) {
+    return false;
+  }
+  if (config.provider === 'gemini' && !(typeof config.apiKey === 'string' && config.apiKey.trim())) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Check whether a cached diffstat or decision triage entry is still within its 24h TTL.
+ *
+ * @param {{ cachedAt?: number } | null | undefined} entry
+ * @param {number} ttlMs
+ * @param {number} now
+ * @returns {boolean}
+ */
+function isCommitCacheEntryFresh(entry, ttlMs, now) {
+  if (!entry || typeof entry.cachedAt !== 'number') {
+    return false;
+  }
+  const ageMs = Math.max(0, now - entry.cachedAt);
+  return ageMs < ttlMs;
+}
+
+/**
  * Create the testable MV3 service worker orchestrator.
  *
  * @param {{
  *   storage?: ReturnType<typeof createStorage>,
  *   client?: ReturnType<typeof createBitbucketClient>,
  *   githubClient?: ReturnType<typeof createGitHubClient>,
+ *   decisionClient?: ReturnType<typeof createDecisionClient>,
  *   chromeApi?: ChromeApiLike,
  *   notificationStore?: import('./storage.js').StorageAreaLike,
  *   nowFn?: () => number,
@@ -186,6 +230,7 @@ export function createWorkerService(deps = {}) {
   const randomFn = deps.randomFn ?? Math.random;
   const client = deps.client ?? createBitbucketClient({ nowFn });
   const githubClient = deps.githubClient ?? createGitHubClient({ nowFn });
+  const decisionClient = deps.decisionClient ?? createDecisionClient({ nowFn });
   const notificationStore = deps.notificationStore ?? chromeApi.storage?.session ?? chromeApi.storage?.local;
 
   /** @type {Map<string, string>} */
@@ -407,6 +452,193 @@ export function createWorkerService(deps = {}) {
   }
 
   /**
+   * Fetch upfront diffstats (respecting `nearLimit` and 24h commit cache) and run Feature #1
+   * System One effort & risk evaluation for open PRs with a `sourceCommitHash`.
+   * Any diffstat or decision error is isolated per-PR so PR sync never fails.
+   *
+   * @param {{
+   *   prs: import('./storage.js').PullRequestRecord[],
+   *   bbCreds: import('./storage.js').Credentials | null,
+   *   ghCreds: import('./storage.js').GitHubCredentials | null,
+   *   nearLimit: boolean,
+   *   forceRefreshCache: boolean,
+   *   now: number
+   * }} params
+   * @returns {Promise<void>}
+   */
+  async function enrichPrsWithDiffstatAndDecisions({
+    prs,
+    bbCreds,
+    ghCreds,
+    nearLimit,
+    forceRefreshCache,
+    now
+  }) {
+    if (!Array.isArray(prs) || prs.length === 0) {
+      return;
+    }
+
+    const decisionConfig = await storage.getDecisionConfig();
+    if (!isDecisionConfigReady(decisionConfig)) {
+      return;
+    }
+
+    let cachedDiffstats = /** @type {import('./storage.js').DiffstatCacheMap} */ ({});
+    let cachedDecisions = /** @type {import('./storage.js').DecisionCacheMap} */ ({});
+    try {
+      [cachedDiffstats, cachedDecisions] = await Promise.all([
+        storage.getCachedDiffstats(),
+        storage.getCachedDecisions()
+      ]);
+    } catch {
+      cachedDiffstats = {};
+      cachedDecisions = {};
+    }
+
+    const nextDiffstatCache = { ...cachedDiffstats };
+    const nextDecisionCache = { ...cachedDecisions };
+    let diffstatMutated = false;
+    let decisionMutated = false;
+
+    /**
+     * @typedef {{
+     *   pr: import('./storage.js').PullRequestRecord,
+     *   diffstatKey: string,
+     *   decisionKey: string,
+     *   cachedDiffstat: import('./storage.js').DiffstatSummary | null
+     * }} DecisionTask
+     */
+
+    /** @type {DecisionTask[]} */
+    const uncachedTasks = [];
+    const questionVersion = DECISION_MODELS.QUESTION_SET_VERSION;
+
+    for (const pr of prs) {
+      const commitHash = typeof pr.sourceCommitHash === 'string' ? pr.sourceCommitHash.trim() : '';
+      if (!commitHash) {
+        continue;
+      }
+
+      const repoPrefix = pr.repoFullName || pr.key || 'repo';
+      const diffstatKey = `${repoPrefix}:${commitHash}`;
+      const decisionKey = `${repoPrefix}:${commitHash}:${questionVersion}`;
+
+      const cachedDiff = nextDiffstatCache[diffstatKey] ?? null;
+      const diffFresh = !forceRefreshCache && isCommitCacheEntryFresh(cachedDiff, CACHE_TTL_MS.diffstat, now);
+      if (diffFresh && cachedDiff) {
+        pr.diffstat = cachedDiff;
+      }
+
+      const cachedDec = nextDecisionCache[decisionKey] ?? null;
+      const decisionFresh = !forceRefreshCache &&
+        cachedDec &&
+        cachedDec.provider === decisionConfig.provider &&
+        cachedDec.model === decisionConfig.model &&
+        isCommitCacheEntryFresh(cachedDec, CACHE_TTL_MS.decisionTriage, now);
+
+      if (decisionFresh && cachedDec) {
+        pr.aiTriage = cachedDec;
+        continue;
+      }
+
+      uncachedTasks.push({
+        pr,
+        diffstatKey,
+        decisionKey,
+        cachedDiffstat: diffFresh && cachedDiff ? cachedDiff : (cachedDiff ?? null)
+      });
+    }
+
+    if (uncachedTasks.length > 0) {
+      const outcomes = await runWithConcurrency(
+        uncachedTasks,
+        THROTTLE_CONFIG.maxConcurrentRequests,
+        async (task) => {
+          let diffstat = task.pr.diffstat ?? task.cachedDiffstat ?? null;
+          let fetchedDiffstat = false;
+
+          if (!task.pr.diffstat && !nearLimit) {
+            const isGh = task.pr.provider === 'github' ||
+              (typeof task.pr.key === 'string' && task.pr.key.startsWith('gh:'));
+            try {
+              let fetched = null;
+              if (isGh && ghCreds && typeof githubClient.fetchDiffstat === 'function') {
+                fetched = await githubClient.fetchDiffstat(ghCreds, task.pr);
+              } else if (!isGh && bbCreds && typeof client.fetchDiffstat === 'function') {
+                fetched = await client.fetchDiffstat(bbCreds, task.pr);
+              }
+              if (fetched) {
+                diffstat = fetched;
+                fetchedDiffstat = true;
+              }
+            } catch {
+              // Non-fatal: continue AI evaluation with title/branches/description only
+            }
+          }
+
+          let triage = null;
+          try {
+            triage = await decisionClient.evaluateEffortAndRisk(decisionConfig, task.pr, diffstat);
+          } catch {
+            // Non-fatal: fall back to any stale cached triage entry
+            triage = nextDecisionCache[task.decisionKey] ?? null;
+            return {
+              diffstat,
+              fetchedDiffstat,
+              triage,
+              fetchedTriage: false
+            };
+          }
+
+          return {
+            diffstat,
+            fetchedDiffstat,
+            triage,
+            fetchedTriage: Boolean(triage)
+          };
+        },
+        { isolateErrors: true }
+      );
+
+      for (let i = 0; i < outcomes.length; i += 1) {
+        const outcome = /** @type {{ status: 'fulfilled', value: { diffstat: import('./storage.js').DiffstatSummary | null, fetchedDiffstat: boolean, triage: import('./storage.js').DecisionTriageResult | null, fetchedTriage: boolean } } | { status: 'rejected', reason: unknown }} */ (
+          /** @type {unknown} */ (outcomes[i])
+        );
+        const task = uncachedTasks[i];
+        if (outcome.status !== 'fulfilled') {
+          continue;
+        }
+        const { diffstat, fetchedDiffstat, triage, fetchedTriage } = outcome.value;
+        if (diffstat) {
+          task.pr.diffstat = diffstat;
+          if (fetchedDiffstat) {
+            nextDiffstatCache[task.diffstatKey] = diffstat;
+            diffstatMutated = true;
+          }
+        }
+        if (triage) {
+          task.pr.aiTriage = triage;
+          if (fetchedTriage) {
+            nextDecisionCache[task.decisionKey] = triage;
+            decisionMutated = true;
+          }
+        }
+      }
+    }
+
+    const persistPromises = [];
+    if (diffstatMutated) {
+      persistPromises.push(storage.setCachedDiffstats(nextDiffstatCache).catch(() => {}));
+    }
+    if (decisionMutated) {
+      persistPromises.push(storage.setCachedDecisions(nextDecisionCache).catch(() => {}));
+    }
+    if (persistPromises.length > 0) {
+      await Promise.all(persistPromises);
+    }
+  }
+
+  /**
    * Refresh the badge using current persisted storage state.
    *
    * @returns {Promise<{
@@ -600,6 +832,37 @@ export function createWorkerService(deps = {}) {
         }
       }
 
+      // Surface non-blocking partial banner if one provider failed while the other succeeded
+      let partialBannerError = null;
+      let partialIsRateLimited = false;
+      let partialIsAuthError = false;
+      if (bbFailed && bbSettled && bbSettled.status === 'rejected') {
+        const info = extractApiErrorInfo(bbSettled.reason, 'Bitbucket sync failed.');
+        partialBannerError = `Bitbucket: ${info.message}`;
+        partialIsRateLimited = info.isRateLimited;
+        partialIsAuthError = info.isAuthError;
+      } else if (ghFailed && ghSettled && ghSettled.status === 'rejected') {
+        const info = extractApiErrorInfo(ghSettled.reason, 'GitHub sync failed.');
+        partialBannerError = `GitHub: ${info.message}`;
+        partialIsRateLimited = info.isRateLimited;
+        partialIsAuthError = info.isAuthError;
+      }
+
+      const nearLimit = Boolean(
+        (bbSettled && bbSettled.status === 'fulfilled' && bbSettled.value.nearLimit) ||
+        (ghSettled && ghSettled.status === 'fulfilled' && ghSettled.value.nearLimit) ||
+        partialIsRateLimited
+      );
+
+      await enrichPrsWithDiffstatAndDecisions({
+        prs: combinedRawPrs,
+        bbCreds,
+        ghCreds,
+        nearLimit,
+        forceRefreshCache,
+        now: finishedAt
+      });
+
       const currentEnriched = enrichPrList(
         combinedRawPrs,
         { bitbucket: bbUserUuid, github: ghUserUuid },
@@ -625,28 +888,6 @@ export function createWorkerService(deps = {}) {
       const syncedWorkspaces = bbSettled && bbSettled.status === 'fulfilled'
         ? bbSettled.value.workspaces.map((w) => w.slug)
         : (bbAuthed ? prevSnapshot.syncedWorkspaces : []);
-
-      // Surface non-blocking partial banner if one provider failed while the other succeeded
-      let partialBannerError = null;
-      let partialIsRateLimited = false;
-      let partialIsAuthError = false;
-      if (bbFailed && bbSettled && bbSettled.status === 'rejected') {
-        const info = extractApiErrorInfo(bbSettled.reason, 'Bitbucket sync failed.');
-        partialBannerError = `Bitbucket: ${info.message}`;
-        partialIsRateLimited = info.isRateLimited;
-        partialIsAuthError = info.isAuthError;
-      } else if (ghFailed && ghSettled && ghSettled.status === 'rejected') {
-        const info = extractApiErrorInfo(ghSettled.reason, 'GitHub sync failed.');
-        partialBannerError = `GitHub: ${info.message}`;
-        partialIsRateLimited = info.isRateLimited;
-        partialIsAuthError = info.isAuthError;
-      }
-
-      const nearLimit = Boolean(
-        (bbSettled && bbSettled.status === 'fulfilled' && bbSettled.value.nearLimit) ||
-        (ghSettled && ghSettled.status === 'fulfilled' && ghSettled.value.nearLimit) ||
-        partialIsRateLimited
-      );
 
       /** @type {import('./storage.js').PrSnapshot} */
       const nextSnapshot = {
@@ -1171,7 +1412,192 @@ export function createWorkerService(deps = {}) {
   }
 
   /**
-   * Return sanitized bootstrap state for the popup UI. NEVER exposes raw Bitbucket or GitHub tokens.
+   * Verify a System One Decision Model configuration without persisting it.
+   *
+   * @param {Partial<import('./storage.js').DecisionConfig>} config
+   */
+  async function testDecisionModel(config) {
+    try {
+      const current = await storage.getDecisionConfig();
+      const rawProvider = config?.provider === 'jev' || config?.provider === 'gemini' || config?.provider === 'off'
+        ? config.provider
+        : current.provider;
+      const candidate = {
+        provider: rawProvider,
+        baseUrl: typeof config?.baseUrl === 'string' ? config.baseUrl.trim() : current.baseUrl,
+        model: typeof config?.model === 'string' ? config.model.trim() : current.model,
+        apiKey: typeof config?.apiKey === 'string' && config.apiKey.trim()
+          ? config.apiKey.trim()
+          : (rawProvider === current.provider ? current.apiKey : '')
+      };
+      const result = await decisionClient.verifyConnection(candidate);
+      return {
+        ok: true,
+        provider: result.provider,
+        model: result.model
+      };
+    } catch (err) {
+      const message = err instanceof Error && err.message
+        ? err.message
+        : 'Failed to verify Decision Model connection.';
+      const isAuthError = Boolean(
+        err && typeof err === 'object' && 'isAuthError' in err && /** @type {{ isAuthError?: unknown }} */ (err).isAuthError
+      );
+      return {
+        ok: false,
+        error: message,
+        isAuthError
+      };
+    }
+  }
+
+  /**
+   * Persist Decision Model configuration (preserving existing apiKey when omitted/blank for same provider)
+   * and trigger an immediate sync so cached/open PRs receive Feature #1 triage scores.
+   *
+   * @param {Partial<import('./storage.js').DecisionConfig>} config
+   */
+  async function saveDecisionConfig(config) {
+    const raw = config && typeof config === 'object' ? config : {};
+    if (typeof raw.baseUrl === 'string' && raw.baseUrl.trim() && !sanitizeDecisionEndpointUrl(raw.baseUrl.trim())) {
+      return {
+        ok: false,
+        error: 'Endpoint URL must be a valid https:// URL (or http:// for localhost / private LAN hosts).',
+        isAuthError: false
+      };
+    }
+
+    const current = await storage.getDecisionConfig();
+    /** @type {import('./storage.js').DecisionProvider} */
+    const nextProvider = raw.provider === 'jev' || raw.provider === 'gemini' || raw.provider === 'off'
+      ? raw.provider
+      : current.provider;
+    const defaultBase = nextProvider === 'gemini'
+      ? DECISION_MODELS.GEMINI_DECISIONS_URL
+      : nextProvider === 'jev'
+        ? DECISION_MODELS.JEV_API_BASE_URL
+        : '';
+    const nextBaseRaw = typeof raw.baseUrl === 'string'
+      ? raw.baseUrl.trim()
+      : (nextProvider !== current.provider ? defaultBase : current.baseUrl);
+    const nextBaseUrl = (nextBaseRaw ? sanitizeDecisionEndpointUrl(nextBaseRaw) : sanitizeDecisionEndpointUrl(defaultBase)) || '';
+    const defaultModel = nextProvider === 'gemini'
+      ? DECISION_MODELS.GEMINI_DEFAULT_MODEL
+      : nextProvider === 'jev'
+        ? DECISION_MODELS.JEV_DEFAULT_MODEL
+        : '';
+    const nextModel = (typeof raw.model === 'string' ? raw.model.trim() : (nextProvider !== current.provider ? defaultModel : current.model)) || defaultModel;
+    const nextApiKey = typeof raw.apiKey === 'string'
+      ? (raw.apiKey.trim() || (nextProvider === current.provider ? current.apiKey : ''))
+      : current.apiKey;
+
+    /** @type {import('./storage.js').DecisionConfig} */
+    const candidate = {
+      provider: nextProvider,
+      baseUrl: nextBaseUrl,
+      model: nextModel,
+      apiKey: nextApiKey
+    };
+
+    if (candidate.provider !== 'off') {
+      const check = await testDecisionModel(candidate);
+      if (!check.ok) {
+        return check;
+      }
+    }
+
+    const saved = await storage.saveDecisionConfig(candidate);
+
+    const [bbCreds, ghCreds, snapshot] = await Promise.all([
+      storage.getCredentials(),
+      storage.getGitHubCredentials(),
+      storage.getPrSnapshot()
+    ]);
+
+    const isAuthed = Boolean((bbCreds && bbCreds.token) || (ghCreds && ghCreds.token));
+    if (isAuthed) {
+      const syncRes = await syncNow({ forceManual: true, bypassCooldown: true });
+      return {
+        ok: true,
+        decision: {
+          provider: saved.provider,
+          baseUrl: saved.baseUrl,
+          model: saved.model,
+          isConfigured: isDecisionConfigReady(saved)
+        },
+        ...(syncRes.snapshot ? { snapshot: syncRes.snapshot } : {}),
+        ...(syncRes.counts ? { counts: syncRes.counts } : {}),
+        ...(!syncRes.ok && syncRes.error ? { syncError: syncRes.error } : {})
+      };
+    }
+
+    return {
+      ok: true,
+      decision: {
+        provider: saved.provider,
+        baseUrl: saved.baseUrl,
+        model: saved.model,
+        isConfigured: isDecisionConfigReady(saved)
+      },
+      snapshot
+    };
+  }
+
+  /**
+   * Clear Decision Model configuration & cached triage scores, and strip `aiTriage` from stored snapshot.
+   */
+  async function clearDecisionConfig() {
+    await storage.clearDecisionConfigAndCache();
+    const [bbCreds, ghCreds, cachedBbUser, cachedGhUser, preferences, snapshot, snoozedMap] = await Promise.all([
+      storage.getCredentials(),
+      storage.getGitHubCredentials(),
+      storage.getCachedUser(),
+      storage.getCachedGitHubUser(),
+      storage.getPreferences(),
+      storage.getPrSnapshot(),
+      storage.getSnoozedMap()
+    ]);
+
+    const clearedPrs = snapshot.prList.map((pr) => {
+      const copy = { ...pr };
+      delete copy.aiTriage;
+      return copy;
+    });
+    const now = nowFn();
+    const enrichedPrs = enrichPrList(
+      clearedPrs,
+      { bitbucket: cachedBbUser?.uuid ?? '', github: cachedGhUser?.uuid ?? '' },
+      preferences,
+      now
+    );
+    await storage.savePrSnapshot({ prList: enrichedPrs });
+    const counts = computeCounts(enrichedPrs, snoozedMap, now);
+    await updateBadge({
+      isAuthenticated: Boolean((bbCreds && bbCreds.token) || (ghCreds && ghCreds.token)),
+      preferences,
+      counts,
+      snapshot: { ...snapshot, prList: enrichedPrs }
+    });
+
+    const defaultConfig = await storage.getDecisionConfig();
+    return {
+      ok: true,
+      decision: {
+        provider: defaultConfig.provider,
+        baseUrl: defaultConfig.baseUrl,
+        model: defaultConfig.model,
+        isConfigured: isDecisionConfigReady(defaultConfig)
+      },
+      snapshot: {
+        ...snapshot,
+        prList: enrichedPrs
+      },
+      counts
+    };
+  }
+
+  /**
+   * Return sanitized bootstrap state for the popup UI. NEVER exposes raw Bitbucket, GitHub, or Decision API keys.
    */
   async function getState() {
     const now = nowFn();
@@ -1185,7 +1611,8 @@ export function createWorkerService(deps = {}) {
       preferences,
       syncState,
       snoozedMap,
-      productFeedback
+      productFeedback,
+      decisionConfig
     ] = await Promise.all([
       storage.getCredentials(),
       storage.getGitHubCredentials(),
@@ -1196,7 +1623,8 @@ export function createWorkerService(deps = {}) {
       storage.getPreferences(),
       storage.getSyncState(),
       storage.getSnoozedMap(),
-      storage.getProductFeedback()
+      storage.getProductFeedback(),
+      storage.getDecisionConfig()
     ]);
 
     const enrichedPrs = enrichPrList(
@@ -1220,6 +1648,12 @@ export function createWorkerService(deps = {}) {
         isAuthenticated: githubAuthenticated,
         apiBaseUrl: ghCreds ? ghCreds.apiBaseUrl : getEffectiveGitHubApiBaseUrl(),
         user: cachedGhUser
+      },
+      decision: {
+        provider: decisionConfig.provider,
+        baseUrl: decisionConfig.baseUrl,
+        model: decisionConfig.model,
+        isConfigured: isDecisionConfigReady(decisionConfig)
       },
       workspaces: cachedWorkspaces ? cachedWorkspaces.items : [],
       isAuthError,
@@ -1300,6 +1734,20 @@ export function createWorkerService(deps = {}) {
         );
       case 'SIGN_OUT_GITHUB':
         return signOutGitHub();
+      case 'TEST_DECISION_MODEL':
+        return testDecisionModel(
+          payload.config && typeof payload.config === 'object'
+            ? /** @type {Partial<import('./storage.js').DecisionConfig>} */ (payload.config)
+            : {}
+        );
+      case 'SAVE_DECISION_CONFIG':
+        return saveDecisionConfig(
+          payload.config && typeof payload.config === 'object'
+            ? /** @type {Partial<import('./storage.js').DecisionConfig>} */ (payload.config)
+            : {}
+        );
+      case 'CLEAR_DECISION_CONFIG':
+        return clearDecisionConfig();
       case 'UPDATE_PREFERENCES':
         return updatePreferences(
           payload.preferences && typeof payload.preferences === 'object'
@@ -1335,6 +1783,9 @@ export function createWorkerService(deps = {}) {
     testGitHubConnection,
     saveGitHubCredentials,
     signOutGitHub,
+    testDecisionModel,
+    saveDecisionConfig,
+    clearDecisionConfig,
     updatePreferences,
     snoozePr,
     unsnoozePr,

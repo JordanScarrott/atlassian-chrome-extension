@@ -352,6 +352,128 @@
               </div>
             </form>
           </div>
+
+          <!-- Feature #1: System One AI Triage (Jev / Clef Flash or Gemini Decision 1) -->
+          <div class="provider-section">
+            <div class="provider-section-header">
+              <span class="provider-badge provider-ai" aria-hidden="true">AI</span>
+              <h4 class="provider-section-title">System One AI Triage</h4>
+            </div>
+
+            <!-- Connected Decision Model Summary -->
+            <div id="decision-summary-card" class="account-summary-card hidden">
+              <div class="account-summary-header">
+                <div class="account-avatar account-avatar-ai" aria-hidden="true">S1</div>
+                <div class="account-identity">
+                  <div id="decision-provider-label" class="account-name">Jev / Clef Flash</div>
+                  <div id="decision-model-display" class="account-meta">clef-flash</div>
+                </div>
+                <span class="pill-tag">Active</span>
+              </div>
+
+              <div class="account-stats-row">
+                <span id="decision-endpoint-display" class="account-stat">clef.internal</span>
+                <span class="account-stat-secure">Confidence ≥ 75%</span>
+              </div>
+
+              <div class="account-summary-actions">
+                <button id="decision-replace-btn" type="button" class="btn btn-secondary btn-sm">Configure</button>
+                <button id="decision-signout-btn" type="button" class="btn btn-danger-outline btn-sm">Disable</button>
+              </div>
+
+              <div id="decision-signout-confirm-row" class="inline-confirm hidden" role="alertdialog" aria-label="Confirm disabling System One AI Triage">
+                <p>Disable System One AI Triage and clear cached effort &amp; risk scores?</p>
+                <div class="inline-confirm-actions">
+                  <button id="decision-confirm-signout-btn" type="button" class="btn btn-danger btn-sm">Confirm Disable</button>
+                  <button id="decision-cancel-signout-btn" type="button" class="btn btn-secondary btn-sm">Keep Enabled</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- System One AI Triage Configuration Form -->
+            <form id="decision-config-form" class="credentials-form" novalidate>
+              <div class="setup-guide-box">
+                <div class="setup-guide-row">
+                  <span class="setup-guide-title">Effort &amp; Risk Decision Model</span>
+                  <span class="pill-tag">System One</span>
+                </div>
+                <p class="field-help">
+                  Scores open PR review effort (<code>⚡ ~2m</code>, <code>⏱ ~15m</code>, <code>🧠 Deep</code>) and production alerts (<code>🔥 Hotfix</code>, <code>⚠ High Risk</code>) from metadata &amp; diffstats without sending raw code patches.
+                </p>
+              </div>
+
+              <div class="form-group">
+                <label for="decision-provider-select">Decision Provider</label>
+                <select id="decision-provider-select" class="form-control">
+                  <option value="off">Disabled</option>
+                  <option value="jev">Jev / Clef Flash (Self-Hosted or TypeSafe)</option>
+                  <option value="gemini">Gemini Decision 1 (Google AI Studio)</option>
+                </select>
+              </div>
+
+              <div id="decision-fields-group">
+                <div class="form-group">
+                  <label for="decision-base-url-input">Endpoint URL</label>
+                  <input
+                    type="url"
+                    id="decision-base-url-input"
+                    class="form-control"
+                    placeholder="https://clef.internal.example.com"
+                    autocomplete="off"
+                  />
+                  <p id="decision-base-url-help" class="field-help">
+                    HTTPS or internal LAN/localhost URL (<code>/v1/systemone</code> appended automatically if omitted).
+                  </p>
+                </div>
+
+                <div class="form-group">
+                  <label for="decision-model-input">Model Name</label>
+                  <input
+                    type="text"
+                    id="decision-model-input"
+                    class="form-control"
+                    placeholder="clef-flash"
+                    autocomplete="off"
+                  />
+                </div>
+
+                <div class="form-group">
+                  <label for="decision-api-key-input">API Key</label>
+                  <div class="input-password-wrapper">
+                    <input
+                      type="password"
+                      id="decision-api-key-input"
+                      class="form-control"
+                      placeholder="Optional for internal GPU; paste Bearer token if required"
+                      autocomplete="off"
+                    />
+                    <button
+                      id="decision-toggle-key-btn"
+                      type="button"
+                      class="visibility-btn"
+                      title="Show API key"
+                      aria-label="Show API key"
+                    >
+                      <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+                        <path fill="currentColor" d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+                      </svg>
+                    </button>
+                  </div>
+                  <p id="decision-api-key-help" class="field-help">
+                    Optional for keyless internal Clef Flash GPU servers; stored locally and never re-displayed.
+                  </p>
+                </div>
+              </div>
+
+              <div id="decision-status-banner" class="inline-banner hidden" role="status" aria-live="polite"></div>
+
+              <div class="settings-actions">
+                <button id="decision-test-btn" type="button" class="btn btn-secondary">Test Model</button>
+                <button id="decision-save-btn" type="submit" class="btn btn-primary">Save &amp; Score</button>
+                <button id="decision-cancel-btn" type="button" class="btn btn-ghost">Cancel</button>
+              </div>
+            </form>
+          </div>
         </div>
 
         <!-- Sub-panel 2: Preferences -->
@@ -554,6 +676,13 @@
                 </svg>
               </button>
             </div>
+            <button
+              id="quick-wins-btn"
+              type="button"
+              class="quick-wins-btn hidden"
+              aria-pressed="false"
+              title="Filter quick <5m PR reviews (effort:quick)"
+            >⚡ Quick Wins</button>
             <button
               id="group-by-ticket-btn"
               type="button"

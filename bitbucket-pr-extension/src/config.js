@@ -59,6 +59,48 @@ export const CENTRAL_URLS = Object.freeze({
   GITHUB_WEB_BASE_URL: 'https://github.com'
 });
 
+/**
+ * ============================================================================
+ * DEVELOPER CONFIGURATION — SYSTEM ONE DECISION MODELS (JEV / CLEF & GEMINI)
+ * ============================================================================
+ * Configure default System One decision-model endpoints centrally below.
+ *
+ * - For an internal/office Clef Flash GPU server (keyless or Bearer-protected):
+ *   Set `DEFAULT_PROVIDER: 'jev'` and hardcode `JEV_API_BASE_URL` (no trailing
+ *   slash, e.g. 'https://clef.internal.example.com' or 'http://10.0.1.42:8080').
+ * - For Google Gemini Decision 1:
+ *   Set `DEFAULT_PROVIDER: 'gemini'`, keep `GEMINI_DECISIONS_URL` and
+ *   `GEMINI_DEFAULT_MODEL: 'gemini-decision-1'`, and configure your API key
+ *   in the extension Settings drawer (never hardcode keys in source!).
+ *
+ * Users can override provider, base URL, model, and API key in Settings.
+ * ============================================================================
+ */
+export const DECISION_MODELS = Object.freeze({
+  /** @type {'off' | 'jev' | 'gemini'} */
+  DEFAULT_PROVIDER: 'off',
+
+  /**
+   * Default Jev / Clef Flash base URL (no trailing slash), e.g.:
+   * 'https://api.typesafe.ai' or 'https://clef.internal.example.com'
+   */
+  JEV_API_BASE_URL: '',
+  JEV_DEFAULT_MODEL: 'clef-flash',
+
+  /** Google Gemini System One Decisions API endpoint & default model. */
+  GEMINI_DECISIONS_URL: 'https://generativelanguage.googleapis.com/v1beta/decisions',
+  GEMINI_DEFAULT_MODEL: 'gemini-decision-1',
+
+  /** Minimum probability/confidence required to surface a triage badge. */
+  CONFIDENCE_THRESHOLD: 0.75,
+  /** Bump when question wording/choices change to invalidate cached scores cleanly. */
+  QUESTION_SET_VERSION: 'effort-risk-v1',
+
+  /** Per-request question limits enforced by auto-chunking in `decision-client.js`. */
+  JEV_MAX_QUESTIONS_PER_REQUEST: 16,
+  GEMINI_MAX_QUESTIONS_PER_REQUEST: 1000
+});
+
 export const AUTH_SETUP_LINKS = Object.freeze({
   atlassianApiTokens: 'https://id.atlassian.com/manage-profile/security/api-tokens',
   bitbucketAccessTokensDocs: 'https://support.atlassian.com/bitbucket-cloud/docs/using-api-tokens/',
@@ -81,7 +123,9 @@ export const CACHE_TTL_MS = Object.freeze({
   repositories: 30 * 60 * 1000,
   prStaleAfter: 5 * 60 * 1000,
   buildStatusTerminal: 6 * 60 * 60 * 1000,
-  buildStatusActive: 60 * 1000
+  buildStatusActive: 60 * 1000,
+  diffstat: 24 * 60 * 60 * 1000,
+  decisionTriage: 24 * 60 * 60 * 1000
 });
 
 export const THROTTLE_CONFIG = Object.freeze({
@@ -92,6 +136,10 @@ export const THROTTLE_CONFIG = Object.freeze({
   maxPagesPerEndpoint: 5,
   maxReposPerWorkspace: 25,
   maxBuildStatusCacheEntries: 200,
+  maxDiffstatCacheEntries: 200,
+  maxDecisionCacheEntries: 200,
+  maxDiffstatFilesInPrompt: 25,
+  maxDescriptionCharsInPrompt: 800,
   baseBackoffMs: 15_000,
   maxBackoffMs: 15 * 60 * 1000,
   nearLimitDelayMs: 1_500
@@ -123,6 +171,9 @@ export const STORAGE_KEYS = Object.freeze({
   CACHED_WORKSPACES: 'cachedWorkspaces',
   CACHED_REPOS: 'cachedRepos',
   CACHED_BUILD_STATUSES: 'cachedBuildStatuses',
+  DECISION_CONFIG: 'decisionConfig',
+  CACHED_DIFFSTATS: 'cachedDiffstats',
+  CACHED_DECISIONS: 'cachedDecisions',
   PR_LIST: 'prList',
   LAST_UPDATED: 'lastUpdated',
   ERROR: 'error',
@@ -161,6 +212,80 @@ export function sanitizeHttpsUrl(rawUrl) {
       return null;
     }
     return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check whether a hostname is a local/loopback, RFC1918 private IPv4, or `.local` internal host
+ * eligible for plain `http://` Clef Flash / internal GPU endpoints.
+ *
+ * @param {string} rawHostname
+ * @returns {boolean}
+ */
+function isInternalOrLocalHostname(rawHostname) {
+  const host = rawHostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) {
+    return false;
+  }
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
+    return true;
+  }
+  if (host.endsWith('.local')) {
+    return true;
+  }
+  const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!ipv4Match) {
+    return false;
+  }
+  const octets = ipv4Match.slice(1).map((part) => Number.parseInt(part, 10));
+  if (octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return false;
+  }
+  const [a, b] = octets;
+  // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8
+  return (
+    a === 10 ||
+    a === 127 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
+/**
+ * Validate and sanitize a System One Decision Model endpoint URL (normalized without trailing slash).
+ * Allows any valid `https://` URL without embedded credentials, and allows `http://` ONLY for
+ * `localhost`, `127.0.0.1`, `[::1]`, RFC1918 private IPs, or internal `.local` hosts.
+ * Rejects `javascript:`, `data:`, embedded credentials, and public `http://` URLs.
+ *
+ * @param {unknown} rawUrl
+ * @returns {string | null}
+ */
+export function sanitizeDecisionEndpointUrl(rawUrl) {
+  if (typeof rawUrl !== 'string') {
+    return null;
+  }
+
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (!parsed.hostname || parsed.username || parsed.password) {
+      return null;
+    }
+    if (parsed.protocol === 'https:') {
+      const cleanPath = parsed.pathname.replace(/\/+$/, '');
+      return `${parsed.origin}${cleanPath}`;
+    }
+    if (parsed.protocol === 'http:' && isInternalOrLocalHostname(parsed.hostname)) {
+      const cleanPath = parsed.pathname.replace(/\/+$/, '');
+      return `${parsed.origin}${cleanPath}`;
+    }
+    return null;
   } catch {
     return null;
   }

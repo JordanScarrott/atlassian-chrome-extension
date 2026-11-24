@@ -101,7 +101,16 @@ test('DOM IDs, CSS selectors, classes, CSP, and MV3 runtime invariants stay cons
     'ticket-deck-slide',
     'is-collapsed',
     'is-expanded-stack',
-    'onboarding-actions'
+    'onboarding-actions',
+    'ai-badge',
+    'ai-effort-quick',
+    'ai-effort-medium',
+    'ai-effort-deep',
+    'ai-alert-hotfix',
+    'ai-alert-high_risk',
+    'quick-wins-btn',
+    'provider-ai',
+    'account-avatar-ai'
   ];
   for (const cls of referencedClasses) {
     assert.ok(stylesCss.includes(`.${cls}`), `styles.css is missing selector .${cls}`);

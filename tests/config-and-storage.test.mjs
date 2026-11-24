@@ -389,3 +389,93 @@ test('GitHub config constants, getEffectiveGitHubApiBaseUrl, groupByTicket, and 
   assert.equal((await storage.getPreferences()).groupByTicket, true);
 });
 
+test('DECISION_MODELS defaults, sanitizeDecisionEndpointUrl, and decision/diffstat storage caches work cleanly', async () => {
+  const { DECISION_MODELS, sanitizeDecisionEndpointUrl } = await import('../bitbucket-pr-extension/src/config.js');
+
+  assert.equal(DECISION_MODELS.DEFAULT_PROVIDER, 'off');
+  assert.equal(DECISION_MODELS.JEV_DEFAULT_MODEL, 'clef-flash');
+  assert.equal(DECISION_MODELS.GEMINI_DEFAULT_MODEL, 'gemini-decision-1');
+  assert.equal(DECISION_MODELS.CONFIDENCE_THRESHOLD, 0.75);
+  assert.equal(DECISION_MODELS.QUESTION_SET_VERSION, 'effort-risk-v1');
+  assert.equal(DECISION_MODELS.JEV_MAX_QUESTIONS_PER_REQUEST, 16);
+  assert.equal(DECISION_MODELS.GEMINI_MAX_QUESTIONS_PER_REQUEST, 1000);
+
+  assert.equal(sanitizeDecisionEndpointUrl('https://clef.internal.example.com/'), 'https://clef.internal.example.com');
+  assert.equal(sanitizeDecisionEndpointUrl('http://localhost:8080/'), 'http://localhost:8080');
+  assert.equal(sanitizeDecisionEndpointUrl('http://127.0.0.1:9000'), 'http://127.0.0.1:9000');
+  assert.equal(sanitizeDecisionEndpointUrl('http://[::1]:8080'), 'http://[::1]:8080');
+  assert.equal(sanitizeDecisionEndpointUrl('http://10.20.30.40:8000'), 'http://10.20.30.40:8000');
+  assert.equal(sanitizeDecisionEndpointUrl('http://192.168.1.5:8080'), 'http://192.168.1.5:8080');
+  assert.equal(sanitizeDecisionEndpointUrl('http://172.16.0.10:8080'), 'http://172.16.0.10:8080');
+  assert.equal(sanitizeDecisionEndpointUrl('http://gpu-box.local:8080'), 'http://gpu-box.local:8080');
+  assert.equal(sanitizeDecisionEndpointUrl('http://public.example.com'), null);
+  assert.equal(sanitizeDecisionEndpointUrl('javascript:alert(1)'), null);
+  assert.equal(sanitizeDecisionEndpointUrl('data:text/plain,hi'), null);
+  assert.equal(sanitizeDecisionEndpointUrl('https://user:pass@clef.example.com'), null);
+
+  const area = createMemoryStorageArea();
+  const storage = createStorage(area);
+
+  const initialCfg = await storage.getDecisionConfig();
+  assert.deepEqual(initialCfg, {
+    provider: 'off',
+    baseUrl: '',
+    model: '',
+    apiKey: ''
+  });
+
+  const savedJev = await storage.saveDecisionConfig({
+    provider: 'jev',
+    baseUrl: 'http://10.0.0.5:8080/',
+    model: 'clef-flash',
+    apiKey: 'secret-jev'
+  });
+  assert.deepEqual(savedJev, {
+    provider: 'jev',
+    baseUrl: 'http://10.0.0.5:8080',
+    model: 'clef-flash',
+    apiKey: 'secret-jev'
+  });
+
+  // LRU-bounded diffstat & decision caches (max 200)
+  /** @type {Record<string, any>} */
+  const diffstats = {};
+  /** @type {Record<string, any>} */
+  const decisions = {};
+  for (let i = 0; i < 210; i += 1) {
+    diffstats[`acme/r:sha-${i}`] = {
+      commitHash: `sha-${i}`,
+      filesChanged: 1,
+      linesAdded: 5,
+      linesRemoved: 1,
+      files: [{ path: 'src/a.js', added: 5, removed: 1, status: 'modified' }],
+      cachedAt: 1000 + i
+    };
+    decisions[`acme/r:sha-${i}:effort-risk-v1`] = {
+      commitHash: `sha-${i}`,
+      questionSetVersion: 'effort-risk-v1',
+      provider: 'jev',
+      model: 'clef-flash',
+      effort: 'quick',
+      effortConfidence: 0.9,
+      alert: null,
+      alertConfidence: 0,
+      changeKind: 'bugfix',
+      riskScore: 1.5,
+      hasClearContext: true,
+      cachedAt: 1000 + i
+    };
+  }
+  await storage.setCachedDiffstats(diffstats);
+  await storage.setCachedDecisions(decisions);
+  assert.equal(Object.keys(await storage.getCachedDiffstats()).length, 200);
+  assert.equal(Object.keys(await storage.getCachedDecisions()).length, 200);
+  assert.equal((await storage.getCachedDiffstats())['acme/r:sha-0'], undefined);
+  assert.ok((await storage.getCachedDecisions())['acme/r:sha-209:effort-risk-v1']);
+
+  await storage.clearDecisionConfigAndCache();
+  assert.equal((await storage.getDecisionConfig()).provider, 'off');
+  assert.deepEqual(await storage.getCachedDecisions(), {});
+});
+
+

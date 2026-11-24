@@ -435,3 +435,71 @@ test('normalizeGitHubPullRequest produces canonical defaults when optional field
   assert.equal(normalized.sourceCommitHash, 'deadbeef');
   assert.equal(normalized.buildStatus, null);
 });
+
+test('fetchGitHubDiffstat fetches /files?per_page=50, drops patch hunks, and degrades gracefully on error', async () => {
+  const { fetchGitHubDiffstat } = await import('../bitbucket-pr-extension/src/github-client.js');
+
+  let calledUrl = '';
+  const summary = await fetchGitHubDiffstat({
+    headers: { Authorization: 'Bearer ghp_tok' },
+    apiBaseUrl: 'https://github.enterprise.local/api/v3',
+    pr: {
+      id: 25,
+      repoFullName: 'acme/web',
+      workspace: 'acme',
+      repoName: 'web',
+      sourceCommitHash: 'sha25'
+    },
+    nowFn: () => 888_000,
+    fetchFn: async (url) => {
+      calledUrl = String(url);
+      return jsonResponse([
+        {
+          filename: 'src/index.ts',
+          status: 'modified',
+          additions: 15,
+          deletions: 4,
+          patch: '@@ -1,4 +1,15 @@\n+const shouldNotBeKept = 1;'
+        },
+        {
+          filename: 'README.md',
+          status: 'added',
+          additions: 10,
+          deletions: 0,
+          patch: '@@ -0,0 +1,10 @@\n+Docs'
+        }
+      ]);
+    }
+  });
+
+  assert.equal(
+    calledUrl,
+    'https://github.enterprise.local/api/v3/repos/acme/web/pulls/25/files?per_page=50'
+  );
+  assert.deepEqual(summary, {
+    commitHash: 'sha25',
+    filesChanged: 2,
+    linesAdded: 25,
+    linesRemoved: 4,
+    files: [
+      { path: 'src/index.ts', added: 15, removed: 4, status: 'modified' },
+      { path: 'README.md', added: 10, removed: 0, status: 'added' }
+    ],
+    cachedAt: 888_000
+  });
+  assert.equal('patch' in (summary?.files[0] ?? {}), false);
+
+  const errSummary = await fetchGitHubDiffstat({
+    headers: { Authorization: 'Bearer ghp_tok' },
+    pr: {
+      id: 25,
+      repoFullName: 'acme/web',
+      workspace: 'acme',
+      repoName: 'web',
+      sourceCommitHash: 'sha25'
+    },
+    fetchFn: async () => new Response('Server error', { status: 500 })
+  });
+  assert.equal(errSummary, null);
+});
+

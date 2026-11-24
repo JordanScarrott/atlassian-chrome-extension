@@ -43,6 +43,7 @@ const PR_FIELDS = [
   'next',
   'values.id',
   'values.title',
+  'values.description',
   'values.state',
   'values.created_on',
   'values.updated_on',
@@ -314,11 +315,16 @@ export function normalizePullRequest(rawPr, fallbackWorkspace = '') {
   const rawCommitHash = typeof rawPr.source?.commit?.hash === 'string'
     ? rawPr.source.commit.hash.trim()
     : '';
+  const rawDescription = typeof rawPr.description === 'string' ? rawPr.description : '';
+  const description = rawDescription
+    ? rawDescription.slice(0, THROTTLE_CONFIG.maxDescriptionCharsInPrompt)
+    : undefined;
 
   return {
     key,
     id: rawPr.id,
     title: typeof rawPr.title === 'string' && rawPr.title.trim() ? rawPr.title.trim() : `PR #${rawPr.id}`,
+    ...(description !== undefined ? { description } : {}),
     state: typeof rawPr.state === 'string' ? rawPr.state : 'OPEN',
     url: safeUrl,
     repoFullName: canonicalRepo,
@@ -339,6 +345,114 @@ export function normalizePullRequest(rawPr, fallbackWorkspace = '') {
     participants,
     ...(rawCommitHash ? { sourceCommitHash: rawCommitHash } : {})
   };
+}
+
+/**
+ * Fetch lightweight per-file diffstat metadata for a Bitbucket PR (no raw diff patches).
+ * Gracefully returns `null` on any network, auth, or HTTP error so PR sync never fails.
+ *
+ * @param {{
+ *   fetchFn?: typeof fetch,
+ *   authHeader: string,
+ *   pr: Pick<import('./storage.js').PullRequestRecord, 'id' | 'repoFullName' | 'workspace' | 'repoName' | 'sourceCommitHash'>,
+ *   nowFn?: () => number
+ * }} params
+ * @returns {Promise<import('./storage.js').DiffstatSummary | null>}
+ */
+export async function fetchBitbucketDiffstat({
+  fetchFn = fetch,
+  authHeader,
+  pr,
+  nowFn = Date.now
+}) {
+  if (!authHeader || !pr || typeof pr.id !== 'number') {
+    return null;
+  }
+
+  let ws = '';
+  let repoSlug = '';
+  const fullName = typeof pr.repoFullName === 'string' ? pr.repoFullName.trim() : '';
+  const slashIdx = fullName.indexOf('/');
+  if (slashIdx > 0) {
+    ws = fullName.slice(0, slashIdx).trim();
+    repoSlug = fullName.slice(slashIdx + 1).trim();
+  } else if (pr.workspace && pr.repoName) {
+    ws = pr.workspace.trim();
+    repoSlug = pr.repoName.trim();
+  }
+  if (!ws || !repoSlug) {
+    return null;
+  }
+
+  const url = `${CENTRAL_URLS.BITBUCKET_API_BASE_URL}/repositories/${encodeURIComponent(ws)}/${encodeURIComponent(repoSlug)}/pullrequests/${pr.id}/diffstat?pagelen=50`;
+  try {
+    const response = await fetchWithTimeout(
+      fetchFn,
+      url,
+      {
+        method: 'GET',
+        headers: {
+          Authorization: authHeader,
+          Accept: 'application/json'
+        }
+      },
+      THROTTLE_CONFIG.requestTimeoutMs
+    );
+    if (!response.ok) {
+      return null;
+    }
+    const data = await response.json();
+    const values = Array.isArray(data?.values) ? data.values : [];
+
+    let linesAdded = 0;
+    let linesRemoved = 0;
+    /** @type {import('./storage.js').DiffstatFile[]} */
+    const files = [];
+
+    for (const entry of values) {
+      if (!entry || typeof entry !== 'object') {
+        continue;
+      }
+      const filePath =
+        (typeof entry.new?.path === 'string' && entry.new.path) ||
+        (typeof entry.old?.path === 'string' && entry.old.path) ||
+        '';
+      if (!filePath) {
+        continue;
+      }
+      const added = typeof entry.lines_added === 'number' && Number.isFinite(entry.lines_added)
+        ? entry.lines_added
+        : 0;
+      const removed = typeof entry.lines_removed === 'number' && Number.isFinite(entry.lines_removed)
+        ? entry.lines_removed
+        : 0;
+      const status = typeof entry.status === 'string' && entry.status ? entry.status : 'modified';
+
+      linesAdded += added;
+      linesRemoved += removed;
+      files.push({
+        path: filePath,
+        added,
+        removed,
+        status
+      });
+    }
+
+    const filesChanged = typeof data?.size === 'number' && Number.isFinite(data.size)
+      ? Math.max(data.size, files.length)
+      : files.length;
+
+    return {
+      commitHash: typeof pr.sourceCommitHash === 'string' ? pr.sourceCommitHash.trim() : '',
+      filesChanged,
+      linesAdded,
+      linesRemoved,
+      files,
+      cachedAt: nowFn()
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1181,8 +1295,25 @@ export function createBitbucketClient({
     };
   }
 
+  /**
+   * Fetch diffstat metadata for a single PR using the client's `fetchFn` and `nowFn`.
+   *
+   * @param {Partial<import('./storage.js').Credentials>} creds
+   * @param {Pick<import('./storage.js').PullRequestRecord, 'id' | 'repoFullName' | 'workspace' | 'repoName' | 'sourceCommitHash'>} pr
+   * @returns {Promise<import('./storage.js').DiffstatSummary | null>}
+   */
+  async function fetchDiffstat(creds, pr) {
+    try {
+      const authHeader = buildAuthHeader(creds);
+      return await fetchBitbucketDiffstat({ fetchFn, authHeader, pr, nowFn });
+    } catch {
+      return null;
+    }
+  }
+
   return {
     verifyCredentials,
-    fetchPullRequests
+    fetchPullRequests,
+    fetchDiffstat
   };
 }

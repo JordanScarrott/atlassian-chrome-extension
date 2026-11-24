@@ -1,4 +1,4 @@
-import { sanitizeHttpsUrl } from './config.js';
+import { DECISION_MODELS, sanitizeHttpsUrl } from './config.js';
 import { filterAndSortPrs, isPrSnoozed } from './pr-triage.js';
 
 /** @typedef {import('./pr-triage.js').EnrichedPullRequest} EnrichedPullRequest */
@@ -6,6 +6,8 @@ import { filterAndSortPrs, isPrSnoozed } from './pr-triage.js';
 /** @typedef {import('./storage.js').BuildState} BuildState */
 /** @typedef {import('./storage.js').BuildStatusSummary} BuildStatusSummary */
 /** @typedef {import('./storage.js').CachedUser} CachedUser */
+/** @typedef {import('./storage.js').DecisionTriageResult} DecisionTriageResult */
+/** @typedef {import('./storage.js').DiffstatSummary} DiffstatSummary */
 /** @typedef {import('./storage.js').SnoozedMap} SnoozedMap */
 /** @typedef {import('./storage.js').WorkspaceSummary} WorkspaceSummary */
 
@@ -717,3 +719,236 @@ export function getOffscreenDeckAttention(prs, activeIndex, snoozedMap = {}, now
     label
   };
 }
+
+/**
+ * @typedef {Object} AiTriageBadgeDescriptor
+ * @property {string} label
+ * @property {string} cssClass
+ * @property {string} tooltip
+ */
+
+/**
+ * @typedef {Object} AiTriageBadgesResult
+ * @property {AiTriageBadgeDescriptor | null} effortBadge
+ * @property {AiTriageBadgeDescriptor | null} alertBadge
+ */
+
+/** @type {Readonly<Record<'quick' | 'medium' | 'deep', { label: string, cssClass: string, summary: string }>>} */
+const EFFORT_BADGE_META = Object.freeze({
+  quick: {
+    label: '⚡ ~2m',
+    cssClass: 'ai-effort-quick',
+    summary: 'Quick review (~2m)'
+  },
+  medium: {
+    label: '⏱ ~15m',
+    cssClass: 'ai-effort-medium',
+    summary: 'Standard review (~15m)'
+  },
+  deep: {
+    label: '🧠 Deep',
+    cssClass: 'ai-effort-deep',
+    summary: 'Deep review (30m+)'
+  }
+});
+
+/** @type {Readonly<Record<'hotfix' | 'high_risk', { label: string, cssClass: string, summary: string }>>} */
+const ALERT_BADGE_META = Object.freeze({
+  hotfix: {
+    label: '🔥 Hotfix',
+    cssClass: 'ai-alert-hotfix',
+    summary: 'Urgent production hotfix / blocker'
+  },
+  high_risk: {
+    label: '⚠ High Risk',
+    cssClass: 'ai-alert-high_risk',
+    summary: 'Elevated blast radius / sensitive change'
+  }
+});
+
+/** @type {Readonly<Record<string, string>>} */
+const CHANGE_KIND_LABELS = Object.freeze({
+  feature: 'Feature',
+  bugfix: 'Bugfix',
+  hotfix: 'Hotfix',
+  refactor: 'Refactor',
+  tests_docs: 'Tests & Docs',
+  config_deps: 'Config & Deps',
+  other: 'Other'
+});
+
+/**
+ * Format calibrated confidence as a whole percentage (e.g. `88% confidence`).
+ *
+ * @param {number} confidence
+ * @returns {string}
+ */
+function formatConfidencePct(confidence) {
+  const clamped = Math.max(0, Math.min(1, confidence));
+  return `${Math.round(clamped * 100)}% confidence`;
+}
+
+/**
+ * Format diffstat summary (`12 files · +140/-32`) when available, or `''`.
+ *
+ * @param {Partial<DiffstatSummary> | null | undefined} diffstat
+ * @returns {string}
+ */
+function formatDiffstatSummary(diffstat) {
+  if (!diffstat || typeof diffstat !== 'object') {
+    return '';
+  }
+  const files = typeof diffstat.filesChanged === 'number' && Number.isFinite(diffstat.filesChanged) && diffstat.filesChanged >= 0
+    ? Math.floor(diffstat.filesChanged)
+    : null;
+  const added = typeof diffstat.linesAdded === 'number' && Number.isFinite(diffstat.linesAdded) && diffstat.linesAdded >= 0
+    ? Math.floor(diffstat.linesAdded)
+    : null;
+  const removed = typeof diffstat.linesRemoved === 'number' && Number.isFinite(diffstat.linesRemoved) && diffstat.linesRemoved >= 0
+    ? Math.floor(diffstat.linesRemoved)
+    : null;
+  if (files === null && added === null && removed === null) {
+    return '';
+  }
+  const filesPart = `${files ?? 0} ${(files ?? 0) === 1 ? 'file' : 'files'}`;
+  const linesPart = `+${added ?? 0}/-${removed ?? 0}`;
+  return `${filesPart} · ${linesPart}`;
+}
+
+/**
+ * Build a rich multi-detail tooltip for an AI triage badge combining explanation,
+ * `changeKind`, `riskScore/5`, diffstat (`12 files · +140/-32`), model name, and calibrated confidence %.
+ *
+ * @param {{
+ *   headline: string,
+ *   aiTriage: Partial<DecisionTriageResult>,
+ *   diffstat: Partial<DiffstatSummary> | null | undefined,
+ *   confidence: number
+ * }} params
+ * @returns {string}
+ */
+function buildAiBadgeTooltip({ headline, aiTriage, diffstat, confidence }) {
+  /** @type {string[]} */
+  const parts = [headline];
+
+  if (typeof aiTriage.changeKind === 'string' && aiTriage.changeKind.trim()) {
+    const rawKind = aiTriage.changeKind.trim();
+    parts.push(`Kind: ${CHANGE_KIND_LABELS[rawKind] ?? rawKind}`);
+  }
+
+  if (typeof aiTriage.riskScore === 'number' && Number.isFinite(aiTriage.riskScore)) {
+    const clampedScore = Math.max(1, Math.min(5, aiTriage.riskScore));
+    const formattedScore = Number.isInteger(clampedScore)
+      ? String(clampedScore)
+      : clampedScore.toFixed(1).replace(/\.0$/, '');
+    parts.push(`Risk: ${formattedScore}/5`);
+  }
+
+  const diffSummary = formatDiffstatSummary(diffstat);
+  if (diffSummary) {
+    parts.push(diffSummary);
+  }
+
+  const modelName = typeof aiTriage.model === 'string' && aiTriage.model.trim()
+    ? aiTriage.model.trim()
+    : (aiTriage.provider === 'gemini' ? DECISION_MODELS.GEMINI_DEFAULT_MODEL : DECISION_MODELS.JEV_DEFAULT_MODEL);
+  parts.push(`${modelName} (${formatConfidencePct(confidence)})`);
+
+  return parts.join(' • ');
+}
+
+/**
+ * Derive strictly capped System One AI triage badges for a PR card:
+ * at most 1 effort badge + at most 1 alert badge, each gated by
+ * `confidence >= DECISION_MODELS.CONFIDENCE_THRESHOLD` (`0.75`).
+ *
+ * @param {Partial<DecisionTriageResult> | null | undefined} aiTriage
+ * @param {Partial<DiffstatSummary> | null | undefined} [diffstat]
+ * @returns {AiTriageBadgesResult}
+ */
+export function getAiTriageBadges(aiTriage, diffstat = null) {
+  if (!aiTriage || typeof aiTriage !== 'object') {
+    return { effortBadge: null, alertBadge: null };
+  }
+
+  const threshold = DECISION_MODELS.CONFIDENCE_THRESHOLD;
+
+  /** @type {AiTriageBadgeDescriptor | null} */
+  let effortBadge = null;
+  const effortKey = aiTriage.effort;
+  const effortConfidence = typeof aiTriage.effortConfidence === 'number' && Number.isFinite(aiTriage.effortConfidence)
+    ? aiTriage.effortConfidence
+    : 0;
+  if (
+    (effortKey === 'quick' || effortKey === 'medium' || effortKey === 'deep') &&
+    effortConfidence >= threshold
+  ) {
+    const meta = EFFORT_BADGE_META[effortKey];
+    effortBadge = {
+      label: meta.label,
+      cssClass: meta.cssClass,
+      tooltip: buildAiBadgeTooltip({
+        headline: meta.summary,
+        aiTriage,
+        diffstat,
+        confidence: effortConfidence
+      })
+    };
+  }
+
+  /** @type {AiTriageBadgeDescriptor | null} */
+  let alertBadge = null;
+  const alertKey = aiTriage.alert;
+  const alertConfidence = typeof aiTriage.alertConfidence === 'number' && Number.isFinite(aiTriage.alertConfidence)
+    ? aiTriage.alertConfidence
+    : 0;
+  if (
+    (alertKey === 'hotfix' || alertKey === 'high_risk') &&
+    alertConfidence >= threshold
+  ) {
+    const meta = ALERT_BADGE_META[alertKey];
+    alertBadge = {
+      label: meta.label,
+      cssClass: meta.cssClass,
+      tooltip: buildAiBadgeTooltip({
+        headline: meta.summary,
+        aiTriage,
+        diffstat,
+        confidence: alertConfidence
+      })
+    };
+  }
+
+  return { effortBadge, alertBadge };
+}
+
+/**
+ * Count open non-snoozed PRs eligible for the `#quick-wins-btn` filter chip
+ * (`aiTriage.effort === 'quick'` and `effortConfidence >= DECISION_MODELS.CONFIDENCE_THRESHOLD`).
+ *
+ * @param {readonly EnrichedPullRequest[]} prs
+ * @param {SnoozedMap | null | undefined} [snoozedMap]
+ * @param {number} [now]
+ * @returns {number}
+ */
+export function countQuickWinsPrs(prs, snoozedMap = {}, now = Date.now()) {
+  if (!Array.isArray(prs) || prs.length === 0) {
+    return 0;
+  }
+  const threshold = DECISION_MODELS.CONFIDENCE_THRESHOLD;
+  let count = 0;
+  for (const pr of prs) {
+    if (!pr || isPrSnoozed(pr, snoozedMap, now)) {
+      continue;
+    }
+    const effort = pr.aiTriage?.effort;
+    const conf = typeof pr.aiTriage?.effortConfidence === 'number' && Number.isFinite(pr.aiTriage.effortConfidence)
+      ? pr.aiTriage.effortConfidence
+      : 0;
+    if (effort === 'quick' && conf >= threshold) {
+      count += 1;
+    }
+  }
+  return count;
+}
+

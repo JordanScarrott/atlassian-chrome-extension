@@ -4,10 +4,12 @@ import assert from 'node:assert/strict';
 import {
   buildReviewerBreakdown,
   buildReviewerBreakdownTooltip,
+  countQuickWinsPrs,
   filterPrsByRelatedTicket,
   formatFooterUpdated,
   formatRelativeAge,
   formatRemainingSnooze,
+  getAiTriageBadges,
   getCiBadgeDescriptor,
   getCrossFilterEmptyHint,
   getDeckDotDescriptor,
@@ -549,3 +551,221 @@ test('filterPrsByRelatedTicket, sortDeckPrs, getDeckDotDescriptor, and getOffscr
   };
   assert.equal(getOffscreenDeckAttention(deck, 0, snoozed, NOW), null);
 });
+
+test('getAiTriageBadges enforces strict confidence >= 0.75 gating, capped effort+alert labels, and rich diffstat tooltips', () => {
+  // Null / disabled / missing triage returns nulls cleanly
+  assert.deepEqual(getAiTriageBadges(null), { effortBadge: null, alertBadge: null });
+  assert.deepEqual(getAiTriageBadges(undefined), { effortBadge: null, alertBadge: null });
+  assert.deepEqual(getAiTriageBadges({}), { effortBadge: null, alertBadge: null });
+
+  const diffstat = {
+    commitHash: 'abc123',
+    filesChanged: 12,
+    linesAdded: 140,
+    linesRemoved: 32,
+    files: [],
+    cachedAt: NOW
+  };
+
+  // Effort: quick + no alert + diffstat tooltip
+  const quickRes = getAiTriageBadges(
+    {
+      provider: 'jev',
+      model: 'clef-flash',
+      effort: 'quick',
+      effortConfidence: 0.88,
+      alert: null,
+      alertConfidence: 0.2,
+      changeKind: 'tests_docs',
+      riskScore: 1,
+      hasClearContext: true
+    },
+    diffstat
+  );
+  assert.equal(quickRes.effortBadge?.label, '⚡ ~2m');
+  assert.equal(quickRes.effortBadge?.cssClass, 'ai-effort-quick');
+  assert.match(quickRes.effortBadge?.tooltip ?? '', /Quick review \(~2m\)/);
+  assert.match(quickRes.effortBadge?.tooltip ?? '', /Kind: Tests & Docs/);
+  assert.match(quickRes.effortBadge?.tooltip ?? '', /Risk: 1\/5/);
+  assert.match(quickRes.effortBadge?.tooltip ?? '', /12 files · \+140\/-32/);
+  assert.match(quickRes.effortBadge?.tooltip ?? '', /clef-flash \(88% confidence\)/);
+  assert.equal(quickRes.alertBadge, null);
+
+  // Effort: medium + hotfix alert at exact 0.75 threshold
+  const mediumHotfixRes = getAiTriageBadges(
+    {
+      provider: 'gemini',
+      model: 'gemini-decision-1',
+      effort: 'medium',
+      effortConfidence: 0.75,
+      alert: 'hotfix',
+      alertConfidence: 0.75,
+      changeKind: 'hotfix',
+      riskScore: 3.4,
+      hasClearContext: true
+    },
+    null
+  );
+  assert.equal(mediumHotfixRes.effortBadge?.label, '⏱ ~15m');
+  assert.equal(mediumHotfixRes.effortBadge?.cssClass, 'ai-effort-medium');
+  assert.match(mediumHotfixRes.effortBadge?.tooltip ?? '', /gemini-decision-1 \(75% confidence\)/);
+  assert.equal(mediumHotfixRes.effortBadge?.tooltip.includes('files ·'), false);
+
+  assert.equal(mediumHotfixRes.alertBadge?.label, '🔥 Hotfix');
+  assert.equal(mediumHotfixRes.alertBadge?.cssClass, 'ai-alert-hotfix');
+  assert.match(mediumHotfixRes.alertBadge?.tooltip ?? '', /Risk: 3\.4\/5/);
+  assert.match(mediumHotfixRes.alertBadge?.tooltip ?? '', /gemini-decision-1 \(75% confidence\)/);
+
+  // Effort: deep + high_risk alert
+  const deepHighRiskRes = getAiTriageBadges(
+    {
+      provider: 'jev',
+      model: 'clef-flash',
+      effort: 'deep',
+      effortConfidence: 0.94,
+      alert: 'high_risk',
+      alertConfidence: 0.81,
+      changeKind: 'refactor',
+      riskScore: 4.6,
+      hasClearContext: false
+    },
+    {
+      commitHash: 'def',
+      filesChanged: 1,
+      linesAdded: 5,
+      linesRemoved: 1,
+      files: [],
+      cachedAt: NOW
+    }
+  );
+  assert.equal(deepHighRiskRes.effortBadge?.label, '🧠 Deep');
+  assert.equal(deepHighRiskRes.effortBadge?.cssClass, 'ai-effort-deep');
+  assert.match(deepHighRiskRes.effortBadge?.tooltip ?? '', /1 file · \+5\/-1/);
+  assert.equal(deepHighRiskRes.alertBadge?.label, '⚠ High Risk');
+  assert.equal(deepHighRiskRes.alertBadge?.cssClass, 'ai-alert-high_risk');
+  assert.match(deepHighRiskRes.alertBadge?.tooltip ?? '', /81% confidence/);
+
+  // Strict < 0.75 gating suppresses badges independently
+  const gatedBoth = getAiTriageBadges({
+    provider: 'jev',
+    model: 'clef-flash',
+    effort: 'quick',
+    effortConfidence: 0.749,
+    alert: 'hotfix',
+    alertConfidence: 0.74,
+    changeKind: 'bugfix',
+    riskScore: 2
+  });
+  assert.equal(gatedBoth.effortBadge, null);
+  assert.equal(gatedBoth.alertBadge, null);
+
+  const gatedEffortOnly = getAiTriageBadges({
+    provider: 'jev',
+    model: 'clef-flash',
+    effort: 'quick',
+    effortConfidence: 0.7,
+    alert: 'high_risk',
+    alertConfidence: 0.9,
+    riskScore: 4
+  });
+  assert.equal(gatedEffortOnly.effortBadge, null);
+  assert.equal(gatedEffortOnly.alertBadge?.label, '⚠ High Risk');
+
+  // Unknown effort/alert values are safely ignored
+  const unknownValues = getAiTriageBadges({
+    // @ts-expect-error testing runtime resilience for unknown effort
+    effort: 'unknown',
+    effortConfidence: 0.99,
+    // @ts-expect-error testing runtime resilience for unknown alert
+    alert: 'unknown',
+    alertConfidence: 0.99
+  });
+  assert.equal(unknownValues.effortBadge, null);
+  assert.equal(unknownValues.alertBadge, null);
+});
+
+test('countQuickWinsPrs counts non-snoozed open PRs with quick effort and confidence >= 0.75', () => {
+  const quickValid = makeEnrichedPr({
+    key: 'acme/repo#201',
+    id: 201,
+    updatedOn: '2026-11-23T11:00:00Z',
+    aiTriage: {
+      commitHash: 'a',
+      questionSetVersion: 'effort-risk-v1',
+      provider: 'jev',
+      model: 'clef-flash',
+      effort: 'quick',
+      effortConfidence: 0.85,
+      alert: null,
+      alertConfidence: 0.1,
+      changeKind: 'tests_docs',
+      riskScore: 1,
+      hasClearContext: true,
+      cachedAt: NOW
+    }
+  });
+  const quickLowConf = makeEnrichedPr({
+    key: 'acme/repo#202',
+    id: 202,
+    aiTriage: {
+      commitHash: 'b',
+      questionSetVersion: 'effort-risk-v1',
+      provider: 'jev',
+      model: 'clef-flash',
+      effort: 'quick',
+      effortConfidence: 0.74,
+      alert: null,
+      alertConfidence: 0.1,
+      changeKind: 'bugfix',
+      riskScore: 2,
+      hasClearContext: true,
+      cachedAt: NOW
+    }
+  });
+  const quickSnoozed = makeEnrichedPr({
+    key: 'acme/repo#203',
+    id: 203,
+    updatedOn: '2026-11-23T11:00:00Z',
+    aiTriage: {
+      commitHash: 'c',
+      questionSetVersion: 'effort-risk-v1',
+      provider: 'jev',
+      model: 'clef-flash',
+      effort: 'quick',
+      effortConfidence: 0.92,
+      alert: null,
+      alertConfidence: 0.1,
+      changeKind: 'config_deps',
+      riskScore: 1,
+      hasClearContext: true,
+      cachedAt: NOW
+    }
+  });
+  const deepPr = makeEnrichedPr({
+    key: 'acme/repo#204',
+    id: 204,
+    aiTriage: {
+      commitHash: 'd',
+      questionSetVersion: 'effort-risk-v1',
+      provider: 'jev',
+      model: 'clef-flash',
+      effort: 'deep',
+      effortConfidence: 0.95,
+      alert: 'high_risk',
+      alertConfidence: 0.9,
+      changeKind: 'refactor',
+      riskScore: 5,
+      hasClearContext: false,
+      cachedAt: NOW
+    }
+  });
+
+  const snoozedMap = {
+    'acme/repo#203': { until: NOW + 60_000, prUpdatedOn: '2026-11-23T11:00:00Z' }
+  };
+
+  assert.equal(countQuickWinsPrs([quickValid, quickLowConf, quickSnoozed, deepPr], snoozedMap, NOW), 1);
+  assert.equal(countQuickWinsPrs([quickLowConf, deepPr], {}, NOW), 0);
+  assert.equal(countQuickWinsPrs([], {}, NOW), 0);
+});
+

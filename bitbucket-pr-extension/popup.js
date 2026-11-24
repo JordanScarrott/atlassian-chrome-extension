@@ -1,10 +1,12 @@
 import {
   AUTH_SETUP_LINKS,
   CENTRAL_URLS,
+  DECISION_MODELS,
   DEFAULT_PREFERENCES,
   STORAGE_KEYS,
   getEffectiveGitHubApiBaseUrl,
   getEffectiveJiraBaseUrl,
+  sanitizeDecisionEndpointUrl,
   sanitizeHttpsUrl
 } from './src/config.js';
 import { isPrSnoozed } from './src/pr-triage.js';
@@ -14,22 +16,25 @@ import {
 } from './src/ui/pr-card-renderer.js';
 import {
   hideSettingsDrawer,
+  readValidatedCredentialInputs,
+  readValidatedDecisionInputs,
+  readValidatedGitHubInputs,
+  readValidatedPreferencesInputs,
   renderAccountSection,
   renderPreferencesForm,
   renderSettingsSubtab,
-  readValidatedCredentialInputs,
-  readValidatedGitHubInputs,
-  readValidatedPreferencesInputs,
   resolveAccountSectionElements,
   resolvePreferencesFormElements,
   resolveSettingsDrawerControls,
   showInlineBanner,
   showSettingsDrawer,
   syncAuthMethodFields,
+  syncDecisionProviderFields,
   toggleSecretInputVisibility
 } from './src/ui/settings-renderer.js';
 import {
   TOP_TABS,
+  hasQuickWinsFilterToken,
   refreshRelativeTimestampsInDom,
   renderAddProductForm,
   renderBitbucketTab as renderBitbucketTabView,
@@ -53,12 +58,14 @@ import {
 /** @typedef {import('./src/pr-triage.js').PrFilter} PrFilter */
 /** @typedef {import('./src/storage.js').AuthType} AuthType */
 /** @typedef {import('./src/storage.js').CachedUser} CachedUser */
+/** @typedef {import('./src/storage.js').DecisionProvider} DecisionProvider */
 /** @typedef {import('./src/storage.js').PrSnapshot} PrSnapshot */
 /** @typedef {import('./src/storage.js').ProductFeedbackState} ProductFeedbackState */
 /** @typedef {import('./src/storage.js').SnoozedMap} SnoozedMap */
 /** @typedef {import('./src/storage.js').SyncState} SyncState */
 /** @typedef {import('./src/storage.js').WorkspaceSummary} WorkspaceSummary */
 /** @typedef {import('./src/ui/pr-card-renderer.js').PrCardCallbacks} PrCardCallbacks */
+/** @typedef {import('./src/ui/settings-renderer.js').DecisionBootstrapState} DecisionBootstrapState */
 
 /**
  * @typedef {Object} GitHubBootstrapState
@@ -75,6 +82,7 @@ import {
  * @property {string} username
  * @property {CachedUser | null} user
  * @property {GitHubBootstrapState} [github]
+ * @property {DecisionBootstrapState} [decision]
  * @property {WorkspaceSummary[]} workspaces
  * @property {boolean} [isAuthError]
  * @property {Omit<PrSnapshot, 'prList'> & { prList: EnrichedPullRequest[], isAuthError?: boolean }} snapshot
@@ -95,6 +103,7 @@ const WATCHED_STORAGE_KEYS = new Set([
   STORAGE_KEYS.GITHUB_TOKEN,
   STORAGE_KEYS.GITHUB_API_BASE_URL,
   STORAGE_KEYS.CACHED_GITHUB_USER,
+  STORAGE_KEYS.DECISION_CONFIG,
   STORAGE_KEYS.PREFERENCES,
   STORAGE_KEYS.CACHED_USER,
   STORAGE_KEYS.CACHED_WORKSPACES,
@@ -143,6 +152,12 @@ function createEmptyState() {
       isAuthenticated: false,
       apiBaseUrl: getEffectiveGitHubApiBaseUrl(),
       user: null
+    },
+    decision: {
+      provider: DECISION_MODELS.DEFAULT_PROVIDER,
+      baseUrl: '',
+      model: '',
+      isConfigured: false
     },
     workspaces: [],
     snapshot: {
@@ -216,6 +231,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   const {
     prSearchClearBtn,
+    quickWinsBtn,
     groupByTicketBtn,
     errorSetupBtn,
     prItemsContainer,
@@ -250,6 +266,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   let isReplacingToken = false;
   /** @type {boolean} */
   let isReplacingGitHubToken = false;
+  /** @type {boolean} */
+  let isConfiguringDecision = false;
   /** @type {boolean} */
   let isSyncing = false;
   /** @type {boolean} */
@@ -345,22 +363,28 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
-   * Populate Settings -> Account & Setup UI (Bitbucket Cloud + GitHub).
+   * Populate Settings -> Account & Setup UI (Bitbucket Cloud + GitHub + System One AI Triage).
    */
   function populateAccountSection() {
-    renderAccountSection(accountSectionElements, {
-      bitbucketAuthenticated: isBitbucketAuthenticated(),
-      isReplacingToken,
-      authType: state.authType,
-      username: state.username,
-      user: state.user,
-      workspaces: state.workspaces,
-      syncedWorkspaces: state.snapshot.syncedWorkspaces,
-      githubAuthenticated: isGitHubAuthenticated(),
-      isReplacingGitHubToken,
-      githubApiBaseUrl: state.github?.apiBaseUrl || '',
-      githubUser: state.github?.user ?? null
-    });
+    renderAccountSection(
+      accountSectionElements,
+      {
+        bitbucketAuthenticated: isBitbucketAuthenticated(),
+        isReplacingToken,
+        authType: state.authType,
+        username: state.username,
+        user: state.user,
+        workspaces: state.workspaces,
+        syncedWorkspaces: state.snapshot.syncedWorkspaces,
+        githubAuthenticated: isGitHubAuthenticated(),
+        isReplacingGitHubToken,
+        githubApiBaseUrl: state.github?.apiBaseUrl || '',
+        githubUser: state.github?.user ?? null,
+        decision: state.decision,
+        isConfiguringDecision
+      },
+      { decisionTestBtn: settingsControls.decisionTestBtn }
+    );
   }
 
   /**
@@ -419,6 +443,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   function closeSettingsPanel() {
     isReplacingToken = false;
     isReplacingGitHubToken = false;
+    isConfiguringDecision = false;
     populateAccountSection();
     populatePreferencesForm(state.preferences);
     hideSettingsDrawer(settingsPanel, toggleSettingsBtn);
@@ -974,6 +999,224 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   /**
+   * Toggle `effort:quick` token inside the search filter bar from `#quick-wins-btn`.
+   */
+  function toggleQuickWinsFilter() {
+    if (!state.isAuthenticated) {
+      return;
+    }
+    activeRelatedTicketKey = null;
+    selectedPrKey = null;
+
+    const currentlyActive = hasQuickWinsFilterToken(searchQuery);
+    if (currentlyActive) {
+      const remainingTokens = searchQuery
+        .trim()
+        .split(/\s+/)
+        .filter((token) => token.toLowerCase() !== 'effort:quick');
+      searchQuery = remainingTokens.join(' ');
+    } else {
+      const trimmed = searchQuery.trim();
+      searchQuery = trimmed ? `${trimmed} effort:quick` : 'effort:quick';
+    }
+
+    prSearchInput.value = searchQuery;
+    renderBitbucketTab();
+  }
+
+  /**
+   * Disable/enable System One AI Triage form controls during async verification or saving.
+   *
+   * @param {boolean} busy
+   */
+  function setDecisionFormBusy(busy) {
+    const isOff = accountSectionElements.decisionProviderSelect.value === 'off';
+    settingsControls.decisionTestBtn.disabled = busy || isOff;
+    settingsControls.decisionSaveBtn.disabled = busy;
+    settingsControls.decisionCancelBtn.disabled = busy;
+  }
+
+  /**
+   * Request optional Chrome host permission for custom non-default Decision Model endpoints
+   * (e.g. internal Jev / Clef Flash servers) before testing or saving.
+   *
+   * @param {DecisionProvider} provider
+   * @param {string} baseUrl
+   * @returns {Promise<boolean>}
+   */
+  async function ensureDecisionHostPermission(provider, baseUrl) {
+    if (provider !== 'jev' || !baseUrl) {
+      return true;
+    }
+    const safeUrl = sanitizeDecisionEndpointUrl(baseUrl);
+    if (!safeUrl) {
+      return false;
+    }
+
+    let originPattern;
+    try {
+      const parsed = new URL(safeUrl);
+      const defaultJevUrl = sanitizeDecisionEndpointUrl(DECISION_MODELS.JEV_API_BASE_URL);
+      const defaultJevOrigin = defaultJevUrl ? new URL(defaultJevUrl).origin : '';
+      const geminiOrigin = new URL(DECISION_MODELS.GEMINI_DECISIONS_URL).origin;
+      if (parsed.origin === geminiOrigin || (defaultJevOrigin && parsed.origin === defaultJevOrigin)) {
+        return true;
+      }
+      originPattern = `${parsed.origin}/*`;
+    } catch {
+      return false;
+    }
+
+    const requestPermission = chrome?.permissions?.request;
+    if (typeof requestPermission !== 'function') {
+      return true;
+    }
+
+    try {
+      const granted = await requestPermission.call(chrome.permissions, { origins: [originPattern] });
+      if (!granted) {
+        showInlineBanner(
+          accountSectionElements.decisionStatusBanner,
+          `Host permission denied for ${originPattern}. Grant site access to allow scoring requests.`,
+          'warning'
+        );
+        return false;
+      }
+      return true;
+    } catch (err) {
+      showInlineBanner(
+        accountSectionElements.decisionStatusBanner,
+        err instanceof Error ? err.message : `Could not request host permission for ${originPattern}.`,
+        'warning'
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Test System One Decision Model configuration without persisting it.
+   */
+  async function handleTestDecisionModel() {
+    const config = readValidatedDecisionInputs(accountSectionElements, {
+      currentProvider: state.decision?.provider,
+      isConfigured: state.decision?.isConfigured
+    });
+    if (!config || config.provider === 'off') {
+      return;
+    }
+
+    setDecisionFormBusy(true);
+    const hasPermission = await ensureDecisionHostPermission(config.provider, config.baseUrl);
+    if (!hasPermission) {
+      setDecisionFormBusy(false);
+      return;
+    }
+
+    showInlineBanner(accountSectionElements.decisionStatusBanner, 'Testing Decision Model connection...', 'info');
+    try {
+      const res = await sendWorkerMessage({ action: 'TEST_DECISION_MODEL', config });
+      if (res.ok) {
+        const providerName = res.provider === 'gemini' ? 'Gemini Decision 1' : 'Jev / Clef Flash';
+        showInlineBanner(
+          accountSectionElements.decisionStatusBanner,
+          `Verified ${providerName} (${String(res.model || config.model)}).`,
+          'success'
+        );
+      } else {
+        showInlineBanner(
+          accountSectionElements.decisionStatusBanner,
+          String(res.error || 'Decision model verification failed.'),
+          'error'
+        );
+      }
+    } catch (err) {
+      showInlineBanner(
+        accountSectionElements.decisionStatusBanner,
+        err instanceof Error ? err.message : 'Failed to test Decision Model connection.',
+        'error'
+      );
+    } finally {
+      setDecisionFormBusy(false);
+    }
+  }
+
+  /**
+   * Validate, optionally request host permission, save System One Decision Model config,
+   * and score open PRs immediately.
+   *
+   * @param {SubmitEvent} e
+   */
+  async function handleSaveDecisionConfig(e) {
+    e.preventDefault();
+    const config = readValidatedDecisionInputs(accountSectionElements, {
+      currentProvider: state.decision?.provider,
+      isConfigured: state.decision?.isConfigured
+    });
+    if (!config) {
+      return;
+    }
+
+    setDecisionFormBusy(true);
+    try {
+      if (config.provider === 'off') {
+        markLocalStateMutation();
+        const res = await sendWorkerMessage({ action: 'CLEAR_DECISION_CONFIG' });
+        if (res.ok === false) {
+          showInlineBanner(
+            accountSectionElements.decisionStatusBanner,
+            String(res.error || 'Could not disable System One AI Triage.'),
+            'error'
+          );
+          return;
+        }
+        accountSectionElements.decisionApiKeyInput.value = '';
+        isConfiguringDecision = false;
+        await refreshStateFromWorker();
+        markLocalStateMutation();
+        populateAccountSection();
+        showToast('System One AI Triage disabled.');
+        return;
+      }
+
+      const hasPermission = await ensureDecisionHostPermission(config.provider, config.baseUrl);
+      if (!hasPermission) {
+        return;
+      }
+
+      showInlineBanner(accountSectionElements.decisionStatusBanner, 'Verifying model and scoring PRs...', 'info');
+      markLocalStateMutation();
+      const res = await sendWorkerMessage({ action: 'SAVE_DECISION_CONFIG', config });
+      if (!res.ok) {
+        showInlineBanner(
+          accountSectionElements.decisionStatusBanner,
+          String(res.error || 'Could not save Decision Model settings.'),
+          'error'
+        );
+        return;
+      }
+
+      accountSectionElements.decisionApiKeyInput.value = '';
+      isConfiguringDecision = false;
+      await refreshStateFromWorker();
+      markLocalStateMutation();
+      closeSettingsPanel();
+      if (res.syncError) {
+        showToast(`AI Triage saved, but sync failed: ${String(res.syncError)}`, 'error', { durationMs: 4200 });
+      } else {
+        showToast('System One AI Triage enabled & PRs scored!', 'success');
+      }
+    } catch (err) {
+      showInlineBanner(
+        accountSectionElements.decisionStatusBanner,
+        err instanceof Error ? err.message : 'Failed to save Decision Model settings.',
+        'error'
+      );
+    } finally {
+      setDecisionFormBusy(false);
+    }
+  }
+
+  /**
    * Validate and persist user preferences via background worker.
    *
    * @param {SubmitEvent} e
@@ -1087,6 +1330,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   settingsControls.closeSettingsBtn.addEventListener('click', closeSettingsPanel);
   settingsControls.cancelSettingsBtn.addEventListener('click', closeSettingsPanel);
   settingsControls.cancelGitHubSettingsBtn.addEventListener('click', closeSettingsPanel);
+  settingsControls.decisionCancelBtn.addEventListener('click', closeSettingsPanel);
   settingsControls.cancelPreferencesBtn.addEventListener('click', closeSettingsPanel);
 
   settingsAccountTab.addEventListener('click', () => switchSettingsSubtab('account'));
@@ -1173,6 +1417,75 @@ document.addEventListener('DOMContentLoaded', async () => {
     } finally {
       settingsControls.githubConfirmSignOutBtn.disabled = false;
     }
+  });
+
+  settingsControls.decisionReplaceBtn.addEventListener('click', () => {
+    isConfiguringDecision = true;
+    populateAccountSection();
+    accountSectionElements.decisionProviderSelect.focus();
+  });
+
+  settingsControls.decisionSignOutBtn.addEventListener('click', () => {
+    accountSectionElements.decisionSignOutConfirmRow.classList.remove('hidden');
+    settingsControls.decisionConfirmSignOutBtn.focus();
+  });
+
+  settingsControls.decisionCancelSignOutBtn.addEventListener('click', () => {
+    accountSectionElements.decisionSignOutConfirmRow.classList.add('hidden');
+    settingsControls.decisionSignOutBtn.focus();
+  });
+
+  settingsControls.decisionConfirmSignOutBtn.addEventListener('click', async () => {
+    settingsControls.decisionConfirmSignOutBtn.disabled = true;
+    try {
+      markLocalStateMutation();
+      const res = await sendWorkerMessage({ action: 'CLEAR_DECISION_CONFIG' });
+      if (res.ok === false) {
+        showToast(String(res.error || 'Could not disable System One AI Triage.'), 'error');
+        return;
+      }
+      isConfiguringDecision = false;
+      await refreshStateFromWorker();
+      markLocalStateMutation();
+      populateAccountSection();
+      showToast('System One AI Triage disabled.');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to disable System One AI Triage.', 'error');
+    } finally {
+      settingsControls.decisionConfirmSignOutBtn.disabled = false;
+    }
+  });
+
+  accountSectionElements.decisionProviderSelect.addEventListener('change', () => {
+    syncDecisionProviderFields(
+      {
+        decisionProviderSelect: accountSectionElements.decisionProviderSelect,
+        decisionFieldsGroup: accountSectionElements.decisionFieldsGroup,
+        decisionBaseUrlInput: accountSectionElements.decisionBaseUrlInput,
+        decisionBaseUrlHelp: accountSectionElements.decisionBaseUrlHelp,
+        decisionModelInput: accountSectionElements.decisionModelInput,
+        decisionApiKeyInput: accountSectionElements.decisionApiKeyInput,
+        decisionApiKeyHelp: accountSectionElements.decisionApiKeyHelp,
+        decisionTestBtn: settingsControls.decisionTestBtn
+      },
+      { applyProviderDefaults: true }
+    );
+  });
+
+  accountSectionElements.decisionToggleKeyBtn.addEventListener('click', () => {
+    toggleSecretInputVisibility(
+      accountSectionElements.decisionApiKeyInput,
+      accountSectionElements.decisionToggleKeyBtn,
+      'Show API key',
+      'Hide API key'
+    );
+  });
+
+  settingsControls.decisionTestBtn.addEventListener('click', () => {
+    void handleTestDecisionModel();
+  });
+  accountSectionElements.decisionConfigForm.addEventListener('submit', (e) => {
+    void handleSaveDecisionConfig(e);
   });
 
   settingsControls.createApiTokenLink.addEventListener('click', (e) => {
@@ -1263,6 +1576,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     activeFilter = nextFilter;
     selectedPrKey = null;
     renderBitbucketTab();
+  });
+
+  quickWinsBtn.addEventListener('click', () => {
+    toggleQuickWinsFilter();
   });
 
   groupByTicketBtn.addEventListener('click', () => {

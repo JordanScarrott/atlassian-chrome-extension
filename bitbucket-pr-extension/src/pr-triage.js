@@ -722,7 +722,8 @@ export function pruneExpiredSnoozes(snoozedMap, prs, now = Date.now()) {
 
 /**
  * Check if an enriched PR matches a case-insensitive substring query (including CI status tokens
- * like `ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`, plus build name, `title`, `repoName`,
+ * like `ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`, AI triage tokens `effort:quick`,
+ * `effort:medium`, `effort:deep`, `risk:high`, `alert:hotfix`, plus build name, `title`, `repoName`,
  * `repoFullName`, `authorName`, `sourceBranch`, and `jiraKeys`).
  *
  * @param {EnrichedPullRequest} pr
@@ -736,6 +737,9 @@ function matchesSearchQuery(pr, normalizedQuery) {
 
   const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
   const ciState = pr.buildStatus?.state ?? null;
+  const aiEffort = pr.aiTriage?.effort ?? null;
+  const aiAlert = pr.aiTriage?.alert ?? null;
+  const aiRiskScore = typeof pr.aiTriage?.riskScore === 'number' ? pr.aiTriage.riskScore : null;
 
   /** @type {string[]} */
   const textTokens = [];
@@ -760,6 +764,36 @@ function matchesSearchQuery(pr, normalizedQuery) {
     }
     if (token === 'ci:stopped') {
       if (ciState !== 'STOPPED') {
+        return false;
+      }
+      continue;
+    }
+    if (token === 'effort:quick') {
+      if (aiEffort !== 'quick') {
+        return false;
+      }
+      continue;
+    }
+    if (token === 'effort:medium') {
+      if (aiEffort !== 'medium') {
+        return false;
+      }
+      continue;
+    }
+    if (token === 'effort:deep') {
+      if (aiEffort !== 'deep') {
+        return false;
+      }
+      continue;
+    }
+    if (token === 'risk:high') {
+      if (aiAlert !== 'high_risk' && (aiRiskScore === null || aiRiskScore < 4)) {
+        return false;
+      }
+      continue;
+    }
+    if (token === 'alert:hotfix') {
+      if (aiAlert !== 'hotfix') {
         return false;
       }
       continue;

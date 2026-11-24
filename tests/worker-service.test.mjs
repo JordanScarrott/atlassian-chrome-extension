@@ -957,3 +957,172 @@ test('TEST_GITHUB_CONNECTION, SAVE_GITHUB_CREDENTIALS, dual-provider sync mergin
   ]);
 });
 
+test('TEST_DECISION_MODEL, SAVE_DECISION_CONFIG, commit-hash caching (0 repeat AI calls), failure isolation, GET_STATE (no key leak), and CLEAR_DECISION_CONFIG', async () => {
+  let now = Date.UTC(2026, 10, 24, 9, 0, 0);
+  const mock = createMockChromeApi();
+  const storage = createStorage(mock.localArea);
+
+  await storage.saveCredentials({ authType: 'bearer', username: '', token: 'bb-tok' });
+  await storage.setCachedUser({ ...SAMPLE_USER, cachedAt: now });
+
+  let commitSha = 'commit-sha-1';
+  let diffstatCalls = 0;
+  let aiEvalCalls = 0;
+  let failAi = false;
+
+  const bbClient = {
+    async verifyCredentials() {
+      return { user: { ...SAMPLE_USER, cachedAt: now }, workspaces: SAMPLE_WORKSPACES, nearLimit: false };
+    },
+    async fetchPullRequests() {
+      return {
+        prs: [
+          makePr({
+            key: 'acme/web#301',
+            id: 301,
+            title: 'MEZ-301 Auth middleware update',
+            sourceCommitHash: commitSha
+          })
+        ],
+        user: { ...SAMPLE_USER, cachedAt: now },
+        workspaces: SAMPLE_WORKSPACES,
+        nearLimit: false,
+        partialErrors: []
+      };
+    },
+    async fetchDiffstat(_creds, pr) {
+      diffstatCalls += 1;
+      return {
+        commitHash: pr.sourceCommitHash || '',
+        filesChanged: 3,
+        linesAdded: 80,
+        linesRemoved: 12,
+        files: [{ path: 'src/auth.js', added: 80, removed: 12, status: 'modified' }],
+        cachedAt: now
+      };
+    }
+  };
+
+  const decisionClient = {
+    async decide() {
+      return {};
+    },
+    async verifyConnection(config) {
+      if (config.apiKey === 'bad-key') {
+        throw new Error('Decision model rejected credentials (401).');
+      }
+      return {
+        ok: true,
+        provider: config.provider,
+        model: config.model || 'gemini-decision-1',
+        answer: { type: 'noul', noul: 0.99, confidence: 0.99 }
+      };
+    },
+    async evaluateEffortAndRisk(config, pr, diffstat) {
+      aiEvalCalls += 1;
+      if (failAi) {
+        throw new Error('Decision endpoint 503');
+      }
+      assert.equal(diffstat?.filesChanged, 3);
+      return {
+        commitHash: pr.sourceCommitHash || '',
+        questionSetVersion: 'effort-risk-v1',
+        provider: config.provider,
+        model: config.model,
+        effort: 'medium',
+        effortConfidence: 0.89,
+        alert: 'high_risk',
+        alertConfidence: 0.85,
+        changeKind: 'feature',
+        riskScore: 4.2,
+        hasClearContext: true,
+        cachedAt: now
+      };
+    }
+  };
+
+  const worker = createWorkerService({
+    storage,
+    client: bbClient,
+    decisionClient,
+    chromeApi: mock.chromeApi,
+    nowFn: () => now
+  });
+
+  // 1. TEST_DECISION_MODEL failure & success
+  const badTest = await worker.handleMessage({
+    action: 'TEST_DECISION_MODEL',
+    config: { provider: 'gemini', model: 'gemini-decision-1', apiKey: 'bad-key' }
+  });
+  assert.equal(badTest.ok, false);
+  assert.match(String(badTest.error), /401/);
+
+  const goodTest = await worker.handleMessage({
+    action: 'TEST_DECISION_MODEL',
+    config: {
+      provider: 'gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta/decisions',
+      model: 'gemini-decision-1',
+      apiKey: 'AIzaSecretDecisionKey'
+    }
+  });
+  assert.equal(goodTest.ok, true);
+  assert.equal(goodTest.provider, 'gemini');
+
+  // 2. SAVE_DECISION_CONFIG persists key, verifies connection, and immediately syncs & scores PRs
+  const saveRes = await worker.handleMessage({
+    action: 'SAVE_DECISION_CONFIG',
+    config: {
+      provider: 'gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta/decisions',
+      model: 'gemini-decision-1',
+      apiKey: 'AIzaSecretDecisionKey'
+    }
+  });
+  assert.equal(saveRes.ok, true);
+  assert.equal(diffstatCalls, 1);
+  assert.equal(aiEvalCalls, 1);
+  assert.equal(saveRes.snapshot.prList[0].aiTriage?.effort, 'medium');
+  assert.equal(saveRes.snapshot.prList[0].aiTriage?.alert, 'high_risk');
+  assert.equal(saveRes.snapshot.prList[0].diffstat?.filesChanged, 3);
+
+  // 3. Second sync for SAME commitHash makes 0 diffstat calls and 0 AI calls!
+  now += 60_000;
+  const sync2 = await worker.syncNow({ forceManual: false });
+  assert.equal(sync2.ok, true);
+  assert.equal(diffstatCalls, 1);
+  assert.equal(aiEvalCalls, 1);
+  assert.equal(sync2.snapshot?.prList[0].aiTriage?.effort, 'medium');
+
+  // 4. GET_STATE exposes decision status WITHOUT ever leaking raw apiKey
+  const state = await worker.handleMessage({ action: 'GET_STATE' });
+  assert.deepEqual(state.decision, {
+    provider: 'gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/decisions',
+    model: 'gemini-decision-1',
+    isConfigured: true
+  });
+  assert.equal('apiKey' in state.decision, false);
+  assert.equal(JSON.stringify(state).includes('AIzaSecretDecisionKey'), false);
+
+  // 5. New commitHash triggers new AI evaluation; AI failure never fails PR sync!
+  now += 60_000;
+  commitSha = 'commit-sha-2';
+  failAi = true;
+  const syncWithAiError = await worker.syncNow({ forceManual: false });
+  assert.equal(syncWithAiError.ok, true);
+  assert.equal(diffstatCalls, 2);
+  assert.equal(aiEvalCalls, 2);
+  assert.equal(syncWithAiError.snapshot?.prList.length, 1);
+  assert.equal(syncWithAiError.snapshot?.prList[0].aiTriage ?? null, null);
+
+  // 6. CLEAR_DECISION_CONFIG wipes config, cached decisions, and strips aiTriage from snapshot
+  const clearRes = await worker.handleMessage({ action: 'CLEAR_DECISION_CONFIG' });
+  assert.equal(clearRes.ok, true);
+  assert.equal(clearRes.decision.provider, 'off');
+  assert.equal(clearRes.decision.isConfigured, false);
+  assert.equal(clearRes.snapshot.prList[0].aiTriage, undefined);
+  assert.deepEqual(await storage.getCachedDecisions(), {});
+});
+
+

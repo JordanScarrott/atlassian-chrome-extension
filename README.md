@@ -8,6 +8,7 @@ A zero-build, Manifest V3 Chrome Extension (**v2.0.0**) that turns your browser 
 
 - **"Your Turn" Attention Set (Authored & Reviewing):** Tracks both pull requests awaiting your review and PRs you authored across **Bitbucket Cloud** and **GitHub** (github.com or GitHub Enterprise Server). Automatically surfaces what requires your action (`Needs Action` vs `Reviewing`, `My PRs`, `All`, and `Snoozed`), surfaces unresolved tasks and change-request counts, ranks items by priority, and flags stale PRs (`24h` / `48h` / `72h`).
 - **Modular GitHub Connection (`BB` / `GH`):** Connect Bitbucket Cloud, GitHub, or both simultaneously in **Settings (⚙) → Account & Setup**. When both providers are active (or when viewing GitHub PRs), cards display subtle `BB` / `GH` badges and the header status chip reflects your combined connections (`Bitbucket + GitHub`, `GitHub (@user)`, or Bitbucket display name).
+- **System One AI Triage (`⚡ ~2m`, `⏱ ~15m`, `🧠 Deep`, `🔥 Hotfix`, `⚠ High Risk`):** Optional, strictly confidence-gated (`>= 75%`) PR effort and production-risk scoring powered by **Jev / Clef Flash** (self-hosted or TypeSafe `/v1/systemone`) or **Gemini Decision 1** (`gemini-decision-1`). Evaluates PR metadata + diffstats per commit hash (zero repeat AI calls for unchanged PRs, never sends raw code diffs), surfaces at most 1 effort badge + 1 alert badge per card, unlocks the **⚡ Quick Wins** filter toggle when `<5m` PRs are available, and supports `effort:quick`, `effort:medium`, `effort:deep`, `risk:high`, and `alert:hotfix` search tokens.
 - **By-Ticket Grouping (`g`) & Horizontal Ticket Decks:** Toggle **By Ticket** (`g`) to group open PRs by primary Jira key (e.g. `MEZ-123`) or `#123` issue reference. Multi-PR tickets render as a **Ticket Deck** (horizontal swipeable carousel sorted by urgency so slide 1 is always most urgent), complete with color-coded status dots (`1 / 3`), an off-screen `+N needs action →` indicator, `‹` / `›` or `h` / `l` navigation, and a `⊞` vertical-stack toggle.
 - **Inline Related PRs (`🔗 +N`):** In flat list view, PR cards sharing a Jira key or `#123` issue ref across Bitbucket and GitHub show a clickable **`🔗 +N <TICKET>`** pill. Clicking it scopes the list to all related open PRs across providers (`Related PRs for PROJ-123 (3)` + **Show all** / `Esc`).
 - **Live CI / Build Status & Presubmit Escalation:** Displays commit build status pills (`✓ CI`, `✕ CI`, `⟳ CI`, `■ CI`) directly on PR cards with deep links to CI runs, escalates authored PRs with failing builds to **CI Failed** (`Needs Action`), and supports search tokens (`ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`).
@@ -54,13 +55,41 @@ One-click Jira ticket deep links (`<base-url>/browse/<KEY>`), Confluence launch 
 
 ---
 
+## System One AI Triage (Jev / Clef Flash & Gemini Decision 1)
+
+System One AI Triage evaluates open PRs in a single pass per `sourceCommitHash` (title, branches, description, and file/line diffstats—never raw code diffs) and gates badges at `CONFIDENCE_THRESHOLD` (`0.75`).
+
+1. **In-App Setup (Recommended):**
+   Open **Settings (⚙) → Account & Setup → System One AI Triage**:
+   - **Jev / Clef Flash (`jev`):** Select `Jev / Clef Flash (Self-Hosted or TypeSafe)`, enter your `https://` endpoint (or `http://` for `localhost` / private RFC1918 LAN / `.local` GPU servers; `/v1/systemone` is appended automatically if omitted), keep model `clef-flash` (or custom), and optionally enter a Bearer API key (leave empty for keyless internal servers). Custom endpoints prompt cleanly for Chrome optional host permission on test/save.
+   - **Gemini Decision 1 (`gemini`):** Select `Gemini Decision 1 (Google AI Studio)`, keep the default endpoint (`https://generativelanguage.googleapis.com/v1beta/decisions`) and model (`gemini-decision-1`), and paste your Google AI Studio API key.
+   - Click **Test Model** to run a lightweight `noul` verification check, then **Save & Score** to evaluate open PRs immediately. Use **Disable** anytime to turn off AI triage and wipe cached scores.
+2. **Central Defaults (`DECISION_MODELS` in `src/config.js`):**
+   Teams can preconfigure default endpoints/providers in [`bitbucket-pr-extension/src/config.js`](./bitbucket-pr-extension/src/config.js) (never hardcode API keys in source):
+   ```js
+   export const DECISION_MODELS = Object.freeze({
+     DEFAULT_PROVIDER: 'off', // 'off' | 'jev' | 'gemini'
+     JEV_API_BASE_URL: '',    // e.g. 'https://clef.internal.example.com' or 'http://10.0.1.42:8080'
+     JEV_DEFAULT_MODEL: 'clef-flash',
+     GEMINI_DECISIONS_URL: 'https://generativelanguage.googleapis.com/v1beta/decisions',
+     GEMINI_DEFAULT_MODEL: 'gemini-decision-1',
+     CONFIDENCE_THRESHOLD: 0.75,
+     ...
+   });
+   ```
+3. **Search Tokens & Quick Wins:**
+   - Click **⚡ Quick Wins** in the PR toolbar (appears automatically when `>= 1` open PR is scored `⚡ ~2m`) to toggle `effort:quick`.
+   - Combine AI tokens in the search bar (`/`): `effort:quick`, `effort:medium`, `effort:deep`, `risk:high`, `alert:hotfix`.
+
+---
+
 ## Keyboard Shortcuts
 
 Press `?` anywhere in the popup (outside text inputs) to toggle the in-app shortcuts cheat sheet.
 
 | Key | Action |
 | :--- | :--- |
-| `/` | Focus PR search bar (supports `ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`, build names, Jira keys) |
+| `/` | Focus PR search bar (supports `ci:failed`, `ci:passing`, `ci:running`, `ci:stopped`, `effort:quick`, `effort:medium`, `effort:deep`, `risk:high`, `alert:hotfix`, build names, Jira keys) |
 | `g` | Toggle **By Ticket** grouping (with horizontal Ticket Decks) |
 | `j` / `k` (or `↓` / `↑`) | Select next / previous PR card |
 | `h` / `l` (or `←` / `→`) | Swipe previous / next PR inside a selected Ticket Deck |

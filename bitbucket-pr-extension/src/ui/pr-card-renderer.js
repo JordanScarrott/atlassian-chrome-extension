@@ -3,6 +3,7 @@ import {
   buildReviewerBreakdown,
   formatRelativeAge,
   formatRemainingSnooze,
+  getAiTriageBadges,
   getCiBadgeDescriptor,
   getDeckDotDescriptor,
   getOffscreenDeckAttention,
@@ -13,6 +14,7 @@ import { isPrSnoozed } from '../pr-triage.js';
 
 export { ACTION_BADGE_LABELS };
 
+/** @typedef {import('../popup-helpers.js').AiTriageBadgeDescriptor} AiTriageBadgeDescriptor */
 /** @typedef {import('../pr-triage.js').EnrichedPullRequest} EnrichedPullRequest */
 /** @typedef {import('../pr-triage.js').PrFilter} PrFilter */
 /** @typedef {import('../pr-triage.js').RelatedPrSummary} RelatedPrSummary */
@@ -84,6 +86,20 @@ export function buildCiBadgeElement(buildStatus, onOpenUrl) {
     });
   }
 
+  return el;
+}
+
+/**
+ * Build a subtle AI triage badge (`.ai-badge`) element from a descriptor.
+ *
+ * @param {AiTriageBadgeDescriptor} descriptor
+ * @returns {HTMLSpanElement}
+ */
+export function buildAiBadgeElement(descriptor) {
+  const el = document.createElement('span');
+  el.className = `ai-badge ${descriptor.cssClass}`;
+  el.textContent = descriptor.label;
+  el.title = descriptor.tooltip;
   return el;
 }
 
@@ -297,6 +313,14 @@ export function buildPrCardElement(pr, isSelected, isSnoozed, now, options = {},
     if (ciBadgeEl) {
       badgesRow.appendChild(ciBadgeEl);
     }
+  }
+
+  const { effortBadge, alertBadge } = getAiTriageBadges(pr.aiTriage, pr.diffstat);
+  if (effortBadge) {
+    badgesRow.appendChild(buildAiBadgeElement(effortBadge));
+  }
+  if (alertBadge) {
+    badgesRow.appendChild(buildAiBadgeElement(alertBadge));
   }
 
   const badgeMeta = ACTION_BADGE_LABELS[pr.actionState] ?? {

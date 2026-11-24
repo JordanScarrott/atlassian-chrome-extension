@@ -608,6 +608,121 @@ export function normalizeGitHubPullRequest({
 }
 
 /**
+ * Fetch lightweight per-file diffstat metadata for a GitHub PR (`GET .../pulls/{number}/files?per_page=50`),
+ * explicitly dropping raw `patch` hunks. Gracefully returns `null` on any error so PR sync never fails.
+ *
+ * @param {{
+ *   fetchFn?: typeof fetch,
+ *   headers?: Record<string, string>,
+ *   apiBaseUrl?: string,
+ *   pr: Pick<import('./storage.js').PullRequestRecord, 'id' | 'repoFullName' | 'workspace' | 'repoName' | 'sourceCommitHash'>,
+ *   nowFn?: () => number
+ * }} params
+ * @returns {Promise<import('./storage.js').DiffstatSummary | null>}
+ */
+export async function fetchGitHubDiffstat({
+  fetchFn = fetch,
+  headers,
+  apiBaseUrl,
+  pr,
+  nowFn = Date.now
+}) {
+  if (!pr || typeof pr.id !== 'number') {
+    return null;
+  }
+
+  let owner = '';
+  let repo = '';
+  const fullName = typeof pr.repoFullName === 'string' ? pr.repoFullName.trim() : '';
+  const slashIdx = fullName.indexOf('/');
+  if (slashIdx > 0) {
+    owner = fullName.slice(0, slashIdx).trim();
+    repo = fullName.slice(slashIdx + 1).trim();
+  } else if (pr.workspace && pr.repoName) {
+    owner = pr.workspace.trim();
+    repo = pr.repoName.trim();
+  }
+  if (!owner || !repo) {
+    return null;
+  }
+
+  let resolvedBase;
+  try {
+    resolvedBase = resolveGitHubApiBaseOrThrow(apiBaseUrl);
+  } catch {
+    return null;
+  }
+
+  const url = `${resolvedBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${pr.id}/files?per_page=50`;
+  try {
+    const response = await fetchWithTimeout(
+      fetchFn,
+      url,
+      {
+        method: 'GET',
+        headers: {
+          Accept: GITHUB_ACCEPT_HEADER,
+          'X-GitHub-Api-Version': GITHUB_API_VERSION,
+          ...(headers && typeof headers === 'object' ? headers : {})
+        }
+      },
+      THROTTLE_CONFIG.requestTimeoutMs
+    );
+    if (!response.ok) {
+      return null;
+    }
+
+    const data = await response.json();
+    if (!Array.isArray(data)) {
+      return null;
+    }
+
+    let linesAdded = 0;
+    let linesRemoved = 0;
+    /** @type {import('./storage.js').DiffstatFile[]} */
+    const files = [];
+
+    for (const entry of data) {
+      if (!entry || typeof entry !== 'object') {
+        continue;
+      }
+      const filename = typeof entry.filename === 'string' ? entry.filename : '';
+      if (!filename) {
+        continue;
+      }
+      const added = typeof entry.additions === 'number' && Number.isFinite(entry.additions)
+        ? entry.additions
+        : 0;
+      const removed = typeof entry.deletions === 'number' && Number.isFinite(entry.deletions)
+        ? entry.deletions
+        : 0;
+      const status = typeof entry.status === 'string' && entry.status ? entry.status : 'modified';
+
+      linesAdded += added;
+      linesRemoved += removed;
+      // Deliberately omit `entry.patch` so raw code diffs never enter prompts or cache
+      files.push({
+        path: filename,
+        added,
+        removed,
+        status
+      });
+    }
+
+    return {
+      commitHash: typeof pr.sourceCommitHash === 'string' ? pr.sourceCommitHash.trim() : '',
+      filesChanged: files.length,
+      linesAdded,
+      linesRemoved,
+      files,
+      cachedAt: nowFn()
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Create a GitHub REST API v3 client with injectable `fetchFn` and `nowFn`.
  * Works with github.com and GitHub Enterprise Server (`apiBaseUrl`).
  *
@@ -1074,8 +1189,34 @@ export function createGitHubClient({
     };
   }
 
+  /**
+   * Fetch diffstat metadata for a single GitHub PR using the client's `fetchFn` and `nowFn`.
+   *
+   * @param {Partial<import('./storage.js').GitHubCredentials>} creds
+   * @param {Pick<import('./storage.js').PullRequestRecord, 'id' | 'repoFullName' | 'workspace' | 'repoName' | 'sourceCommitHash'>} pr
+   * @returns {Promise<import('./storage.js').DiffstatSummary | null>}
+   */
+  async function fetchDiffstat(creds, pr) {
+    const token = typeof creds?.token === 'string' ? creds.token.trim() : '';
+    if (!token) {
+      return null;
+    }
+    return fetchGitHubDiffstat({
+      fetchFn,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: GITHUB_ACCEPT_HEADER,
+        'X-GitHub-Api-Version': GITHUB_API_VERSION
+      },
+      apiBaseUrl: creds?.apiBaseUrl,
+      pr,
+      nowFn
+    });
+  }
+
   return {
     verifyCredentials,
-    fetchPullRequests
+    fetchPullRequests,
+    fetchDiffstat
   };
 }

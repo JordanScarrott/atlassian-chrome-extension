@@ -669,3 +669,84 @@ test('buildRelatedPrMap links PRs across Bitbucket + GitHub and groupPrsByTicket
   assert.equal(groups[2].yourTurnCount, 1);
 });
 
+test('filterAndSortPrs supports effort:quick, effort:medium, effort:deep, risk:high, and alert:hotfix search tokens', () => {
+  const makeTriage = (overrides) => ({
+    commitHash: 'abc',
+    questionSetVersion: 'effort-risk-v1',
+    provider: 'jev',
+    model: 'clef-flash',
+    effort: null,
+    effortConfidence: 0.9,
+    alert: null,
+    alertConfidence: 0.9,
+    changeKind: 'feature',
+    riskScore: 2.0,
+    hasClearContext: true,
+    cachedAt: NOW,
+    ...overrides
+  });
+
+  const quickPr = enrichPullRequest(
+    makePr({
+      key: 'acme/repo#101',
+      title: 'Fix typo in docs',
+      aiTriage: makeTriage({ effort: 'quick', riskScore: 1.2 })
+    }),
+    ME,
+    { now: NOW }
+  );
+  const mediumPr = enrichPullRequest(
+    makePr({
+      key: 'acme/repo#102',
+      title: 'Add metrics gauge',
+      aiTriage: makeTriage({ effort: 'medium', alert: 'hotfix', riskScore: 3.1 })
+    }),
+    ME,
+    { now: NOW }
+  );
+  const deepRiskPr = enrichPullRequest(
+    makePr({
+      key: 'acme/repo#103',
+      title: 'Migrate auth tokens',
+      aiTriage: makeTriage({ effort: 'deep', alert: 'high_risk', riskScore: 4.5 })
+    }),
+    ME,
+    { now: NOW }
+  );
+  const untriagedPr = enrichPullRequest(
+    makePr({
+      key: 'acme/repo#104',
+      title: 'Untriaged PR'
+    }),
+    ME,
+    { now: NOW }
+  );
+
+  const all = [quickPr, mediumPr, deepRiskPr, untriagedPr];
+  assert.deepEqual(
+    filterAndSortPrs(all, { filter: 'all', query: 'effort:quick', now: NOW }).map((p) => p.key),
+    ['acme/repo#101']
+  );
+  assert.deepEqual(
+    filterAndSortPrs(all, { filter: 'all', query: 'effort:medium', now: NOW }).map((p) => p.key),
+    ['acme/repo#102']
+  );
+  assert.deepEqual(
+    filterAndSortPrs(all, { filter: 'all', query: 'effort:deep', now: NOW }).map((p) => p.key),
+    ['acme/repo#103']
+  );
+  assert.deepEqual(
+    filterAndSortPrs(all, { filter: 'all', query: 'risk:high', now: NOW }).map((p) => p.key),
+    ['acme/repo#103']
+  );
+  assert.deepEqual(
+    filterAndSortPrs(all, { filter: 'all', query: 'alert:hotfix', now: NOW }).map((p) => p.key),
+    ['acme/repo#102']
+  );
+  assert.deepEqual(
+    filterAndSortPrs(all, { filter: 'all', query: 'effort:deep risk:high migrate', now: NOW }).map((p) => p.key),
+    ['acme/repo#103']
+  );
+});
+
+

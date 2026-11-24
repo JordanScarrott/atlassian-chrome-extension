@@ -665,3 +665,73 @@ test('fetchPullRequests caches terminal build statuses for 6h, refreshes INPROGR
   assert.equal(run5.nearLimit, true);
   assert.equal(run5.prs.find((p) => p.id === 2)?.buildStatus?.state, 'INPROGRESS');
 });
+
+test('fetchBitbucketDiffstat extracts file/line summary without patches and normalizePullRequest truncates description to 800 chars', async () => {
+  const { fetchBitbucketDiffstat } = await import('../bitbucket-pr-extension/src/bitbucket-client.js');
+
+  const normalized = normalizePullRequest({
+    id: 77,
+    title: 'Long description PR',
+    description: 'D'.repeat(1000),
+    source: {
+      branch: { name: 'feat/x' },
+      commit: { hash: 'sha77' },
+      repository: { full_name: 'acme/api', name: 'api' }
+    },
+    destination: { branch: { name: 'main' } }
+  });
+  assert.equal(normalized?.description?.length, 800);
+
+  let calledUrl = '';
+  const summary = await fetchBitbucketDiffstat({
+    authHeader: 'Bearer tok',
+    pr: {
+      id: 77,
+      repoFullName: 'acme/api',
+      workspace: 'acme',
+      repoName: 'api',
+      sourceCommitHash: 'sha77'
+    },
+    nowFn: () => 555_000,
+    fetchFn: async (url) => {
+      calledUrl = String(url);
+      return jsonResponse({
+        size: 2,
+        values: [
+          { status: 'modified', lines_added: 12, lines_removed: 3, new: { path: 'src/app.js' } },
+          { status: 'removed', lines_added: 0, lines_removed: 20, old: { path: 'src/old.js' } }
+        ]
+      });
+    }
+  });
+
+  assert.equal(
+    calledUrl,
+    'https://api.bitbucket.org/2.0/repositories/acme/api/pullrequests/77/diffstat?pagelen=50'
+  );
+  assert.deepEqual(summary, {
+    commitHash: 'sha77',
+    filesChanged: 2,
+    linesAdded: 12,
+    linesRemoved: 23,
+    files: [
+      { path: 'src/app.js', added: 12, removed: 3, status: 'modified' },
+      { path: 'src/old.js', added: 0, removed: 20, status: 'removed' }
+    ],
+    cachedAt: 555_000
+  });
+
+  const errSummary = await fetchBitbucketDiffstat({
+    authHeader: 'Bearer tok',
+    pr: {
+      id: 77,
+      repoFullName: 'acme/api',
+      workspace: 'acme',
+      repoName: 'api',
+      sourceCommitHash: 'sha77'
+    },
+    fetchFn: async () => new Response('Forbidden', { status: 403 })
+  });
+  assert.equal(errSummary, null);
+});
+

@@ -1,4 +1,9 @@
-import { getEffectiveGitHubApiBaseUrl, sanitizeHttpsUrl } from '../config.js';
+import {
+  DECISION_MODELS,
+  getEffectiveGitHubApiBaseUrl,
+  sanitizeDecisionEndpointUrl,
+  sanitizeHttpsUrl
+} from '../config.js';
 import { normalizeAuthType } from '../storage.js';
 
 /**
@@ -50,7 +55,22 @@ export function resolveAccountSectionElements() {
     githubTokenInput: getEl('github-token', HTMLInputElement),
     toggleGitHubTokenVisibilityBtn: getEl('toggle-github-token-visibility', HTMLButtonElement),
     githubApiUrlInput: getEl('github-api-url', HTMLInputElement),
-    githubAuthStatusBanner: getEl('github-auth-status-banner', HTMLDivElement)
+    githubAuthStatusBanner: getEl('github-auth-status-banner', HTMLDivElement),
+    decisionSummaryCard: getEl('decision-summary-card', HTMLDivElement),
+    decisionProviderLabel: getEl('decision-provider-label', HTMLDivElement),
+    decisionModelDisplay: getEl('decision-model-display', HTMLDivElement),
+    decisionEndpointDisplay: getEl('decision-endpoint-display', HTMLSpanElement),
+    decisionSignOutConfirmRow: getEl('decision-signout-confirm-row', HTMLDivElement),
+    decisionConfigForm: getEl('decision-config-form', HTMLFormElement),
+    decisionProviderSelect: getEl('decision-provider-select', HTMLSelectElement),
+    decisionFieldsGroup: getEl('decision-fields-group', HTMLDivElement),
+    decisionBaseUrlInput: getEl('decision-base-url-input', HTMLInputElement),
+    decisionBaseUrlHelp: getEl('decision-base-url-help', HTMLParagraphElement),
+    decisionModelInput: getEl('decision-model-input', HTMLInputElement),
+    decisionApiKeyInput: getEl('decision-api-key-input', HTMLInputElement),
+    decisionToggleKeyBtn: getEl('decision-toggle-key-btn', HTMLButtonElement),
+    decisionApiKeyHelp: getEl('decision-api-key-help', HTMLParagraphElement),
+    decisionStatusBanner: getEl('decision-status-banner', HTMLDivElement)
   };
 }
 
@@ -103,6 +123,13 @@ export function resolvePreferencesFormElements() {
  *   testGitHubConnectionBtn: HTMLButtonElement,
  *   saveGitHubSettingsBtn: HTMLButtonElement,
  *   cancelGitHubSettingsBtn: HTMLButtonElement,
+ *   decisionReplaceBtn: HTMLButtonElement,
+ *   decisionSignOutBtn: HTMLButtonElement,
+ *   decisionConfirmSignOutBtn: HTMLButtonElement,
+ *   decisionCancelSignOutBtn: HTMLButtonElement,
+ *   decisionTestBtn: HTMLButtonElement,
+ *   decisionSaveBtn: HTMLButtonElement,
+ *   decisionCancelBtn: HTMLButtonElement,
  *   preferencesForm: HTMLFormElement,
  *   savePreferencesBtn: HTMLButtonElement,
  *   cancelPreferencesBtn: HTMLButtonElement
@@ -134,6 +161,13 @@ export function resolveSettingsDrawerControls() {
     testGitHubConnectionBtn: getEl('test-github-connection-btn', HTMLButtonElement),
     saveGitHubSettingsBtn: getEl('save-github-settings-btn', HTMLButtonElement),
     cancelGitHubSettingsBtn: getEl('cancel-github-settings-btn', HTMLButtonElement),
+    decisionReplaceBtn: getEl('decision-replace-btn', HTMLButtonElement),
+    decisionSignOutBtn: getEl('decision-signout-btn', HTMLButtonElement),
+    decisionConfirmSignOutBtn: getEl('decision-confirm-signout-btn', HTMLButtonElement),
+    decisionCancelSignOutBtn: getEl('decision-cancel-signout-btn', HTMLButtonElement),
+    decisionTestBtn: getEl('decision-test-btn', HTMLButtonElement),
+    decisionSaveBtn: getEl('decision-save-btn', HTMLButtonElement),
+    decisionCancelBtn: getEl('decision-cancel-btn', HTMLButtonElement),
     preferencesForm: getEl('preferences-form', HTMLFormElement),
     savePreferencesBtn: getEl('save-preferences-btn', HTMLButtonElement),
     cancelPreferencesBtn: getEl('cancel-preferences-btn', HTMLButtonElement)
@@ -143,7 +177,16 @@ export function resolveSettingsDrawerControls() {
 /** @typedef {import('../config.js').Preferences} Preferences */
 /** @typedef {import('../storage.js').AuthType} AuthType */
 /** @typedef {import('../storage.js').CachedUser} CachedUser */
+/** @typedef {import('../storage.js').DecisionProvider} DecisionProvider */
 /** @typedef {import('../storage.js').WorkspaceSummary} WorkspaceSummary */
+
+/**
+ * @typedef {Object} DecisionBootstrapState
+ * @property {DecisionProvider} provider
+ * @property {string} baseUrl
+ * @property {string} model
+ * @property {boolean} isConfigured
+ */
 
 /**
  * @typedef {Object} AccountSectionElements
@@ -174,6 +217,21 @@ export function resolveSettingsDrawerControls() {
  * @property {HTMLButtonElement} toggleGitHubTokenVisibilityBtn
  * @property {HTMLInputElement} githubApiUrlInput
  * @property {HTMLDivElement} githubAuthStatusBanner
+ * @property {HTMLDivElement} decisionSummaryCard
+ * @property {HTMLDivElement} decisionProviderLabel
+ * @property {HTMLDivElement} decisionModelDisplay
+ * @property {HTMLSpanElement} decisionEndpointDisplay
+ * @property {HTMLDivElement} decisionSignOutConfirmRow
+ * @property {HTMLFormElement} decisionConfigForm
+ * @property {HTMLSelectElement} decisionProviderSelect
+ * @property {HTMLDivElement} decisionFieldsGroup
+ * @property {HTMLInputElement} decisionBaseUrlInput
+ * @property {HTMLParagraphElement} decisionBaseUrlHelp
+ * @property {HTMLInputElement} decisionModelInput
+ * @property {HTMLInputElement} decisionApiKeyInput
+ * @property {HTMLButtonElement} decisionToggleKeyBtn
+ * @property {HTMLParagraphElement} decisionApiKeyHelp
+ * @property {HTMLDivElement} decisionStatusBanner
  */
 
 /**
@@ -189,6 +247,8 @@ export function resolveSettingsDrawerControls() {
  * @property {boolean} isReplacingGitHubToken
  * @property {string} githubApiBaseUrl
  * @property {CachedUser | null} githubUser
+ * @property {DecisionBootstrapState} [decision]
+ * @property {boolean} [isConfiguringDecision]
  */
 
 /**
@@ -308,12 +368,104 @@ export function syncAuthMethodFields(elements) {
 }
 
 /**
- * Populate Settings -> Account & Setup UI (Bitbucket Cloud + GitHub) without ever injecting stored token plaintext.
+ * Format human-readable provider label for System One AI Triage.
+ *
+ * @param {DecisionProvider | string} provider
+ * @returns {string}
+ */
+export function getDecisionProviderLabel(provider) {
+  if (provider === 'gemini') {
+    return 'Gemini Decision 1';
+  }
+  if (provider === 'jev') {
+    return 'Jev / Clef Flash';
+  }
+  return 'Disabled';
+}
+
+/**
+ * Extract displayable `host[:port]` from an endpoint URL for the connected summary card.
+ *
+ * @param {string} rawUrl
+ * @returns {string}
+ */
+function formatEndpointHost(rawUrl) {
+  const safe = sanitizeDecisionEndpointUrl(rawUrl);
+  if (!safe) {
+    return 'Endpoint configured';
+  }
+  try {
+    return new URL(safe).host;
+  } catch {
+    return safe;
+  }
+}
+
+/**
+ * Synchronize System One Decision Model form placeholders, defaults, and hints
+ * when switching between `off`, `jev`, and `gemini`.
+ *
+ * @param {{
+ *   decisionProviderSelect: HTMLSelectElement,
+ *   decisionFieldsGroup: HTMLDivElement,
+ *   decisionBaseUrlInput: HTMLInputElement,
+ *   decisionBaseUrlHelp: HTMLParagraphElement,
+ *   decisionModelInput: HTMLInputElement,
+ *   decisionApiKeyInput: HTMLInputElement,
+ *   decisionApiKeyHelp: HTMLParagraphElement,
+ *   decisionTestBtn?: HTMLButtonElement
+ * }} elements
+ * @param {{ applyProviderDefaults?: boolean }} [options]
+ */
+export function syncDecisionProviderFields(elements, options = {}) {
+  const applyProviderDefaults = Boolean(options.applyProviderDefaults);
+  const selected = elements.decisionProviderSelect.value;
+
+  if (selected === 'off') {
+    elements.decisionFieldsGroup.classList.add('hidden');
+    if (elements.decisionTestBtn) {
+      elements.decisionTestBtn.disabled = true;
+    }
+    return;
+  }
+
+  elements.decisionFieldsGroup.classList.remove('hidden');
+  if (elements.decisionTestBtn) {
+    elements.decisionTestBtn.disabled = false;
+  }
+
+  if (selected === 'gemini') {
+    elements.decisionBaseUrlInput.placeholder = DECISION_MODELS.GEMINI_DECISIONS_URL;
+    elements.decisionBaseUrlHelp.textContent = 'Default Google Gemini Decisions API endpoint (https:// required).';
+    elements.decisionModelInput.placeholder = DECISION_MODELS.GEMINI_DEFAULT_MODEL;
+    elements.decisionApiKeyInput.placeholder = 'AIza... (required for Gemini)';
+    elements.decisionApiKeyHelp.textContent = 'Required for Gemini Decision 1. Sent via x-goog-api-key header and never re-displayed.';
+    if (applyProviderDefaults) {
+      elements.decisionBaseUrlInput.value = DECISION_MODELS.GEMINI_DECISIONS_URL;
+      elements.decisionModelInput.value = DECISION_MODELS.GEMINI_DEFAULT_MODEL;
+    }
+  } else {
+    elements.decisionBaseUrlInput.placeholder = 'https://clef.internal.example.com';
+    elements.decisionBaseUrlHelp.textContent = 'HTTPS or internal LAN/localhost URL (/v1/systemone appended if omitted).';
+    elements.decisionModelInput.placeholder = DECISION_MODELS.JEV_DEFAULT_MODEL;
+    elements.decisionApiKeyInput.placeholder = 'Optional for internal GPU; paste Bearer token if required';
+    elements.decisionApiKeyHelp.textContent = 'Optional for keyless internal Clef Flash GPU servers; stored locally and never re-displayed.';
+    if (applyProviderDefaults) {
+      elements.decisionBaseUrlInput.value = DECISION_MODELS.JEV_API_BASE_URL;
+      elements.decisionModelInput.value = DECISION_MODELS.JEV_DEFAULT_MODEL;
+    }
+  }
+}
+
+/**
+ * Populate Settings -> Account & Setup UI (Bitbucket Cloud + GitHub + System One AI Triage)
+ * without ever injecting stored token or API key plaintext.
  *
  * @param {AccountSectionElements} elements
  * @param {AccountSectionViewState} viewState
+ * @param {{ decisionTestBtn?: HTMLButtonElement }} [controls]
  */
-export function renderAccountSection(elements, viewState) {
+export function renderAccountSection(elements, viewState, controls = {}) {
   const {
     accountSummaryCard,
     accountAvatar,
@@ -341,7 +493,22 @@ export function renderAccountSection(elements, viewState) {
     githubTokenInput,
     toggleGitHubTokenVisibilityBtn,
     githubApiUrlInput,
-    githubAuthStatusBanner
+    githubAuthStatusBanner,
+    decisionSummaryCard,
+    decisionProviderLabel,
+    decisionModelDisplay,
+    decisionEndpointDisplay,
+    decisionSignOutConfirmRow,
+    decisionConfigForm,
+    decisionProviderSelect,
+    decisionFieldsGroup,
+    decisionBaseUrlInput,
+    decisionBaseUrlHelp,
+    decisionModelInput,
+    decisionApiKeyInput,
+    decisionToggleKeyBtn,
+    decisionApiKeyHelp,
+    decisionStatusBanner
   } = elements;
 
   const showBbSummary = viewState.bitbucketAuthenticated && !viewState.isReplacingToken;
@@ -407,6 +574,68 @@ export function renderAccountSection(elements, viewState) {
   toggleGitHubTokenVisibilityBtn.title = 'Show token';
   githubApiUrlInput.value = currentGhApi;
   hideInlineBanner(githubAuthStatusBanner);
+
+  // System One AI Triage section
+  const decision = viewState.decision ?? {
+    provider: DECISION_MODELS.DEFAULT_PROVIDER,
+    baseUrl: '',
+    model: '',
+    isConfigured: false
+  };
+  const showDecisionSummary = Boolean(decision.isConfigured) && !viewState.isConfiguringDecision;
+  decisionSummaryCard.classList.toggle('hidden', !showDecisionSummary);
+  decisionConfigForm.classList.toggle('hidden', showDecisionSummary);
+  decisionSignOutConfirmRow.classList.add('hidden');
+
+  if (showDecisionSummary) {
+    const defaultBase = decision.provider === 'gemini'
+      ? DECISION_MODELS.GEMINI_DECISIONS_URL
+      : DECISION_MODELS.JEV_API_BASE_URL;
+    const effectiveBase = decision.baseUrl || defaultBase;
+    const defaultModel = decision.provider === 'gemini'
+      ? DECISION_MODELS.GEMINI_DEFAULT_MODEL
+      : DECISION_MODELS.JEV_DEFAULT_MODEL;
+    decisionProviderLabel.textContent = getDecisionProviderLabel(decision.provider);
+    decisionModelDisplay.textContent = decision.model || defaultModel;
+    decisionEndpointDisplay.textContent = formatEndpointHost(effectiveBase);
+    decisionEndpointDisplay.title = effectiveBase;
+  }
+
+  const formProvider = decision.provider === 'jev' || decision.provider === 'gemini' || decision.provider === 'off'
+    ? decision.provider
+    : DECISION_MODELS.DEFAULT_PROVIDER;
+  decisionProviderSelect.value = formProvider;
+
+  if (formProvider === 'gemini') {
+    decisionBaseUrlInput.value = decision.baseUrl || DECISION_MODELS.GEMINI_DECISIONS_URL;
+    decisionModelInput.value = decision.model || DECISION_MODELS.GEMINI_DEFAULT_MODEL;
+  } else if (formProvider === 'jev') {
+    decisionBaseUrlInput.value = decision.baseUrl || DECISION_MODELS.JEV_API_BASE_URL;
+    decisionModelInput.value = decision.model || DECISION_MODELS.JEV_DEFAULT_MODEL;
+  } else {
+    decisionBaseUrlInput.value = decision.baseUrl || '';
+    decisionModelInput.value = decision.model || '';
+  }
+
+  // Security invariant: NEVER populate stored Decision API key into the DOM
+  decisionApiKeyInput.value = '';
+  decisionApiKeyInput.type = 'password';
+  decisionToggleKeyBtn.setAttribute('aria-label', 'Show API key');
+  decisionToggleKeyBtn.title = 'Show API key';
+  syncDecisionProviderFields(
+    {
+      decisionProviderSelect,
+      decisionFieldsGroup,
+      decisionBaseUrlInput,
+      decisionBaseUrlHelp,
+      decisionModelInput,
+      decisionApiKeyInput,
+      decisionApiKeyHelp,
+      decisionTestBtn: controls.decisionTestBtn
+    },
+    { applyProviderDefaults: false }
+  );
+  hideInlineBanner(decisionStatusBanner);
 }
 
 /**
@@ -519,6 +748,73 @@ export function readValidatedGitHubInputs(elements) {
   }
 
   return { token, apiBaseUrl };
+}
+
+/**
+ * Collect and validate System One AI Triage configuration inputs from `#decision-config-form`.
+ * Allows omitting the API key in Jev mode (for keyless internal GPUs) and preserves existing
+ * saved key for Gemini when reconfiguring without re-entering the key (`alreadyConfiguredSameProvider`).
+ *
+ * @param {{
+ *   decisionProviderSelect: HTMLSelectElement,
+ *   decisionBaseUrlInput: HTMLInputElement,
+ *   decisionModelInput: HTMLInputElement,
+ *   decisionApiKeyInput: HTMLInputElement,
+ *   decisionStatusBanner: HTMLDivElement
+ * }} elements
+ * @param {{ currentProvider?: DecisionProvider, isConfigured?: boolean, requireApiKeyForGemini?: boolean }} [options]
+ * @returns {{ provider: DecisionProvider, baseUrl: string, model: string, apiKey: string } | null}
+ */
+export function readValidatedDecisionInputs(elements, options = {}) {
+  const rawProvider = elements.decisionProviderSelect.value;
+  /** @type {DecisionProvider} */
+  const provider = rawProvider === 'jev' || rawProvider === 'gemini' ? rawProvider : 'off';
+  if (provider === 'off') {
+    return { provider: 'off', baseUrl: '', model: '', apiKey: '' };
+  }
+
+  const rawBaseUrl = elements.decisionBaseUrlInput.value.trim();
+  const defaultBaseUrl = provider === 'gemini'
+    ? DECISION_MODELS.GEMINI_DECISIONS_URL
+    : DECISION_MODELS.JEV_API_BASE_URL;
+  const candidateBaseUrl = rawBaseUrl || defaultBaseUrl;
+  const safeBaseUrl = sanitizeDecisionEndpointUrl(candidateBaseUrl);
+
+  if (!safeBaseUrl) {
+    showInlineBanner(
+      elements.decisionStatusBanner,
+      provider === 'gemini'
+        ? 'Gemini Decisions URL must be a valid https:// URL.'
+        : 'Enter a valid https:// Endpoint URL (or http:// for localhost / internal LAN hosts).',
+      'error'
+    );
+    elements.decisionBaseUrlInput.focus();
+    return null;
+  }
+
+  const defaultModel = provider === 'gemini'
+    ? DECISION_MODELS.GEMINI_DEFAULT_MODEL
+    : DECISION_MODELS.JEV_DEFAULT_MODEL;
+  const model = elements.decisionModelInput.value.trim() || defaultModel;
+  const apiKey = elements.decisionApiKeyInput.value.trim();
+
+  const canReuseStoredGeminiKey = Boolean(
+    options.isConfigured &&
+    options.currentProvider === 'gemini' &&
+    !options.requireApiKeyForGemini
+  );
+  if (provider === 'gemini' && !apiKey && !canReuseStoredGeminiKey) {
+    showInlineBanner(elements.decisionStatusBanner, 'Enter your Google AI Studio API key for Gemini Decision 1.', 'error');
+    elements.decisionApiKeyInput.focus();
+    return null;
+  }
+
+  return {
+    provider,
+    baseUrl: safeBaseUrl,
+    model,
+    apiKey
+  };
 }
 
 /**
