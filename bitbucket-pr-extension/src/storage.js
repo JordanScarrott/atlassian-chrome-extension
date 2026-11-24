@@ -1,7 +1,96 @@
-import { DEFAULT_PREFERENCES, STORAGE_KEYS, sanitizeHttpsUrl } from './config.js';
+import {
+  DECISION_MODELS,
+  DEFAULT_PREFERENCES,
+  STORAGE_KEYS,
+  THROTTLE_CONFIG,
+  getEffectiveGitHubApiBaseUrl,
+  sanitizeDecisionEndpointUrl,
+  sanitizeHttpsUrl
+} from './config.js';
 
 /**
  * @typedef {'api_token' | 'bearer'} AuthType
+ */
+
+/**
+ * @typedef {'bitbucket' | 'github'} PrProvider
+ */
+
+/**
+ * @typedef {'SUCCESSFUL' | 'FAILED' | 'INPROGRESS' | 'STOPPED'} BuildState
+ */
+
+/**
+ * @typedef {Object} BuildStatusSummary
+ * @property {BuildState} state
+ * @property {number} totalCount
+ * @property {number} passedCount
+ * @property {number} failedCount
+ * @property {number} inProgressCount
+ * @property {number} stoppedCount
+ * @property {string | null} url
+ * @property {string} name
+ * @property {string} updatedOn
+ * @property {string} commitHash
+ * @property {number} cachedAt
+ */
+
+/**
+ * @typedef {Record<string, BuildStatusSummary>} BuildStatusCacheMap
+ */
+
+/**
+ * @typedef {Object} DiffstatFile
+ * @property {string} path
+ * @property {number} added
+ * @property {number} removed
+ * @property {string} status
+ */
+
+/**
+ * @typedef {Object} DiffstatSummary
+ * @property {string} commitHash
+ * @property {number} filesChanged
+ * @property {number} linesAdded
+ * @property {number} linesRemoved
+ * @property {DiffstatFile[]} files
+ * @property {number} cachedAt
+ */
+
+/**
+ * @typedef {Record<string, DiffstatSummary>} DiffstatCacheMap
+ */
+
+/**
+ * @typedef {'off' | 'jev' | 'gemini'} DecisionProvider
+ */
+
+/**
+ * @typedef {Object} DecisionConfig
+ * @property {DecisionProvider} provider
+ * @property {string} baseUrl
+ * @property {string} model
+ * @property {string} apiKey
+ */
+
+/**
+ * @typedef {Object} DecisionTriageResult
+ * @property {string} commitHash
+ * @property {string} questionSetVersion
+ * @property {'jev' | 'gemini'} provider
+ * @property {string} model
+ * @property {'quick' | 'medium' | 'deep' | null} effort
+ * @property {number} effortConfidence
+ * @property {'hotfix' | 'high_risk' | null} alert
+ * @property {number} alertConfidence
+ * @property {string | null} changeKind
+ * @property {number | null} riskScore
+ * @property {boolean | null} hasClearContext
+ * @property {number} cachedAt
+ */
+
+/**
+ * @typedef {Record<string, DecisionTriageResult>} DecisionCacheMap
  */
 
 /**
@@ -12,8 +101,15 @@ import { DEFAULT_PREFERENCES, STORAGE_KEYS, sanitizeHttpsUrl } from './config.js
  */
 
 /**
+ * @typedef {Object} GitHubCredentials
+ * @property {string} token
+ * @property {string} apiBaseUrl
+ */
+
+/**
  * @typedef {Object} CachedUser
  * @property {string} uuid
+ * @property {string} [accountId]
  * @property {string} displayName
  * @property {string} username
  * @property {string | null} avatarUrl
@@ -62,9 +158,11 @@ import { DEFAULT_PREFERENCES, STORAGE_KEYS, sanitizeHttpsUrl } from './config.js
 
 /**
  * @typedef {Object} PullRequestRecord
+ * @property {PrProvider} [provider]
  * @property {string} key
  * @property {number} id
  * @property {string} title
+ * @property {string} [description]
  * @property {string} state
  * @property {string} url
  * @property {string} repoFullName
@@ -81,6 +179,10 @@ import { DEFAULT_PREFERENCES, STORAGE_KEYS, sanitizeHttpsUrl } from './config.js
  * @property {boolean} draft
  * @property {PrReviewer[]} reviewers
  * @property {PrParticipant[]} participants
+ * @property {string} [sourceCommitHash]
+ * @property {BuildStatusSummary | null} [buildStatus]
+ * @property {DiffstatSummary | null} [diffstat]
+ * @property {DecisionTriageResult | null} [aiTriage]
  */
 
 /**
@@ -219,6 +321,10 @@ export function validatePreferences(raw, base = DEFAULT_PREFERENCES) {
     ? source.compactMode
     : base.compactMode;
 
+  const groupByTicket = typeof source.groupByTicket === 'boolean'
+    ? source.groupByTicket
+    : Boolean(base.groupByTicket);
+
   const workspacesFilter = source.workspacesFilter !== undefined
     ? sanitizeStringList(source.workspacesFilter)
     : [...base.workspacesFilter];
@@ -248,6 +354,7 @@ export function validatePreferences(raw, base = DEFAULT_PREFERENCES) {
     staleThresholdHours,
     defaultFilter,
     compactMode,
+    groupByTicket,
     workspacesFilter,
     reposFilter,
     jiraBaseUrlOverride
@@ -338,6 +445,7 @@ export function createStorage(area = typeof chrome !== 'undefined' ? chrome?.sto
         STORAGE_KEYS.CACHED_USER,
         STORAGE_KEYS.CACHED_WORKSPACES,
         STORAGE_KEYS.CACHED_REPOS,
+        STORAGE_KEYS.CACHED_BUILD_STATUSES,
         STORAGE_KEYS.PR_LIST,
         STORAGE_KEYS.LAST_UPDATED,
         STORAGE_KEYS.ERROR,
@@ -345,6 +453,110 @@ export function createStorage(area = typeof chrome !== 'undefined' ? chrome?.sto
         STORAGE_KEYS.SYNCED_WORKSPACES,
         STORAGE_KEYS.SYNC_STATE
       ]);
+    },
+
+    /**
+     * Read stored GitHub PAT credentials and effective API base URL.
+     * Returns `null` if no GitHub token is configured.
+     *
+     * @returns {Promise<GitHubCredentials | null>}
+     */
+    async getGitHubCredentials() {
+      const data = await area.get([
+        STORAGE_KEYS.GITHUB_TOKEN,
+        STORAGE_KEYS.GITHUB_API_BASE_URL
+      ]);
+      const storedToken = data[STORAGE_KEYS.GITHUB_TOKEN];
+      const token = typeof storedToken === 'string' ? storedToken.trim() : '';
+      if (!token) {
+        return null;
+      }
+
+      const rawBaseVal = data[STORAGE_KEYS.GITHUB_API_BASE_URL];
+      const rawBase = typeof rawBaseVal === 'string' ? rawBaseVal : '';
+      return {
+        token,
+        apiBaseUrl: getEffectiveGitHubApiBaseUrl(rawBase)
+      };
+    },
+
+    /**
+     * Save GitHub PAT credentials and optional normalized Enterprise API base URL.
+     *
+     * @param {Partial<GitHubCredentials>} creds
+     * @returns {Promise<GitHubCredentials>}
+     */
+    async saveGitHubCredentials(creds) {
+      const token = typeof creds?.token === 'string' ? creds.token.trim() : '';
+      const rawBase = typeof creds?.apiBaseUrl === 'string' ? creds.apiBaseUrl.trim() : '';
+      const apiBaseUrl = getEffectiveGitHubApiBaseUrl(rawBase);
+
+      await area.set({
+        [STORAGE_KEYS.GITHUB_TOKEN]: token,
+        [STORAGE_KEYS.GITHUB_API_BASE_URL]: rawBase ? apiBaseUrl : ''
+      });
+
+      return { token, apiBaseUrl };
+    },
+
+    /**
+     * Clear GitHub credentials and cached GitHub user profile while preserving
+     * Bitbucket credentials, preferences, snoozed PRs, and product feedback.
+     *
+     * @returns {Promise<void>}
+     */
+    async clearGitHubCredentialsAndCache() {
+      await area.remove([
+        STORAGE_KEYS.GITHUB_TOKEN,
+        STORAGE_KEYS.GITHUB_API_BASE_URL,
+        STORAGE_KEYS.CACHED_GITHUB_USER
+      ]);
+    },
+
+    /**
+     * Read cached GitHub user profile.
+     *
+     * @returns {Promise<CachedUser | null>}
+     */
+    async getCachedGitHubUser() {
+      const data = await area.get([STORAGE_KEYS.CACHED_GITHUB_USER]);
+      const raw = data[STORAGE_KEYS.CACHED_GITHUB_USER];
+      if (!raw || typeof raw !== 'object') {
+        return null;
+      }
+      const entry = /** @type {Record<string, unknown>} */ (raw);
+      if (typeof entry.uuid !== 'string' || typeof entry.cachedAt !== 'number') {
+        return null;
+      }
+      const avatarUrl = typeof entry.avatarUrl === 'string' ? sanitizeHttpsUrl(entry.avatarUrl) : null;
+      return {
+        uuid: entry.uuid,
+        ...(typeof entry.accountId === 'string' ? { accountId: entry.accountId } : {}),
+        displayName: typeof entry.displayName === 'string' ? entry.displayName : 'GitHub User',
+        username: typeof entry.username === 'string' ? entry.username : '',
+        avatarUrl,
+        cachedAt: entry.cachedAt
+      };
+    },
+
+    /**
+     * Persist cached GitHub user profile.
+     *
+     * @param {CachedUser} user
+     * @returns {Promise<void>}
+     */
+    async setCachedGitHubUser(user) {
+      const avatarUrl = typeof user.avatarUrl === 'string' ? sanitizeHttpsUrl(user.avatarUrl) : null;
+      await area.set({
+        [STORAGE_KEYS.CACHED_GITHUB_USER]: {
+          uuid: user.uuid,
+          ...(typeof user.accountId === 'string' ? { accountId: user.accountId } : {}),
+          displayName: user.displayName,
+          username: user.username,
+          avatarUrl,
+          cachedAt: user.cachedAt
+        }
+      });
     },
 
     /**
@@ -476,6 +688,105 @@ export function createStorage(area = typeof chrome !== 'undefined' ? chrome?.sto
       const map = current && typeof current === 'object' ? { .../** @type {Record<string, unknown>} */ (current) } : {};
       map[workspace] = repos;
       await area.set({ [STORAGE_KEYS.CACHED_REPOS]: map });
+    },
+
+    /**
+     * Read cached commit build statuses keyed by `${repoFullName}:${commitHash}` (or `${commitHash}`).
+     *
+     * @returns {Promise<BuildStatusCacheMap>}
+     */
+    async getCachedBuildStatuses() {
+      const data = await area.get([STORAGE_KEYS.CACHED_BUILD_STATUSES]);
+      const raw = data[STORAGE_KEYS.CACHED_BUILD_STATUSES];
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return {};
+      }
+      /** @type {BuildStatusCacheMap} */
+      const cleaned = {};
+      for (const [key, entry] of Object.entries(raw)) {
+        if (!entry || typeof entry !== 'object') {
+          continue;
+        }
+        const e = /** @type {Record<string, unknown>} */ (entry);
+        if (
+          (e.state !== 'SUCCESSFUL' && e.state !== 'FAILED' && e.state !== 'INPROGRESS' && e.state !== 'STOPPED') ||
+          typeof e.cachedAt !== 'number'
+        ) {
+          continue;
+        }
+        cleaned[key] = {
+          state: e.state,
+          totalCount: typeof e.totalCount === 'number' ? e.totalCount : 0,
+          passedCount: typeof e.passedCount === 'number' ? e.passedCount : 0,
+          failedCount: typeof e.failedCount === 'number' ? e.failedCount : 0,
+          inProgressCount: typeof e.inProgressCount === 'number' ? e.inProgressCount : 0,
+          stoppedCount: typeof e.stoppedCount === 'number' ? e.stoppedCount : 0,
+          url: sanitizeHttpsUrl(e.url),
+          name: typeof e.name === 'string' ? e.name : '',
+          updatedOn: typeof e.updatedOn === 'string' ? e.updatedOn : '',
+          commitHash: typeof e.commitHash === 'string' ? e.commitHash : '',
+          cachedAt: e.cachedAt
+        };
+      }
+      return cleaned;
+    },
+
+    /**
+     * Persist build status cache map, sanitizing URLs and pruning oldest entries past `maxBuildStatusCacheEntries`.
+     *
+     * @param {BuildStatusCacheMap} map
+     * @returns {Promise<void>}
+     */
+    async setCachedBuildStatuses(map) {
+      if (!map || typeof map !== 'object' || Array.isArray(map)) {
+        await area.set({ [STORAGE_KEYS.CACHED_BUILD_STATUSES]: {} });
+        return;
+      }
+      /** @type {Array<[string, BuildStatusSummary]>} */
+      const validEntries = [];
+      for (const [key, entry] of Object.entries(map)) {
+        if (!key || !entry || typeof entry !== 'object') {
+          continue;
+        }
+        if (
+          (entry.state !== 'SUCCESSFUL' &&
+            entry.state !== 'FAILED' &&
+            entry.state !== 'INPROGRESS' &&
+            entry.state !== 'STOPPED') ||
+          typeof entry.cachedAt !== 'number'
+        ) {
+          continue;
+        }
+        validEntries.push([
+          key,
+          {
+            state: entry.state,
+            totalCount: typeof entry.totalCount === 'number' ? entry.totalCount : 0,
+            passedCount: typeof entry.passedCount === 'number' ? entry.passedCount : 0,
+            failedCount: typeof entry.failedCount === 'number' ? entry.failedCount : 0,
+            inProgressCount: typeof entry.inProgressCount === 'number' ? entry.inProgressCount : 0,
+            stoppedCount: typeof entry.stoppedCount === 'number' ? entry.stoppedCount : 0,
+            url: sanitizeHttpsUrl(entry.url),
+            name: typeof entry.name === 'string' ? entry.name : '',
+            updatedOn: typeof entry.updatedOn === 'string' ? entry.updatedOn : '',
+            commitHash: typeof entry.commitHash === 'string' ? entry.commitHash : '',
+            cachedAt: entry.cachedAt
+          }
+        ]);
+      }
+
+      const maxEntries = THROTTLE_CONFIG.maxBuildStatusCacheEntries;
+      if (validEntries.length > maxEntries) {
+        validEntries.sort((a, b) => b[1].cachedAt - a[1].cachedAt);
+        validEntries.length = maxEntries;
+      }
+
+      /** @type {BuildStatusCacheMap} */
+      const bounded = {};
+      for (const [key, value] of validEntries) {
+        bounded[key] = value;
+      }
+      await area.set({ [STORAGE_KEYS.CACHED_BUILD_STATUSES]: bounded });
     },
 
     /**
@@ -646,6 +957,355 @@ export function createStorage(area = typeof chrome !== 'undefined' ? chrome?.sto
           ? feedback.productFeedbackTimestamp
           : Date.now()
       });
+    },
+
+    /**
+     * Read and normalize persisted System One Decision Model config, falling back
+     * cleanly to `DECISION_MODELS` defaults.
+     *
+     * @returns {Promise<DecisionConfig>}
+     */
+    async getDecisionConfig() {
+      const data = await area.get([STORAGE_KEYS.DECISION_CONFIG]);
+      const raw = data[STORAGE_KEYS.DECISION_CONFIG];
+      const source = raw && typeof raw === 'object' && !Array.isArray(raw)
+        ? /** @type {Record<string, unknown>} */ (raw)
+        : {};
+
+      /** @type {DecisionProvider} */
+      const provider = source.provider === 'jev' || source.provider === 'gemini' || source.provider === 'off'
+        ? source.provider
+        : DECISION_MODELS.DEFAULT_PROVIDER;
+
+      const defaultBaseUrl = provider === 'gemini'
+        ? DECISION_MODELS.GEMINI_DECISIONS_URL
+        : provider === 'jev'
+          ? DECISION_MODELS.JEV_API_BASE_URL
+          : '';
+      const rawBase = typeof source.baseUrl === 'string' ? source.baseUrl.trim() : '';
+      const baseUrl = (rawBase ? sanitizeDecisionEndpointUrl(rawBase) : sanitizeDecisionEndpointUrl(defaultBaseUrl)) || '';
+
+      const defaultModel = provider === 'gemini'
+        ? DECISION_MODELS.GEMINI_DEFAULT_MODEL
+        : provider === 'jev'
+          ? DECISION_MODELS.JEV_DEFAULT_MODEL
+          : '';
+      const rawModel = typeof source.model === 'string' ? source.model.trim() : '';
+      const model = rawModel || defaultModel;
+
+      const apiKey = typeof source.apiKey === 'string' ? source.apiKey.trim() : '';
+
+      return {
+        provider,
+        baseUrl,
+        model,
+        apiKey
+      };
+    },
+
+    /**
+     * Persist System One Decision Model configuration, validating provider and endpoint URL.
+     *
+     * @param {Partial<DecisionConfig>} config
+     * @returns {Promise<DecisionConfig>}
+     */
+    async saveDecisionConfig(config) {
+      const current = await this.getDecisionConfig();
+      const source = config && typeof config === 'object' ? config : {};
+
+      /** @type {DecisionProvider} */
+      const provider = source.provider === 'jev' || source.provider === 'gemini' || source.provider === 'off'
+        ? source.provider
+        : current.provider;
+
+      const providerDefaultBase = provider === 'gemini'
+        ? DECISION_MODELS.GEMINI_DECISIONS_URL
+        : provider === 'jev'
+          ? DECISION_MODELS.JEV_API_BASE_URL
+          : '';
+      const rawBase = typeof source.baseUrl === 'string'
+        ? source.baseUrl.trim()
+        : (provider !== current.provider ? providerDefaultBase : current.baseUrl);
+      const baseUrl = rawBase
+        ? (sanitizeDecisionEndpointUrl(rawBase) || '')
+        : (sanitizeDecisionEndpointUrl(providerDefaultBase) || '');
+
+      const providerDefaultModel = provider === 'gemini'
+        ? DECISION_MODELS.GEMINI_DEFAULT_MODEL
+        : provider === 'jev'
+          ? DECISION_MODELS.JEV_DEFAULT_MODEL
+          : '';
+      const rawModel = typeof source.model === 'string'
+        ? source.model.trim()
+        : (provider !== current.provider ? providerDefaultModel : current.model);
+      const model = rawModel || providerDefaultModel;
+
+      const apiKey = typeof source.apiKey === 'string'
+        ? (source.apiKey.trim() || (provider === current.provider ? current.apiKey : ''))
+        : current.apiKey;
+
+      /** @type {DecisionConfig} */
+      const next = {
+        provider,
+        baseUrl,
+        model,
+        apiKey
+      };
+
+      await area.set({ [STORAGE_KEYS.DECISION_CONFIG]: next });
+      return next;
+    },
+
+    /**
+     * Clear stored Decision Model config and cached decision triage results.
+     *
+     * @returns {Promise<void>}
+     */
+    async clearDecisionConfigAndCache() {
+      await area.remove([
+        STORAGE_KEYS.DECISION_CONFIG,
+        STORAGE_KEYS.CACHED_DECISIONS
+      ]);
+    },
+
+    /**
+     * Read cached per-commit diffstats keyed by `${repoFullName}:${commitHash}`.
+     *
+     * @returns {Promise<DiffstatCacheMap>}
+     */
+    async getCachedDiffstats() {
+      const data = await area.get([STORAGE_KEYS.CACHED_DIFFSTATS]);
+      const raw = data[STORAGE_KEYS.CACHED_DIFFSTATS];
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return {};
+      }
+
+      /** @type {DiffstatCacheMap} */
+      const cleaned = {};
+      for (const [key, entry] of Object.entries(raw)) {
+        if (!key || !entry || typeof entry !== 'object') {
+          continue;
+        }
+        const e = /** @type {Record<string, unknown>} */ (entry);
+        if (typeof e.cachedAt !== 'number' || !Array.isArray(e.files)) {
+          continue;
+        }
+        /** @type {DiffstatFile[]} */
+        const files = [];
+        for (const f of e.files) {
+          if (!f || typeof f !== 'object') {
+            continue;
+          }
+          const fo = /** @type {Record<string, unknown>} */ (f);
+          if (typeof fo.path !== 'string' || !fo.path) {
+            continue;
+          }
+          files.push({
+            path: fo.path,
+            added: typeof fo.added === 'number' && Number.isFinite(fo.added) ? fo.added : 0,
+            removed: typeof fo.removed === 'number' && Number.isFinite(fo.removed) ? fo.removed : 0,
+            status: typeof fo.status === 'string' ? fo.status : 'modified'
+          });
+        }
+        cleaned[key] = {
+          commitHash: typeof e.commitHash === 'string' ? e.commitHash : '',
+          filesChanged: typeof e.filesChanged === 'number' && Number.isFinite(e.filesChanged) ? e.filesChanged : files.length,
+          linesAdded: typeof e.linesAdded === 'number' && Number.isFinite(e.linesAdded) ? e.linesAdded : 0,
+          linesRemoved: typeof e.linesRemoved === 'number' && Number.isFinite(e.linesRemoved) ? e.linesRemoved : 0,
+          files,
+          cachedAt: e.cachedAt
+        };
+      }
+      return cleaned;
+    },
+
+    /**
+     * Persist diffstat cache map, pruning oldest entries past `THROTTLE_CONFIG.maxDiffstatCacheEntries` (LRU).
+     *
+     * @param {DiffstatCacheMap} map
+     * @returns {Promise<void>}
+     */
+    async setCachedDiffstats(map) {
+      if (!map || typeof map !== 'object' || Array.isArray(map)) {
+        await area.set({ [STORAGE_KEYS.CACHED_DIFFSTATS]: {} });
+        return;
+      }
+
+      /** @type {Array<[string, DiffstatSummary]>} */
+      const validEntries = [];
+      for (const [key, entry] of Object.entries(map)) {
+        if (!key || !entry || typeof entry !== 'object') {
+          continue;
+        }
+        if (typeof entry.cachedAt !== 'number' || !Array.isArray(entry.files)) {
+          continue;
+        }
+        /** @type {DiffstatFile[]} */
+        const files = entry.files
+          .filter((f) => f && typeof f === 'object' && typeof f.path === 'string' && f.path)
+          .map((f) => ({
+            path: f.path,
+            added: typeof f.added === 'number' && Number.isFinite(f.added) ? f.added : 0,
+            removed: typeof f.removed === 'number' && Number.isFinite(f.removed) ? f.removed : 0,
+            status: typeof f.status === 'string' ? f.status : 'modified'
+          }));
+
+        validEntries.push([
+          key,
+          {
+            commitHash: typeof entry.commitHash === 'string' ? entry.commitHash : '',
+            filesChanged: typeof entry.filesChanged === 'number' && Number.isFinite(entry.filesChanged)
+              ? entry.filesChanged
+              : files.length,
+            linesAdded: typeof entry.linesAdded === 'number' && Number.isFinite(entry.linesAdded) ? entry.linesAdded : 0,
+            linesRemoved: typeof entry.linesRemoved === 'number' && Number.isFinite(entry.linesRemoved) ? entry.linesRemoved : 0,
+            files,
+            cachedAt: entry.cachedAt
+          }
+        ]);
+      }
+
+      const maxEntries = THROTTLE_CONFIG.maxDiffstatCacheEntries;
+      if (validEntries.length > maxEntries) {
+        validEntries.sort((a, b) => b[1].cachedAt - a[1].cachedAt);
+        validEntries.length = maxEntries;
+      }
+
+      /** @type {DiffstatCacheMap} */
+      const bounded = {};
+      for (const [key, value] of validEntries) {
+        bounded[key] = value;
+      }
+      await area.set({ [STORAGE_KEYS.CACHED_DIFFSTATS]: bounded });
+    },
+
+    /**
+     * Read cached System One decision triage results keyed by `${repoFullName}:${commitHash}:${questionSetVersion}`.
+     *
+     * @returns {Promise<DecisionCacheMap>}
+     */
+    async getCachedDecisions() {
+      const data = await area.get([STORAGE_KEYS.CACHED_DECISIONS]);
+      const raw = data[STORAGE_KEYS.CACHED_DECISIONS];
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return {};
+      }
+
+      /** @type {DecisionCacheMap} */
+      const cleaned = {};
+      for (const [key, entry] of Object.entries(raw)) {
+        if (!key || !entry || typeof entry !== 'object') {
+          continue;
+        }
+        const e = /** @type {Record<string, unknown>} */ (entry);
+        if (
+          (e.provider !== 'jev' && e.provider !== 'gemini') ||
+          typeof e.cachedAt !== 'number' ||
+          typeof e.questionSetVersion !== 'string'
+        ) {
+          continue;
+        }
+        /** @type {'quick' | 'medium' | 'deep' | null} */
+        const effort = e.effort === 'quick' || e.effort === 'medium' || e.effort === 'deep'
+          ? e.effort
+          : null;
+        /** @type {'hotfix' | 'high_risk' | null} */
+        const alert = e.alert === 'hotfix' || e.alert === 'high_risk'
+          ? e.alert
+          : null;
+
+        cleaned[key] = {
+          commitHash: typeof e.commitHash === 'string' ? e.commitHash : '',
+          questionSetVersion: e.questionSetVersion,
+          provider: e.provider,
+          model: typeof e.model === 'string' ? e.model : '',
+          effort,
+          effortConfidence: typeof e.effortConfidence === 'number' && Number.isFinite(e.effortConfidence)
+            ? e.effortConfidence
+            : 0,
+          alert,
+          alertConfidence: typeof e.alertConfidence === 'number' && Number.isFinite(e.alertConfidence)
+            ? e.alertConfidence
+            : 0,
+          changeKind: typeof e.changeKind === 'string' ? e.changeKind : null,
+          riskScore: typeof e.riskScore === 'number' && Number.isFinite(e.riskScore) ? e.riskScore : null,
+          hasClearContext: typeof e.hasClearContext === 'boolean' ? e.hasClearContext : null,
+          cachedAt: e.cachedAt
+        };
+      }
+      return cleaned;
+    },
+
+    /**
+     * Persist System One decision triage cache map, pruning oldest entries past
+     * `THROTTLE_CONFIG.maxDecisionCacheEntries` (LRU).
+     *
+     * @param {DecisionCacheMap} map
+     * @returns {Promise<void>}
+     */
+    async setCachedDecisions(map) {
+      if (!map || typeof map !== 'object' || Array.isArray(map)) {
+        await area.set({ [STORAGE_KEYS.CACHED_DECISIONS]: {} });
+        return;
+      }
+
+      /** @type {Array<[string, DecisionTriageResult]>} */
+      const validEntries = [];
+      for (const [key, entry] of Object.entries(map)) {
+        if (!key || !entry || typeof entry !== 'object') {
+          continue;
+        }
+        if (
+          (entry.provider !== 'jev' && entry.provider !== 'gemini') ||
+          typeof entry.cachedAt !== 'number' ||
+          typeof entry.questionSetVersion !== 'string'
+        ) {
+          continue;
+        }
+        /** @type {'quick' | 'medium' | 'deep' | null} */
+        const effort = entry.effort === 'quick' || entry.effort === 'medium' || entry.effort === 'deep'
+          ? entry.effort
+          : null;
+        /** @type {'hotfix' | 'high_risk' | null} */
+        const alert = entry.alert === 'hotfix' || entry.alert === 'high_risk'
+          ? entry.alert
+          : null;
+
+        validEntries.push([
+          key,
+          {
+            commitHash: typeof entry.commitHash === 'string' ? entry.commitHash : '',
+            questionSetVersion: entry.questionSetVersion,
+            provider: entry.provider,
+            model: typeof entry.model === 'string' ? entry.model : '',
+            effort,
+            effortConfidence: typeof entry.effortConfidence === 'number' && Number.isFinite(entry.effortConfidence)
+              ? entry.effortConfidence
+              : 0,
+            alert,
+            alertConfidence: typeof entry.alertConfidence === 'number' && Number.isFinite(entry.alertConfidence)
+              ? entry.alertConfidence
+              : 0,
+            changeKind: typeof entry.changeKind === 'string' ? entry.changeKind : null,
+            riskScore: typeof entry.riskScore === 'number' && Number.isFinite(entry.riskScore) ? entry.riskScore : null,
+            hasClearContext: typeof entry.hasClearContext === 'boolean' ? entry.hasClearContext : null,
+            cachedAt: entry.cachedAt
+          }
+        ]);
+      }
+
+      const maxEntries = THROTTLE_CONFIG.maxDecisionCacheEntries;
+      if (validEntries.length > maxEntries) {
+        validEntries.sort((a, b) => b[1].cachedAt - a[1].cachedAt);
+        validEntries.length = maxEntries;
+      }
+
+      /** @type {DecisionCacheMap} */
+      const bounded = {};
+      for (const [key, value] of validEntries) {
+        bounded[key] = value;
+      }
+      await area.set({ [STORAGE_KEYS.CACHED_DECISIONS]: bounded });
     }
   };
 }
