@@ -43,6 +43,7 @@ const PR_FIELDS = [
   'next',
   'values.id',
   'values.title',
+  'values.description',
   'values.state',
   'values.created_on',
   'values.updated_on',
@@ -53,6 +54,7 @@ const PR_FIELDS = [
   'values.author.display_name',
   'values.author.uuid',
   'values.source.branch.name',
+  'values.source.commit.hash',
   'values.source.repository.full_name',
   'values.source.repository.name',
   'values.destination.branch.name',
@@ -68,6 +70,18 @@ const PR_FIELDS = [
 ].join(',');
 
 const REPO_FIELDS = 'next,values.slug,values.full_name,values.updated_on';
+const BUILD_STATUS_FIELDS = 'values.state,values.name,values.url,values.updated_on';
+
+/** @type {ReadonlySet<import('./storage.js').BuildState>} */
+const TERMINAL_BUILD_STATES = new Set(['SUCCESSFUL', 'FAILED', 'STOPPED']);
+
+/** @type {Readonly<Record<import('./storage.js').BuildState, number>>} */
+const BUILD_STATE_PRECEDENCE = Object.freeze({
+  FAILED: 4,
+  INPROGRESS: 3,
+  STOPPED: 2,
+  SUCCESSFUL: 1
+});
 
 /**
  * Encode a UTF-8 string into Base64 safely using `TextEncoder` + `btoa` (no legacy percent-decoding hacks).
@@ -298,10 +312,19 @@ export function normalizePullRequest(rawPr, fallbackWorkspace = '') {
       })
     : [];
 
+  const rawCommitHash = typeof rawPr.source?.commit?.hash === 'string'
+    ? rawPr.source.commit.hash.trim()
+    : '';
+  const rawDescription = typeof rawPr.description === 'string' ? rawPr.description : '';
+  const description = rawDescription
+    ? rawDescription.slice(0, THROTTLE_CONFIG.maxDescriptionCharsInPrompt)
+    : undefined;
+
   return {
     key,
     id: rawPr.id,
     title: typeof rawPr.title === 'string' && rawPr.title.trim() ? rawPr.title.trim() : `PR #${rawPr.id}`,
+    ...(description !== undefined ? { description } : {}),
     state: typeof rawPr.state === 'string' ? rawPr.state : 'OPEN',
     url: safeUrl,
     repoFullName: canonicalRepo,
@@ -319,7 +342,229 @@ export function normalizePullRequest(rawPr, fallbackWorkspace = '') {
     taskCount: typeof rawPr.task_count === 'number' ? rawPr.task_count : 0,
     draft: Boolean(rawPr.draft),
     reviewers,
-    participants
+    participants,
+    ...(rawCommitHash ? { sourceCommitHash: rawCommitHash } : {})
+  };
+}
+
+/**
+ * Fetch lightweight per-file diffstat metadata for a Bitbucket PR (no raw diff patches).
+ * Gracefully returns `null` on any network, auth, or HTTP error so PR sync never fails.
+ *
+ * @param {{
+ *   fetchFn?: typeof fetch,
+ *   authHeader: string,
+ *   pr: Pick<import('./storage.js').PullRequestRecord, 'id' | 'repoFullName' | 'workspace' | 'repoName' | 'sourceCommitHash'>,
+ *   nowFn?: () => number
+ * }} params
+ * @returns {Promise<import('./storage.js').DiffstatSummary | null>}
+ */
+export async function fetchBitbucketDiffstat({
+  fetchFn = fetch,
+  authHeader,
+  pr,
+  nowFn = Date.now
+}) {
+  if (!authHeader || !pr || typeof pr.id !== 'number') {
+    return null;
+  }
+
+  let ws = '';
+  let repoSlug = '';
+  const fullName = typeof pr.repoFullName === 'string' ? pr.repoFullName.trim() : '';
+  const slashIdx = fullName.indexOf('/');
+  if (slashIdx > 0) {
+    ws = fullName.slice(0, slashIdx).trim();
+    repoSlug = fullName.slice(slashIdx + 1).trim();
+  } else if (pr.workspace && pr.repoName) {
+    ws = pr.workspace.trim();
+    repoSlug = pr.repoName.trim();
+  }
+  if (!ws || !repoSlug) {
+    return null;
+  }
+
+  const url = `${CENTRAL_URLS.BITBUCKET_API_BASE_URL}/repositories/${encodeURIComponent(ws)}/${encodeURIComponent(repoSlug)}/pullrequests/${pr.id}/diffstat?pagelen=50`;
+  try {
+    const response = await fetchWithTimeout(
+      fetchFn,
+      url,
+      {
+        method: 'GET',
+        headers: {
+          Authorization: authHeader,
+          Accept: 'application/json'
+        }
+      },
+      THROTTLE_CONFIG.requestTimeoutMs
+    );
+    if (!response.ok) {
+      return null;
+    }
+    const data = await response.json();
+    const values = Array.isArray(data?.values) ? data.values : [];
+
+    let linesAdded = 0;
+    let linesRemoved = 0;
+    /** @type {import('./storage.js').DiffstatFile[]} */
+    const files = [];
+
+    for (const entry of values) {
+      if (!entry || typeof entry !== 'object') {
+        continue;
+      }
+      const filePath =
+        (typeof entry.new?.path === 'string' && entry.new.path) ||
+        (typeof entry.old?.path === 'string' && entry.old.path) ||
+        '';
+      if (!filePath) {
+        continue;
+      }
+      const added = typeof entry.lines_added === 'number' && Number.isFinite(entry.lines_added)
+        ? entry.lines_added
+        : 0;
+      const removed = typeof entry.lines_removed === 'number' && Number.isFinite(entry.lines_removed)
+        ? entry.lines_removed
+        : 0;
+      const status = typeof entry.status === 'string' && entry.status ? entry.status : 'modified';
+
+      linesAdded += added;
+      linesRemoved += removed;
+      files.push({
+        path: filePath,
+        added,
+        removed,
+        status
+      });
+    }
+
+    const filesChanged = typeof data?.size === 'number' && Number.isFinite(data.size)
+      ? Math.max(data.size, files.length)
+      : files.length;
+
+    return {
+      commitHash: typeof pr.sourceCommitHash === 'string' ? pr.sourceCommitHash.trim() : '',
+      filesChanged,
+      linesAdded,
+      linesRemoved,
+      files,
+      cachedAt: nowFn()
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Aggregate raw Bitbucket commit/PR build statuses into a single summary record.
+ * Precedence: `FAILED` > `INPROGRESS` > `STOPPED` > `SUCCESSFUL`.
+ *
+ * @param {readonly any[]} rawStatuses
+ * @param {string} [commitHash]
+ * @param {number} [now]
+ * @returns {import('./storage.js').BuildStatusSummary | null}
+ */
+export function aggregateBuildStatuses(rawStatuses, commitHash = '', now = Date.now()) {
+  if (!Array.isArray(rawStatuses) || rawStatuses.length === 0) {
+    return null;
+  }
+
+  let passedCount = 0;
+  let failedCount = 0;
+  let inProgressCount = 0;
+  let stoppedCount = 0;
+
+  /** @type {{ state: import('./storage.js').BuildState, name: string, url: string | null, updatedOn: string } | null} */
+  let primaryFailed = null;
+  /** @type {{ state: import('./storage.js').BuildState, name: string, url: string | null, updatedOn: string } | null} */
+  let primaryInProgress = null;
+  /** @type {{ state: import('./storage.js').BuildState, name: string, url: string | null, updatedOn: string } | null} */
+  let primaryStopped = null;
+  /** @type {{ state: import('./storage.js').BuildState, name: string, url: string | null, updatedOn: string, updatedMs: number } | null} */
+  let latestSuccessful = null;
+
+  for (const raw of rawStatuses) {
+    if (!raw || typeof raw !== 'object') {
+      continue;
+    }
+    const rawState = typeof raw.state === 'string' ? raw.state.toUpperCase() : '';
+    if (!(rawState in BUILD_STATE_PRECEDENCE)) {
+      continue;
+    }
+    const state = /** @type {import('./storage.js').BuildState} */ (rawState);
+    const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : '';
+    const url = sanitizeHttpsUrl(raw.url);
+    const updatedOn = typeof raw.updated_on === 'string' ? raw.updated_on : '';
+
+    if (state === 'FAILED') {
+      failedCount += 1;
+      if (!primaryFailed) {
+        primaryFailed = { state, name, url, updatedOn };
+      } else if (!primaryFailed.url && url) {
+        primaryFailed.url = url;
+      }
+    } else if (state === 'INPROGRESS') {
+      inProgressCount += 1;
+      if (!primaryInProgress) {
+        primaryInProgress = { state, name, url, updatedOn };
+      } else if (!primaryInProgress.url && url) {
+        primaryInProgress.url = url;
+      }
+    } else if (state === 'STOPPED') {
+      stoppedCount += 1;
+      if (!primaryStopped) {
+        primaryStopped = { state, name, url, updatedOn };
+      } else if (!primaryStopped.url && url) {
+        primaryStopped.url = url;
+      }
+    } else if (state === 'SUCCESSFUL') {
+      passedCount += 1;
+      const parsedMs = updatedOn ? Date.parse(updatedOn) : Number.NaN;
+      const updatedMs = Number.isNaN(parsedMs) ? -1 : parsedMs;
+      if (!latestSuccessful || updatedMs > latestSuccessful.updatedMs) {
+        latestSuccessful = { state, name, url, updatedOn, updatedMs };
+      } else if (updatedMs === latestSuccessful.updatedMs && !latestSuccessful.url && url) {
+        latestSuccessful.url = url;
+      }
+    }
+  }
+
+  const totalCount = passedCount + failedCount + inProgressCount + stoppedCount;
+  if (totalCount === 0) {
+    return null;
+  }
+
+  /** @type {{ state: import('./storage.js').BuildState, name: string, url: string | null, updatedOn: string }} */
+  const chosen = primaryFailed ?? primaryInProgress ?? primaryStopped ?? /** @type {NonNullable<typeof latestSuccessful>} */ (latestSuccessful);
+
+  let latestUpdatedOn = chosen.updatedOn;
+  let latestUpdatedMs = latestUpdatedOn ? Date.parse(latestUpdatedOn) : Number.NaN;
+  if (Number.isNaN(latestUpdatedMs)) {
+    latestUpdatedMs = -1;
+  }
+  for (const raw of rawStatuses) {
+    if (!raw || typeof raw !== 'object' || typeof raw.updated_on !== 'string' || !raw.updated_on) {
+      continue;
+    }
+    const ms = Date.parse(raw.updated_on);
+    if (!Number.isNaN(ms) && ms > latestUpdatedMs) {
+      latestUpdatedMs = ms;
+      latestUpdatedOn = raw.updated_on;
+    }
+  }
+
+  return {
+    state: chosen.state,
+    totalCount,
+    passedCount,
+    failedCount,
+    inProgressCount,
+    stoppedCount,
+    url: chosen.url,
+    name: chosen.name,
+    updatedOn: latestUpdatedOn,
+    commitHash: typeof commitHash === 'string' ? commitHash.trim() : '',
+    cachedAt: now
   };
 }
 
@@ -656,6 +901,7 @@ export function createBitbucketClient({
     prMap.set(normalized.key, {
       ...existing,
       ...normalized,
+      sourceCommitHash: normalized.sourceCommitHash || existing.sourceCommitHash,
       reviewers: Array.from(mergedReviewersMap.values()),
       participants: Array.from(mergedParticipantsMap.values())
     });
@@ -687,6 +933,49 @@ export function createBitbucketClient({
       return false;
     }
     return false;
+  }
+
+  /**
+   * Determine whether a cached build status entry is still fresh enough to reuse without network calls.
+   *
+   * @param {import('./storage.js').BuildStatusSummary | undefined} cached
+   * @param {number} now
+   * @returns {boolean}
+   */
+  function isBuildStatusCacheFresh(cached, now) {
+    if (!cached) {
+      return false;
+    }
+    const ageMs = Math.max(0, now - cached.cachedAt);
+    if (TERMINAL_BUILD_STATES.has(cached.state)) {
+      return ageMs < CACHE_TTL_MS.buildStatusTerminal;
+    }
+    if (cached.state === 'INPROGRESS') {
+      return ageMs < CACHE_TTL_MS.buildStatusActive;
+    }
+    return false;
+  }
+
+  /**
+   * Parse `workspace` and `repoSlug` from a `PullRequestRecord`.
+   *
+   * @param {import('./storage.js').PullRequestRecord} pr
+   * @returns {{ ws: string, repoSlug: string } | null}
+   */
+  function extractRepoSlugParts(pr) {
+    const fullName = typeof pr.repoFullName === 'string' ? pr.repoFullName.trim() : '';
+    const slashIdx = fullName.indexOf('/');
+    if (slashIdx > 0) {
+      const ws = fullName.slice(0, slashIdx).trim();
+      const repoSlug = fullName.slice(slashIdx + 1).trim();
+      if (ws && repoSlug) {
+        return { ws, repoSlug };
+      }
+    }
+    if (pr.workspace && pr.repoName) {
+      return { ws: pr.workspace.trim(), repoSlug: pr.repoName.trim() };
+    }
+    return null;
   }
 
   /**
@@ -891,8 +1180,114 @@ export function createBitbucketClient({
         });
     }
 
+    // 4. Enrich deduplicated PRs with commit-cached CI / build status (never fails PR sync)
+    const prs = Array.from(prMap.values());
+    if (prs.length > 0) {
+      let cachedStatuses = /** @type {import('./storage.js').BuildStatusCacheMap} */ ({});
+      try {
+        cachedStatuses = await storage.getCachedBuildStatuses();
+      } catch {
+        cachedStatuses = {};
+      }
+      const nextStatusCache = { ...cachedStatuses };
+      let cacheMutated = false;
+
+      /** @type {Array<{ pr: import('./storage.js').PullRequestRecord, cacheKey: string | null, cached: import('./storage.js').BuildStatusSummary | null, repoParts: { ws: string, repoSlug: string } }>} */
+      const statusTasks = [];
+      const statusNow = nowFn();
+
+      for (const pr of prs) {
+        const commitHash = typeof pr.sourceCommitHash === 'string' ? pr.sourceCommitHash.trim() : '';
+        const cacheKey = commitHash
+          ? (pr.repoFullName ? `${pr.repoFullName}:${commitHash}` : commitHash)
+          : null;
+        const cached = cacheKey
+          ? (nextStatusCache[cacheKey] ?? (commitHash && nextStatusCache[commitHash]) ?? null)
+          : null;
+
+        if (!forceRefreshCache && cached && isBuildStatusCacheFresh(cached, statusNow)) {
+          pr.buildStatus = cached;
+          continue;
+        }
+
+        if (nearLimit) {
+          pr.buildStatus = cached ?? null;
+          continue;
+        }
+
+        const repoParts = extractRepoSlugParts(pr);
+        if (!repoParts) {
+          pr.buildStatus = cached ?? null;
+          continue;
+        }
+
+        statusTasks.push({ pr, cacheKey, cached, repoParts });
+      }
+
+      if (statusTasks.length > 0) {
+        const encodedStatusFields = encodeURIComponent(BUILD_STATUS_FIELDS);
+        const statusOutcomes = await runWithConcurrency(
+          statusTasks,
+          THROTTLE_CONFIG.maxConcurrentRequests,
+          async (task) => {
+            if (nearLimit) {
+              return { skippedDueToLimit: true, summary: task.cached, nearLimit: false };
+            }
+            const statusUrl = `${CENTRAL_URLS.BITBUCKET_API_BASE_URL}/repositories/${encodeURIComponent(task.repoParts.ws)}/${encodeURIComponent(task.repoParts.repoSlug)}/pullrequests/${task.pr.id}/statuses?pagelen=50&fields=${encodedStatusFields}`;
+            const res = await requestJson(statusUrl, authHeader);
+            if (res.nearLimit) {
+              nearLimit = true;
+            }
+            const rawValues = Array.isArray(res.data?.values) ? res.data.values : [];
+            const summary = aggregateBuildStatuses(rawValues, task.pr.sourceCommitHash ?? '', nowFn());
+            return { skippedDueToLimit: false, summary, nearLimit: res.nearLimit };
+          },
+          { isolateErrors: true }
+        );
+
+        for (let i = 0; i < statusOutcomes.length; i += 1) {
+          const outcome = /** @type {{ status: 'fulfilled', value: { skippedDueToLimit: boolean, summary: import('./storage.js').BuildStatusSummary | null, nearLimit: boolean } } | { status: 'rejected', reason: unknown }} */ (
+            /** @type {unknown} */ (statusOutcomes[i])
+          );
+          const task = statusTasks[i];
+
+          if (outcome.status === 'fulfilled') {
+            const { skippedDueToLimit, summary } = outcome.value;
+            if (skippedDueToLimit) {
+              task.pr.buildStatus = task.cached ?? null;
+              continue;
+            }
+            task.pr.buildStatus = summary;
+            if (summary && task.cacheKey) {
+              nextStatusCache[task.cacheKey] = summary;
+              cacheMutated = true;
+            }
+          } else {
+            const reason = outcome.reason;
+            if (reason instanceof BitbucketApiError && reason.status === 429) {
+              nearLimit = true;
+            }
+            task.pr.buildStatus = task.cached ?? null;
+            partialErrors.push({
+              scope: `${task.pr.key} (statuses)`,
+              message: reason instanceof Error ? reason.message : 'Failed to fetch PR build statuses.',
+              status: reason instanceof BitbucketApiError ? reason.status : null
+            });
+          }
+        }
+      }
+
+      if (cacheMutated) {
+        try {
+          await storage.setCachedBuildStatuses(nextStatusCache);
+        } catch {
+          // Non-fatal cache persistence failure
+        }
+      }
+    }
+
     return {
-      prs: Array.from(prMap.values()),
+      prs,
       user,
       workspaces,
       nearLimit,
@@ -900,8 +1295,25 @@ export function createBitbucketClient({
     };
   }
 
+  /**
+   * Fetch diffstat metadata for a single PR using the client's `fetchFn` and `nowFn`.
+   *
+   * @param {Partial<import('./storage.js').Credentials>} creds
+   * @param {Pick<import('./storage.js').PullRequestRecord, 'id' | 'repoFullName' | 'workspace' | 'repoName' | 'sourceCommitHash'>} pr
+   * @returns {Promise<import('./storage.js').DiffstatSummary | null>}
+   */
+  async function fetchDiffstat(creds, pr) {
+    try {
+      const authHeader = buildAuthHeader(creds);
+      return await fetchBitbucketDiffstat({ fetchFn, authHeader, pr, nowFn });
+    } catch {
+      return null;
+    }
+  }
+
   return {
     verifyCredentials,
-    fetchPullRequests
+    fetchPullRequests,
+    fetchDiffstat
   };
 }

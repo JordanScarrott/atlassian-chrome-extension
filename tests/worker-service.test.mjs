@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { BitbucketApiError } from '../bitbucket-pr-extension/src/bitbucket-client.js';
+import { GitHubApiError } from '../bitbucket-pr-extension/src/github-client.js';
 import { THROTTLE_CONFIG } from '../bitbucket-pr-extension/src/config.js';
 import { createStorage } from '../bitbucket-pr-extension/src/storage.js';
 import {
@@ -643,3 +644,485 @@ test('HTTP 429 preserves cached PRs, sets rateLimitWarning, persists backoff acr
   assert.equal(stateAfterRestart.snapshot.rateLimitWarning, true);
   assert.ok((stateAfterRestart.syncState.backoffUntil ?? 0) > now);
 });
+
+test('ci_failed triggers explicit CI notification label, updatePreferences surfaces syncError on scope sync failure, and GET_STATE exposes isAuthError', async () => {
+  let now = Date.UTC(2026, 10, 23, 12, 0, 0);
+  const mock = createMockChromeApi();
+  const storage = createStorage(mock.localArea);
+
+  await storage.saveCredentials({ authType: 'bearer', username: '', token: 'tok' });
+  await storage.savePreferences({ notificationsEnabled: true });
+  await storage.setCachedUser(SAMPLE_USER);
+
+  let mode = 'ci_fail'; // 'ci_fail' | 'scope_404' | 'auth_401'
+  const client = {
+    async verifyCredentials() {
+      return { user: SAMPLE_USER, workspaces: SAMPLE_WORKSPACES, nearLimit: false };
+    },
+    async fetchPullRequests() {
+      if (mode === 'scope_404') {
+        throw new BitbucketApiError({
+          status: 404,
+          code: 'NOT_FOUND',
+          message: 'Requested Bitbucket resource was not found (404).',
+          retryAfter: null,
+          isTransient: false,
+          isAuthError: false
+        });
+      }
+      if (mode === 'auth_401') {
+        throw new BitbucketApiError({
+          status: 401,
+          code: 'UNAUTHORIZED',
+          message: 'Authentication failed (401). Check your email/API token or access token in Settings.',
+          retryAfter: null,
+          isTransient: false,
+          isAuthError: true
+        });
+      }
+      return {
+        prs: [
+          makePr({
+            key: 'acme/web#55',
+            id: 55,
+            title: 'MEZ-55 Auth refactor',
+            authorUuid: '{me}',
+            authorName: 'Jordan',
+            reviewers: [],
+            participants: [
+              { uuid: '{bob}', displayName: 'Bob', role: 'REVIEWER', approved: true, state: 'approved' }
+            ],
+            buildStatus: {
+              state: 'FAILED',
+              totalCount: 1,
+              passedCount: 0,
+              failedCount: 1,
+              inProgressCount: 0,
+              stoppedCount: 0,
+              url: 'https://ci.example.com/build/55',
+              name: 'Unit Tests',
+              updatedOn: '2026-11-23T11:55:00Z',
+              commitHash: 'abc123',
+              cachedAt: now
+            }
+          })
+        ],
+        user: SAMPLE_USER,
+        workspaces: SAMPLE_WORKSPACES,
+        nearLimit: false,
+        partialErrors: []
+      };
+    }
+  };
+
+  const worker = createWorkerService({
+    storage,
+    client,
+    chromeApi: mock.chromeApi,
+    nowFn: () => now
+  });
+
+  // 1. Authored PR with failing CI fires notification with explicit CI label
+  const sync1 = await worker.syncNow({ forceManual: false });
+  assert.equal(sync1.ok, true);
+  assert.equal(mock.createdNotifications.length, 1);
+  assert.equal(mock.createdNotifications[0].options.title, 'CI build failed on your PR: web');
+
+  // 2. Scope change causing sync failure returns { ok: true, ..., syncError }
+  mode = 'scope_404';
+  const prefRes = await worker.handleMessage({
+    action: 'UPDATE_PREFERENCES',
+    preferences: { reposFilter: ['acme/nonexistent'] }
+  });
+  assert.equal(prefRes.ok, true);
+  assert.match(String(prefRes.syncError), /404/);
+
+  const stateAfter404 = await worker.handleMessage({ action: 'GET_STATE' });
+  assert.equal(stateAfter404.isAuthError, false);
+  assert.equal(stateAfter404.snapshot.isAuthError, false);
+
+  // 3. Auth error (401) sets isAuthError: true in GET_STATE
+  now += 60_000;
+  mode = 'auth_401';
+  const fail401 = await worker.syncNow({ forceManual: true });
+  assert.equal(fail401.ok, false);
+  assert.equal(fail401.isAuthError, true);
+
+  const stateAfter401 = await worker.handleMessage({ action: 'GET_STATE' });
+  assert.equal(stateAfter401.isAuthError, true);
+  assert.equal(stateAfter401.snapshot.isAuthError, true);
+});
+
+test('TEST_GITHUB_CONNECTION, SAVE_GITHUB_CREDENTIALS, dual-provider sync merging, partial error isolation, GET_STATE (no token leak), and SIGN_OUT_GITHUB', async () => {
+  let now = Date.UTC(2026, 10, 23, 14, 0, 0);
+  const mock = createMockChromeApi();
+  const storage = createStorage(mock.localArea);
+
+  const GH_USER = {
+    uuid: 'gh:42',
+    accountId: '42',
+    displayName: 'Jordan GH',
+    username: 'jscarrott',
+    avatarUrl: 'https://avatars.githubusercontent.com/u/42',
+    cachedAt: now
+  };
+
+  const bbMode = 'ok';
+  let ghMode = 'ok';
+
+  const bbClient = {
+    async verifyCredentials() {
+      return { user: { ...SAMPLE_USER, cachedAt: now }, workspaces: SAMPLE_WORKSPACES, nearLimit: false };
+    },
+    async fetchPullRequests() {
+      if (bbMode === 'fail') {
+        throw new BitbucketApiError({
+          status: 503,
+          code: 'SERVER_ERROR',
+          message: 'Bitbucket temporarily unavailable (503).',
+          retryAfter: null,
+          isTransient: true,
+          isAuthError: false
+        });
+      }
+      return {
+        prs: [
+          makePr({
+            key: 'acme/api#101',
+            id: 101,
+            title: 'MEZ-101 Bitbucket backend PR',
+            authorUuid: '{me}',
+            authorName: 'Jordan Scarrott',
+            reviewers: [],
+            participants: [
+              { uuid: '{bob}', displayName: 'Bob', role: 'REVIEWER', approved: true, state: 'approved' }
+            ]
+          })
+        ],
+        user: { ...SAMPLE_USER, cachedAt: now },
+        workspaces: SAMPLE_WORKSPACES,
+        nearLimit: false,
+        partialErrors: []
+      };
+    }
+  };
+
+  const ghClient = {
+    async verifyCredentials(creds) {
+      if (creds.token === 'bad-gh') {
+        throw new GitHubApiError({
+          status: 401,
+          code: 'UNAUTHORIZED',
+          message: 'GitHub authentication failed (401).',
+          retryAfter: null,
+          isTransient: false,
+          isAuthError: true
+        });
+      }
+      return { user: { ...GH_USER, cachedAt: now }, nearLimit: false };
+    },
+    async fetchPullRequests() {
+      if (ghMode === 'fail') {
+        throw new GitHubApiError({
+          status: 401,
+          code: 'UNAUTHORIZED',
+          message: 'GitHub authentication failed (401). Check your Personal Access Token in Settings.',
+          retryAfter: null,
+          isTransient: false,
+          isAuthError: true
+        });
+      }
+      return {
+        prs: [
+          {
+            provider: 'github',
+            key: 'gh:acme/web#88',
+            id: 88,
+            title: 'MEZ-101 GitHub frontend PR',
+            description: 'Connects to MEZ-101',
+            state: 'OPEN',
+            url: 'https://github.enterprise.local/acme/web/pull/88',
+            repoFullName: 'acme/web',
+            repoName: 'web',
+            workspace: 'acme',
+            authorUuid: 'gh:99',
+            authorName: 'Alice',
+            sourceBranch: 'feat/mez-101',
+            destinationBranch: 'main',
+            createdOn: '2026-11-23T10:00:00Z',
+            updatedOn: '2026-11-23T12:00:00Z',
+            commentCount: 2,
+            taskCount: 0,
+            draft: false,
+            reviewers: [{ uuid: 'gh:42', displayName: 'Jordan GH' }],
+            participants: [],
+            buildStatus: null
+          }
+        ],
+        user: { ...GH_USER, cachedAt: now },
+        nearLimit: false,
+        partialErrors: []
+      };
+    }
+  };
+
+  const worker = createWorkerService({
+    storage,
+    client: bbClient,
+    githubClient: ghClient,
+    chromeApi: mock.chromeApi,
+    nowFn: () => now
+  });
+
+  // 1. TEST_GITHUB_CONNECTION handles invalid & valid tokens
+  const badTest = await worker.handleMessage({
+    action: 'TEST_GITHUB_CONNECTION',
+    creds: { token: 'bad-gh', apiBaseUrl: 'https://github.enterprise.local/api/v3' }
+  });
+  assert.equal(badTest.ok, false);
+  assert.equal(badTest.isAuthError, true);
+
+  const goodTest = await worker.handleMessage({
+    action: 'TEST_GITHUB_CONNECTION',
+    creds: { token: 'ghp_super_secret', apiBaseUrl: 'https://github.enterprise.local/api/v3' }
+  });
+  assert.equal(goodTest.ok, true);
+  assert.equal(goodTest.user.uuid, 'gh:42');
+
+  // 2. SAVE_GITHUB_CREDENTIALS works standalone (GitHub-only mode)
+  const saveGh = await worker.handleMessage({
+    action: 'SAVE_GITHUB_CREDENTIALS',
+    creds: { token: 'ghp_super_secret', apiBaseUrl: 'https://github.enterprise.local/api/v3/' }
+  });
+  assert.equal(saveGh.ok, true);
+  assert.equal(saveGh.apiBaseUrl, 'https://github.enterprise.local/api/v3');
+  assert.equal(saveGh.snapshot.prList.length, 1);
+  assert.equal(saveGh.snapshot.prList[0].provider, 'github');
+  assert.equal(saveGh.snapshot.prList[0].isYourTurn, true);
+  assert.equal(saveGh.counts.actionRequired, 1);
+
+  // 3. Connect Bitbucket too -> dual-provider unified PR list enriched with each provider's user UUID
+  const saveBb = await worker.handleMessage({
+    action: 'SAVE_CREDENTIALS',
+    creds: { authType: 'bearer', token: 'bb_super_secret' }
+  });
+  assert.equal(saveBb.ok, true);
+  assert.equal(saveBb.snapshot.prList.length, 2);
+  assert.equal(saveBb.counts.actionRequired, 2);
+
+  const bbPr = saveBb.snapshot.prList.find((p) => p.key === 'acme/api#101');
+  const ghPr = saveBb.snapshot.prList.find((p) => p.key === 'gh:acme/web#88');
+  assert.equal(bbPr?.provider, 'bitbucket');
+  assert.equal(bbPr?.actionState, 'ready_to_merge');
+  assert.equal(ghPr?.provider, 'github');
+  assert.equal(ghPr?.actionState, 'needs_review');
+
+  // 4. GET_STATE reports both providers and NEVER leaks githubToken or bitbucketToken
+  const state = await worker.handleMessage({ action: 'GET_STATE' });
+  assert.equal(state.isAuthenticated, true);
+  assert.equal(state.bitbucketAuthenticated, true);
+  assert.equal(state.github.isAuthenticated, true);
+  assert.equal(state.github.apiBaseUrl, 'https://github.enterprise.local/api/v3');
+  assert.equal(state.github.user.uuid, 'gh:42');
+  const serialized = JSON.stringify(state);
+  assert.equal(serialized.includes('ghp_super_secret'), false);
+  assert.equal(serialized.includes('bb_super_secret'), false);
+
+  // 5. Partial provider failure isolates error: Bitbucket stays live while GitHub error banner is surfaced
+  now += 60_000;
+  ghMode = 'fail';
+  const partialRes = await worker.syncNow({ forceManual: true, bypassCooldown: true });
+  assert.equal(partialRes.ok, true);
+  assert.equal(partialRes.snapshot?.prList.length, 2); // preserves cached GH PR + fresh BB PR
+  assert.match(partialRes.snapshot?.error ?? '', /^GitHub:/);
+  assert.equal(partialRes.isAuthError, true);
+  ghMode = 'ok';
+
+  // 6. SIGN_OUT_GITHUB clears GitHub creds & removes GitHub PRs while preserving Bitbucket PRs
+  const signOutGh = await worker.handleMessage({ action: 'SIGN_OUT_GITHUB' });
+  assert.equal(signOutGh.ok, true);
+  assert.equal(await storage.getGitHubCredentials(), null);
+  assert.equal(await storage.getCachedGitHubUser(), null);
+  assert.equal((await storage.getCredentials())?.token, 'bb_super_secret');
+
+  const stateAfterGhSignOut = await worker.handleMessage({ action: 'GET_STATE' });
+  assert.equal(stateAfterGhSignOut.isAuthenticated, true);
+  assert.equal(stateAfterGhSignOut.bitbucketAuthenticated, true);
+  assert.equal(stateAfterGhSignOut.github.isAuthenticated, false);
+  assert.deepEqual(stateAfterGhSignOut.snapshot.prList.map((p) => p.key), ['acme/api#101']);
+  assert.equal(stateAfterGhSignOut.counts.actionRequired, 1);
+  assert.deepEqual(mock.badgeHistory.slice(-2), [
+    { type: 'text', text: '1' },
+    { type: 'color', color: '#0052CC' }
+  ]);
+});
+
+test('TEST_DECISION_MODEL, SAVE_DECISION_CONFIG, commit-hash caching (0 repeat AI calls), failure isolation, GET_STATE (no key leak), and CLEAR_DECISION_CONFIG', async () => {
+  let now = Date.UTC(2026, 10, 24, 9, 0, 0);
+  const mock = createMockChromeApi();
+  const storage = createStorage(mock.localArea);
+
+  await storage.saveCredentials({ authType: 'bearer', username: '', token: 'bb-tok' });
+  await storage.setCachedUser({ ...SAMPLE_USER, cachedAt: now });
+
+  let commitSha = 'commit-sha-1';
+  let diffstatCalls = 0;
+  let aiEvalCalls = 0;
+  let failAi = false;
+
+  const bbClient = {
+    async verifyCredentials() {
+      return { user: { ...SAMPLE_USER, cachedAt: now }, workspaces: SAMPLE_WORKSPACES, nearLimit: false };
+    },
+    async fetchPullRequests() {
+      return {
+        prs: [
+          makePr({
+            key: 'acme/web#301',
+            id: 301,
+            title: 'MEZ-301 Auth middleware update',
+            sourceCommitHash: commitSha
+          })
+        ],
+        user: { ...SAMPLE_USER, cachedAt: now },
+        workspaces: SAMPLE_WORKSPACES,
+        nearLimit: false,
+        partialErrors: []
+      };
+    },
+    async fetchDiffstat(_creds, pr) {
+      diffstatCalls += 1;
+      return {
+        commitHash: pr.sourceCommitHash || '',
+        filesChanged: 3,
+        linesAdded: 80,
+        linesRemoved: 12,
+        files: [{ path: 'src/auth.js', added: 80, removed: 12, status: 'modified' }],
+        cachedAt: now
+      };
+    }
+  };
+
+  const decisionClient = {
+    async decide() {
+      return {};
+    },
+    async verifyConnection(config) {
+      if (config.apiKey === 'bad-key') {
+        throw new Error('Decision model rejected credentials (401).');
+      }
+      return {
+        ok: true,
+        provider: config.provider,
+        model: config.model || 'gemini-decision-1',
+        answer: { type: 'noul', noul: 0.99, confidence: 0.99 }
+      };
+    },
+    async evaluateEffortAndRisk(config, pr, diffstat) {
+      aiEvalCalls += 1;
+      if (failAi) {
+        throw new Error('Decision endpoint 503');
+      }
+      assert.equal(diffstat?.filesChanged, 3);
+      return {
+        commitHash: pr.sourceCommitHash || '',
+        questionSetVersion: 'effort-risk-v1',
+        provider: config.provider,
+        model: config.model,
+        effort: 'medium',
+        effortConfidence: 0.89,
+        alert: 'high_risk',
+        alertConfidence: 0.85,
+        changeKind: 'feature',
+        riskScore: 4.2,
+        hasClearContext: true,
+        cachedAt: now
+      };
+    }
+  };
+
+  const worker = createWorkerService({
+    storage,
+    client: bbClient,
+    decisionClient,
+    chromeApi: mock.chromeApi,
+    nowFn: () => now
+  });
+
+  // 1. TEST_DECISION_MODEL failure & success
+  const badTest = await worker.handleMessage({
+    action: 'TEST_DECISION_MODEL',
+    config: { provider: 'gemini', model: 'gemini-decision-1', apiKey: 'bad-key' }
+  });
+  assert.equal(badTest.ok, false);
+  assert.match(String(badTest.error), /401/);
+
+  const goodTest = await worker.handleMessage({
+    action: 'TEST_DECISION_MODEL',
+    config: {
+      provider: 'gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta/decisions',
+      model: 'gemini-decision-1',
+      apiKey: 'AIzaSecretDecisionKey'
+    }
+  });
+  assert.equal(goodTest.ok, true);
+  assert.equal(goodTest.provider, 'gemini');
+
+  // 2. SAVE_DECISION_CONFIG persists key, verifies connection, and immediately syncs & scores PRs
+  const saveRes = await worker.handleMessage({
+    action: 'SAVE_DECISION_CONFIG',
+    config: {
+      provider: 'gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta/decisions',
+      model: 'gemini-decision-1',
+      apiKey: 'AIzaSecretDecisionKey'
+    }
+  });
+  assert.equal(saveRes.ok, true);
+  assert.equal(diffstatCalls, 1);
+  assert.equal(aiEvalCalls, 1);
+  assert.equal(saveRes.snapshot.prList[0].aiTriage?.effort, 'medium');
+  assert.equal(saveRes.snapshot.prList[0].aiTriage?.alert, 'high_risk');
+  assert.equal(saveRes.snapshot.prList[0].diffstat?.filesChanged, 3);
+
+  // 3. Second sync for SAME commitHash makes 0 diffstat calls and 0 AI calls!
+  now += 60_000;
+  const sync2 = await worker.syncNow({ forceManual: false });
+  assert.equal(sync2.ok, true);
+  assert.equal(diffstatCalls, 1);
+  assert.equal(aiEvalCalls, 1);
+  assert.equal(sync2.snapshot?.prList[0].aiTriage?.effort, 'medium');
+
+  // 4. GET_STATE exposes decision status WITHOUT ever leaking raw apiKey
+  const state = await worker.handleMessage({ action: 'GET_STATE' });
+  assert.deepEqual(state.decision, {
+    provider: 'gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/decisions',
+    model: 'gemini-decision-1',
+    isConfigured: true
+  });
+  assert.equal('apiKey' in state.decision, false);
+  assert.equal(JSON.stringify(state).includes('AIzaSecretDecisionKey'), false);
+
+  // 5. New commitHash triggers new AI evaluation; AI failure never fails PR sync!
+  now += 60_000;
+  commitSha = 'commit-sha-2';
+  failAi = true;
+  const syncWithAiError = await worker.syncNow({ forceManual: false });
+  assert.equal(syncWithAiError.ok, true);
+  assert.equal(diffstatCalls, 2);
+  assert.equal(aiEvalCalls, 2);
+  assert.equal(syncWithAiError.snapshot?.prList.length, 1);
+  assert.equal(syncWithAiError.snapshot?.prList[0].aiTriage ?? null, null);
+
+  // 6. CLEAR_DECISION_CONFIG wipes config, cached decisions, and strips aiTriage from snapshot
+  const clearRes = await worker.handleMessage({ action: 'CLEAR_DECISION_CONFIG' });
+  assert.equal(clearRes.ok, true);
+  assert.equal(clearRes.decision.provider, 'off');
+  assert.equal(clearRes.decision.isConfigured, false);
+  assert.equal(clearRes.snapshot.prList[0].aiTriage, undefined);
+  assert.deepEqual(await storage.getCachedDecisions(), {});
+});
+
+
