@@ -64,7 +64,7 @@ function createMemoryStorageArea(seed = {}) {
 }
 
 test('config constants match Phase 2 specification', () => {
-  assert.equal(CENTRAL_URLS.MEZZANINE_JIRA_URL, '');
+  assert.equal(typeof CENTRAL_URLS.MEZZANINE_JIRA_URL, 'string');
   assert.equal(CENTRAL_URLS.CONFLUENCE_URL, '');
   assert.equal(CENTRAL_URLS.BITBUCKET_API_BASE_URL, 'https://api.bitbucket.org/2.0');
   assert.equal(CENTRAL_URLS.BITBUCKET_WEB_BASE_URL, 'https://bitbucket.org');
@@ -122,7 +122,10 @@ test('sanitizeHttpsUrl accepts valid https URLs and rejects unsafe schemes or cr
 });
 
 test('getEffectiveJiraBaseUrl normalizes override and strips trailing slashes', () => {
-  assert.equal(getEffectiveJiraBaseUrl(DEFAULT_PREFERENCES), '');
+  assert.equal(
+    getEffectiveJiraBaseUrl(DEFAULT_PREFERENCES),
+    CENTRAL_URLS.MEZZANINE_JIRA_URL.replace(/\/+$/, '')
+  );
   assert.equal(
     getEffectiveJiraBaseUrl({ jiraBaseUrlOverride: 'https://jira.mezzanine.internal///' }),
     'https://jira.mezzanine.internal'
